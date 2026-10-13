@@ -54,10 +54,22 @@ check "third child refused" "$(mcp lead create_sandbox '{"name":"w3","command":[
 echo "== Grant changes"
 check "a sandbox cannot change grants" "$(mcp lead grant_update '{"grant_id":"x","max_total":9}')" "NOT_ALLOWED"
 gid=$(mcp lead get_limits | python3 -c 'import json,sys; print(json.load(sys.stdin)["grant_id"])')
-check "the user widens the grant (breadth 3, total 4)" "$(user_mcp grant_update grant_id="$gid" max_breadth=3 max_total=4)" '"max_breadth": 3'
+check "the user widens the grant (breadth 5, total 6)" "$(user_mcp grant_update grant_id="$gid" max_breadth=5 max_total=6)" '"max_breadth": 5'
 check "lead can create again after widening" "$(mcp lead create_sandbox '{"name":"w3","command":["sh","-c","echo result-from-w3; exit 0"],"lifetime":"until_exit"}')" '"handle":"w3"'
 check "wait for w3 to exit" "$(mcp lead wait '{"handle":"w3","timeout_s":60}')" '"exit_code":0'
 check "only your own children" "$(mcp lead stop_sandbox '{"handle":"lead"}')" "NOT_YOUR_CHILD"
+
+echo "== Tool sandboxes (kind: tool)"
+check "create tool sandbox t1 (no command needed)" "$(mcp lead create_sandbox '{"name":"t1","kind":"tool"}')" '"kind":"tool"'
+check "tool sandboxes can never create children" "$(mcp lead create_sandbox '{"name":"t0","kind":"tool"}' >/dev/null; $OS sandbox get t0 --policy-only 2>&1 | grep -c openshell_gateway_mcp)" "0"
+wait_ready t1
+check "exec runs a command in the tool sandbox" "$(mcp lead exec '{"handle":"t1","command":["sh","-c","echo out-line; echo err-line >&2; exit 3"]}')" '"exit_code":3'
+check "exec returns stdout" "$(mcp lead exec '{"handle":"t1","command":["sh","-c","echo out-line"]}')" 'out-line'
+check "exec on an agent child is refused" "$(mcp lead exec '{"handle":"w1","command":["id"]}')" "WRONG_KIND"
+check "bad kind is refused" "$(mcp lead create_sandbox '{"name":"x","kind":"robot","command":["true"]}')" "INVALID_ARGUMENT"
+check "short idle timeout accepted" "$(mcp lead create_sandbox '{"name":"t2","kind":"tool","idle_timeout_s":10}')" '"idle_timeout_s":10'
+sleep 25
+check "idle tool sandbox t2 stopped automatically" "[$($OS sandbox list 2>&1 | grep -E '^t2 ' | grep -v -i deleting || true)]" "[]"
 
 echo "== Cascade stop"
 $OS sandbox delete lead >/dev/null 2>&1; sleep 5
