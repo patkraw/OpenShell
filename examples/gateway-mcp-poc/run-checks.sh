@@ -85,6 +85,7 @@ wait_ready hostlead
 check "that sandbox can create children" "$(mcp hostlead tools/list)" "create_sandbox"
 check "child_policy=inherit: a child policy is refused" "$(mcp hostlead create_sandbox '{"name":"hc1","command":["sleep","60"],"policy":{"network_policies":{}}}')" "omit policy"
 check "child_policy=inherit: a child without policy is created" "$(mcp hostlead create_sandbox '{"name":"hc1","command":["sleep","60"]}')" '"handle":"hc1"'
+check "that child reaches Ready (explicit default policy, no image policy)" "$(wait_ready hc1 && echo ready)" "ready"
 $OS sandbox delete hostlead >/dev/null 2>&1
 
 echo "== Cascade stop"

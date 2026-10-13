@@ -290,7 +290,11 @@ pub fn prepare_granted_create(
         ));
     }
     let grant = parse_grant_spec(raw).map_err(tonic::Status::invalid_argument)?;
-    let policy = spec.policy.get_or_insert_with(SandboxPolicy::default);
+    // A tree always has an explicit policy: without one, the restrictive
+    // default (what a supervisor would fall back to) becomes the ceiling.
+    let policy = spec
+        .policy
+        .get_or_insert_with(openshell_policy::restrictive_default_policy);
     let ceiling = policy.clone();
     if grant.max_depth > 0 {
         let rule = door_rule(&grant.program).map_err(tonic::Status::internal)?;

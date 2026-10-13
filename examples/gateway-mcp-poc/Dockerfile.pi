@@ -13,6 +13,10 @@ RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSIO
 
 # Scripted MCP client used by the POC checks.
 COPY mcp-client.mjs /usr/local/lib/gateway-mcp/mcp-client.mjs
+# Official MCP TypeScript SDK and an example that uses it from inside a sandbox.
+RUN npm install --prefix /usr/local/lib/gateway-mcp --ignore-scripts --no-audit --no-fund \
+    "@modelcontextprotocol/sdk@1.31.0"
+COPY sdk/sandbox_child.mjs /usr/local/lib/gateway-mcp/sandbox_child.mjs
 # Pi config seed (copied into PI_CODING_AGENT_DIR by pi-run) and the wrapper.
 COPY pi-seed/ /usr/local/share/pi-seed/
 COPY --chmod=755 pi-run /usr/local/bin/pi-run

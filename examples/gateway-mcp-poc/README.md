@@ -6,6 +6,11 @@ an agent on the host can create sandboxes as the user. Design:
 [RFC draft](../../rfc/NNNN-gateway-mcp-sandbox-creation/README.md) (on branch
 `docs/gateway-mcp-rfc/patkraw`).
 
+- **[TUTORIAL.md](TUTORIAL.md)**: step by step with the CLI, MCP from inside and
+  outside a sandbox, and the official Python and TypeScript MCP SDKs.
+- **[PROTOCOL.md](PROTOCOL.md)**: the protocol agreement (transport, methods,
+  tools per caller, results, error codes) with real captured exchanges.
+
 ## What is where
 
 | Part | Path | What it does |
@@ -35,7 +40,7 @@ Docker running):
 mise run gateway:docker                     # builds the gateway and supervisor image, serves on :18080
 docker build -t pi-agent:local -f examples/gateway-mcp-poc/Dockerfile.pi examples/gateway-mcp-poc
 cargo build -p openshell-cli
-examples/gateway-mcp-poc/run-checks.sh      # 36 checks: grants, door, refusals, retries, tool sandboxes, host user, cascade stop
+examples/gateway-mcp-poc/run-checks.sh      # 37 checks: grants, door, refusals, retries, tool sandboxes, host user, cascade stop
 ```
 
 Try it by hand:
@@ -61,6 +66,10 @@ examples/gateway-mcp-poc/user-mcp.py create_sandbox name=box1 image=pi-agent:loc
 Point any MCP client at it: inside a sandbox the URL is
 `http://openshell.local/mcp`; on the host it is `http://127.0.0.1:18080/mcp`.
 
+SDK examples: `sdk/host_create.py` (official Python MCP SDK, on the host) and
+`sdk/sandbox_child.mjs` (official TypeScript MCP SDK, inside a sandbox). See the
+tutorial.
+
 A real Pi lead creating a Pi worker: `run-pi-demo.sh` (needs a model provider,
 see the script header).
 
@@ -76,6 +85,9 @@ see the script header).
 | `expires` | e.g. `4h`. |
 | `program` | Executable allowed to use the door, e.g. `/usr/local/bin/node` for Pi. |
 | `child_policy` | `narrow` (default): agents write their children's network rules within the ceiling. `inherit`: every child gets this sandbox's policy unchanged. |
+
+The sandbox's policy (`--policy`) becomes the tree's ceiling. Without one, the
+restrictive default policy is used; a tree never relies on an image's own policy.
 
 ## Known limits of the proof of concept
 
