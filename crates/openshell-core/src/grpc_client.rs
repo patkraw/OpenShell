@@ -72,6 +72,16 @@ enum TokenSource {
 /// call and shared with every subsequent client and the renewal loop.
 static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
 
+/// The current gateway bearer (`"Bearer <jwt>"`) this process authenticates
+/// with, if a channel has been connected. Used by the supervisor's gateway MCP
+/// door to forward calls as this sandbox.
+#[must_use]
+pub fn current_gateway_bearer() -> Option<String> {
+    let slot = TOKEN_SLOT.get()?;
+    let value = slot.read().ok()?;
+    value.to_str().ok().map(str::to_string)
+}
+
 /// Refresh strategy used by the process-wide token slot.
 static TOKEN_REFRESH_MODE: OnceLock<RefreshMode> = OnceLock::new();
 

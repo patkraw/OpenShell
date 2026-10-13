@@ -4837,7 +4837,7 @@ pub(super) async fn handle_report_policy_status(
 // Sandbox logs handlers
 // ---------------------------------------------------------------------------
 
-pub(super) async fn handle_get_sandbox_logs(
+pub(crate) async fn handle_get_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<GetSandboxLogsRequest>,
 ) -> Result<Response<GetSandboxLogsResponse>, Status> {
@@ -6722,6 +6722,12 @@ fn validate_rule_not_always_blocked(rule: &NetworkPolicyRule) -> Result<(), Stat
         }
     }
     Ok(())
+}
+
+/// Whether a gateway-global policy is active (it replaces sandbox policies).
+pub(crate) async fn global_policy_active(state: &ServerState) -> Result<bool, Status> {
+    let global = load_global_settings(state.store.as_ref()).await?;
+    Ok(global.settings.contains_key(POLICY_SETTING_KEY))
 }
 
 async fn require_no_global_policy(state: &ServerState) -> Result<(), Status> {

@@ -898,7 +898,7 @@ where
 /// When neither OIDC nor sandbox credentials are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
-fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
+pub(crate) fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
         authenticators.push(peer);
@@ -976,7 +976,7 @@ impl<S> AuthGrpcRouter<S> {
     }
 }
 
-fn unauthenticated_dev_user_principal() -> Principal {
+pub(crate) fn unauthenticated_dev_user_principal() -> Principal {
     Principal::User(UserPrincipal {
         identity: Identity {
             subject: "unauthenticated-local-dev".to_string(),

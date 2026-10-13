@@ -982,6 +982,24 @@ fn pinned_transparent_plan(
         .map_err(|_| MappingLookupError::InvalidMapping)
 }
 
+/// Gateway MCP door: is the calling program allowed by the door rule
+/// (a network policy entry for `openshell.local:80`)?
+fn door_program_allowed(
+    engine: &OpaEngine,
+    identity_cache: &BinaryIdentityCache,
+    identity: Option<&Result<ContractBinaryIdentity, ResolveError>>,
+) -> std::result::Result<(), String> {
+    let Some(identity) = identity else {
+        return Err("no verified workload identity".to_string());
+    };
+    let intent = EgressIntent::forward_http(crate::gateway_mcp_door::DOOR_HOST.to_string(), 80);
+    let decision = authorize_supplied_identity(engine, identity_cache, intent, identity);
+    match decision.action {
+        NetworkAction::Allow { .. } => Ok(()),
+        NetworkAction::Deny { reason } => Err(reason),
+    }
+}
+
 fn valid_policy_local_request(method: &str, target: &str, request_headers: &str) -> bool {
     if method == "CONNECT" || !target.starts_with('/') {
         return false;
@@ -2583,6 +2601,19 @@ async fn handle_mediated_connection(
             &mut client,
         )
         .await;
+    }
+
+    if policy_local_transparent
+        && crate::gateway_mcp_door::request_host(&buf[..header_end])
+            .as_deref()
+            .is_some_and(crate::gateway_mcp_door::is_door_host)
+    {
+        let ctx = policy_local_ctx
+            .as_ref()
+            .ok_or_else(|| miette::miette!("sandbox-local policy context is unavailable"))?;
+        let allowed = door_program_allowed(&opa_engine, &identity_cache, supplied_identity.as_ref());
+        return crate::gateway_mcp_door::handle(ctx, allowed, method, target, &buf[..used], &mut client)
+            .await;
     }
 
     if policy_local_transparent {
@@ -5375,6 +5406,20 @@ async fn handle_forward_proxy(
             client,
         )
         .await;
+    }
+
+    if host_lc == crate::gateway_mcp_door::DOOR_HOST {
+        let allowed = if scheme == "http" && port == 80 {
+            door_program_allowed(&opa_engine, &identity_cache, supplied_identity)
+        } else {
+            Err("use http://openshell.local/mcp".to_string())
+        };
+        if let Some(ctx) = policy_local_ctx {
+            return crate::gateway_mcp_door::handle(&ctx, allowed, method, &path, &buf[..used], client)
+                .await;
+        }
+        respond(client, b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await?;
+        return Ok(());
     }
 
     if host_lc == POLICY_LOCAL_HOST {

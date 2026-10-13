@@ -8,7 +8,7 @@ pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
 pub mod provider_readiness;
-mod sandbox;
+pub(crate) mod sandbox;
 pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;

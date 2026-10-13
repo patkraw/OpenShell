@@ -443,6 +443,7 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
+    pub grant: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
     pub expose_authorization_mode: ServiceAuthorizationMode,
@@ -473,6 +474,7 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
+            grant: None,
             forward: None,
             expose: None,
             expose_authorization_mode: ServiceAuthorizationMode::Strip,
@@ -511,6 +513,7 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
+        grant,
         forward,
         expose,
         expose_authorization_mode,
@@ -662,7 +665,7 @@ pub async fn sandbox_create(
             && command.is_empty()
             && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
     let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
-    let annotations = if persist {
+    let mut annotations = if persist {
         HashMap::new()
     } else {
         HashMap::from([(
@@ -670,6 +673,9 @@ pub async fn sandbox_create(
             "ephemeral".to_string(),
         )])
     };
+    if let Some(grant) = grant {
+        annotations.insert("openshell.io/mcp-grant".to_string(), grant.to_string());
+    }
     let request = CreateSandboxRequest {
         request_id: String::new(),
         spec: Some(SandboxSpec {

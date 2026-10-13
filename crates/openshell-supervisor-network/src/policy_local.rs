@@ -94,6 +94,11 @@ pub struct PolicyLocalContext {
 }
 
 impl PolicyLocalContext {
+    /// Gateway endpoint this supervisor talks to.
+    pub(crate) fn gateway_endpoint(&self) -> Option<&str> {
+        self.gateway_endpoint.as_deref()
+    }
+
     pub fn new(
         current_policy: Option<ProtoSandboxPolicy>,
         gateway_endpoint: Option<String>,
@@ -1228,7 +1233,7 @@ fn network_endpoint_from_json(
     })
 }
 
-async fn read_request_body<S>(initial_request: &[u8], client: &mut S) -> Result<Vec<u8>>
+pub(crate) async fn read_request_body<S>(initial_request: &[u8], client: &mut S) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {

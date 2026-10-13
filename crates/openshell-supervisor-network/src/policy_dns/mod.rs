@@ -113,7 +113,9 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
     ) -> Result<SyntheticAnswer, PolicyDnsError> {
         let normalized_name =
             NormalizedName::parse(raw_name).map_err(|_| PolicyDnsError::InvalidName)?;
-        if normalized_name.as_str() == crate::policy_local::POLICY_LOCAL_HOST {
+        if normalized_name.as_str() == crate::policy_local::POLICY_LOCAL_HOST
+            || normalized_name.as_str() == crate::gateway_mcp_door::DOOR_HOST
+        {
             return if family == AddressFamily::Ipv4 {
                 Ok(SyntheticAnswer {
                     address: POLICY_LOCAL_ADDRESS.into(),
