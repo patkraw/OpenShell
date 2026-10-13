@@ -45,7 +45,13 @@ fn header_value(request_head: &[u8], wanted: &str) -> Option<String> {
         .map(|(_, value)| value.trim().to_string())
 }
 
-async fn respond<S: AsyncWrite + Unpin>(client: &mut S, status: u16, reason: &str, ctype: &str, body: &[u8]) -> Result<()> {
+async fn respond<S: AsyncWrite + Unpin>(
+    client: &mut S,
+    status: u16,
+    reason: &str,
+    ctype: &str,
+    body: &[u8],
+) -> Result<()> {
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -71,21 +77,56 @@ where
     if let Err(reason) = program_allowed {
         warn!(%reason, "gateway MCP door: denied (no door rule for this program)");
         let body = serde_json::json!({"error": "door_denied", "detail": reason}).to_string();
-        return respond(client, 403, "Forbidden", "application/json", body.as_bytes()).await;
+        return respond(
+            client,
+            403,
+            "Forbidden",
+            "application/json",
+            body.as_bytes(),
+        )
+        .await;
     }
     let path = target.split('?').next().unwrap_or(target);
     if path != DOOR_PATH {
-        return respond(client, 404, "Not Found", "text/plain", b"only /mcp is served here").await;
+        return respond(
+            client,
+            404,
+            "Not Found",
+            "text/plain",
+            b"only /mcp is served here",
+        )
+        .await;
     }
     if method != "POST" {
-        return respond(client, 405, "Method Not Allowed", "text/plain", b"POST only").await;
+        return respond(
+            client,
+            405,
+            "Method Not Allowed",
+            "text/plain",
+            b"POST only",
+        )
+        .await;
     }
     let body = crate::policy_local::read_request_body(initial_request, client).await?;
     let Some(endpoint) = ctx.gateway_endpoint() else {
-        return respond(client, 503, "Service Unavailable", "text/plain", b"no gateway endpoint").await;
+        return respond(
+            client,
+            503,
+            "Service Unavailable",
+            "text/plain",
+            b"no gateway endpoint",
+        )
+        .await;
     };
     let Some(bearer) = openshell_core::grpc_client::current_gateway_bearer() else {
-        return respond(client, 503, "Service Unavailable", "text/plain", b"no gateway token yet").await;
+        return respond(
+            client,
+            503,
+            "Service Unavailable",
+            "text/plain",
+            b"no gateway token yet",
+        )
+        .await;
     };
     let url = format!("{}/mcp", endpoint.trim_end_matches('/'));
     let mut req = reqwest::Client::new()
@@ -101,7 +142,14 @@ where
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "gateway MCP door: forward failed");
-            return respond(client, 502, "Bad Gateway", "text/plain", b"gateway unreachable").await;
+            return respond(
+                client,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                b"gateway unreachable",
+            )
+            .await;
         }
     };
     let status = resp.status();
@@ -113,7 +161,14 @@ where
         .to_string();
     let bytes = resp.bytes().await.into_diagnostic()?;
     info!(status = status.as_u16(), "gateway MCP door: forwarded");
-    respond(client, status.as_u16(), status.canonical_reason().unwrap_or(""), &ctype, &bytes).await
+    respond(
+        client,
+        status.as_u16(),
+        status.canonical_reason().unwrap_or(""),
+        &ctype,
+        &bytes,
+    )
+    .await
 }
 
 #[cfg(test)]

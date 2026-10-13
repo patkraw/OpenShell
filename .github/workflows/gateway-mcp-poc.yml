@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fork-only checks for the gateway MCP proof of concept. Runs on GitHub-hosted
+# runners, so it works in a fork where the upstream self-hosted runners are not
+# available. The end-to-end checks need Docker and a dev gateway; run them
+# locally with examples/gateway-mcp-poc/run-checks.sh.
+name: gateway-mcp-poc
+
+on:
+  push:
+    branches: ["gateway-mcp-poc", "feat/gateway-mcp**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.repository != 'NVIDIA/OpenShell'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          install_args: "rust protoc"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: MCP crate (protocol only, fake backend)
+        run: cargo test --locked -p openshell-gateway-mcp
+      - name: Gateway child-sandbox rules
+        run: cargo test --locked -p openshell-server --features prebuilt-z3 --lib children
+      - name: Supervisor door
+        run: cargo test --locked -p openshell-supervisor-network --lib gateway_mcp_door
+      - name: Build gateway, CLI and supervisor
+        run: cargo build --locked -p openshell-gateway -p openshell-cli -p openshell-supervisor --features openshell-server/prebuilt-z3

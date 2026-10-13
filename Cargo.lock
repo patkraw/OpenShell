@@ -4671,6 +4671,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-gateway-mcp"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
@@ -4939,6 +4953,7 @@ dependencies = [
  "openshell-driver-vault",
  "openshell-extension-core",
  "openshell-gateway-interceptors",
+ "openshell-gateway-mcp",
  "openshell-ocsf",
  "openshell-otel",
  "openshell-policy",

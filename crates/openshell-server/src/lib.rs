@@ -15,6 +15,7 @@
 
 mod auth;
 pub mod certgen;
+mod children;
 pub mod cli;
 mod compute;
 pub mod config_file;
@@ -28,7 +29,6 @@ mod gateway_ocsf;
 mod gateway_ring;
 mod grpc;
 mod http;
-mod mcp;
 mod middleware;
 mod multiplex;
 mod ocsf_log;
@@ -288,8 +288,8 @@ pub struct ServerState {
     /// Active SSH tunnel connection counts per session token.
     pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
 
-    /// Gateway MCP grants and lineage (proof of concept, in memory).
-    pub(crate) mcp: mcp::McpState,
+    /// Child-sandbox grants and lineage (proof of concept, in memory).
+    pub(crate) children: children::ChildrenState,
 
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
@@ -447,7 +447,7 @@ impl ServerState {
             tracing_log_bus,
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
-            mcp: mcp::McpState::default(),
+            children: children::ChildrenState::default(),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
