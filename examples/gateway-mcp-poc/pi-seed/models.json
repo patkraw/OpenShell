@@ -1,0 +1,10 @@
+{
+  "providers": {
+    "nvidia": {
+      "baseUrl": "https://inference-api.nvidia.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "models": [{ "id": "aws/anthropic/bedrock-claude-sonnet-5-5" }]
+    }
+  }
+}

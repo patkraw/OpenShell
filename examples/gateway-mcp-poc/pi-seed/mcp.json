@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "openshell": {
+      "url": "http://openshell.local/mcp",
+      "description": "OpenShell gateway: create and manage child sandboxes",
+      "timeout": 600
+    }
+  }
+}

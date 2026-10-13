@@ -452,6 +452,11 @@ fn tools_for(state: &ServerState, principal: &Principal) -> Vec<Value> {
             }
             tools.push(tool("wait", "Wait until a child is ready or has exited.", json!({"type": "object", "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}}, "required": ["handle"]})));
             tools.push(tool("get_output", "Recent log output of a child.", handle.clone()));
+            tools.push(tool(
+                "get_file",
+                "Read a file from a running child (e.g. its result file). Max 256 KiB.",
+                json!({"type": "object", "properties": {"handle": {"type": "string"}, "path": {"type": "string"}}, "required": ["handle", "path"]}),
+            ));
             tools.push(tool("stop_sandbox", "Stop a child (its children are stopped first).", handle));
             tools.push(tool("list_children", "Your children.", json!({"type": "object", "properties": {}})));
             tools.push(tool("get_limits", "Your depth, children and total left.", json!({"type": "object", "properties": {}})));
@@ -508,6 +513,7 @@ async fn call_tool(
         (Principal::Sandbox(s), "create_sandbox") => create_child(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "wait") => wait_child(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "get_output") => child_output(state, &s.sandbox_id, args).await,
+        (Principal::Sandbox(s), "get_file") => child_file(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "stop_sandbox") => stop_child(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "list_children") => Ok(list_children(state, &s.sandbox_id)),
         (Principal::Sandbox(s), "get_limits") => Ok(get_limits(state, &s.sandbox_id)),
@@ -782,6 +788,46 @@ async fn child_output(state: &Arc<ServerState>, caller_id: &str, args: &Value) -
         .map(|l| format!("[{}] {}", l.source, l.message))
         .collect();
     Ok(json!({"handle": child.name, "lines": lines}))
+}
+
+const MAX_FILE_BYTES: usize = 256 * 1024;
+
+async fn child_file(state: &Arc<ServerState>, caller_id: &str, args: &Value) -> Result<Value, ToolError> {
+    use openshell_core::proto::{ExecSandboxRequest, exec_sandbox_event::Payload};
+    use tokio_stream::StreamExt;
+    let child = own_child(state, caller_id, args)?;
+    let path = str_arg(args, "path").ok_or_else(|| terr("INVALID_ARGUMENT", "path is required"))?;
+    let grant = state.mcp.grant(&child.grant_id).ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
+    let mut req = tonic::Request::new(ExecSandboxRequest {
+        workspace_scope: Some(workspace_selector(child.workspace.clone())),
+        sandbox: child.name.clone(),
+        command: vec!["cat".to_string(), path.to_string()],
+        no_login_shell: true,
+        ..Default::default()
+    });
+    req.extensions_mut()
+        .insert(Principal::User(UserPrincipal { identity: grant.user.clone() }));
+    let mut stream = crate::grpc::sandbox::handle_exec_sandbox(state, req)
+        .await
+        .map_err(|s| terr("EXEC_FAILED", s.message()))?
+        .into_inner();
+    let (mut out, mut err, mut code) = (Vec::new(), Vec::new(), None);
+    while let Some(ev) = stream.next().await {
+        match ev.map_err(|s| terr("EXEC_FAILED", s.message()))?.payload {
+            Some(Payload::Stdout(o)) => out.extend_from_slice(&o.data),
+            Some(Payload::Stderr(e)) => err.extend_from_slice(&e.data),
+            Some(Payload::Exit(x)) => code = Some(x.exit_code),
+            None => {}
+        }
+        if out.len() > MAX_FILE_BYTES {
+            out.truncate(MAX_FILE_BYTES);
+            break;
+        }
+    }
+    if code.unwrap_or(0) != 0 {
+        return Err(terr("FILE_ERROR", String::from_utf8_lossy(&err).trim().to_string()));
+    }
+    Ok(json!({"handle": child.name, "path": path, "content": String::from_utf8_lossy(&out)}))
 }
 
 async fn stop_child(state: &Arc<ServerState>, caller_id: &str, args: &Value) -> Result<Value, ToolError> {
