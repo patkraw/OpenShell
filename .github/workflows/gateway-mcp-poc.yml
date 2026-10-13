@@ -23,25 +23,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
-          install_args: "rust protoc"
+          install_args: "rust protoc github:mozilla/sccache"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: MCP crate (protocol only, fake backend)
-        # mise.toml sets RUSTC_WRAPPER=sccache, which this job does not install.
-        env:
-          RUSTC_WRAPPER: ""
         run: cargo test --locked -p openshell-gateway-mcp
       - name: Gateway child-sandbox rules
-        # mise.toml sets RUSTC_WRAPPER=sccache, which this job does not install.
-        env:
-          RUSTC_WRAPPER: ""
         run: cargo test --locked -p openshell-server --features prebuilt-z3 --lib children
       - name: Supervisor door
-        # mise.toml sets RUSTC_WRAPPER=sccache, which this job does not install.
-        env:
-          RUSTC_WRAPPER: ""
         run: cargo test --locked -p openshell-supervisor-network --lib gateway_mcp_door
       - name: Build gateway, CLI and supervisor
-        # mise.toml sets RUSTC_WRAPPER=sccache, which this job does not install.
-        env:
-          RUSTC_WRAPPER: ""
         run: cargo build --locked -p openshell-gateway -p openshell-cli -p openshell-supervisor --features openshell-server/prebuilt-z3
