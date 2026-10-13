@@ -1,0 +1,1 @@
+{"license": "Apache-2.0", "expected_license": "Apache-2.0", "match": true, "a_read_data": "denied", "a_other_path": "denied", "b_network": "denied", "wide_error": "EXCEEDS_CEILING"}

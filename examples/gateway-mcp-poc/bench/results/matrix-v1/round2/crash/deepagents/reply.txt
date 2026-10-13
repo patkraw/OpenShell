@@ -1,0 +1,10 @@
+I couldn't get the error counts, so I'm not giving the JSON. I can't produce the answer without making up numbers.
+
+- **w1:** It failed with exit code 3 (`SANDBOX_PHASE_ERROR`) and never wrote `/tmp/result.txt`.
+- **w2:** It started, and `wait` reported `file_ready: true`. The first `get_file` for `/tmp/result.txt` then failed with `EXEC_FAILED: relay open timed out`.
+- **My mistake:** I called `stop_sandbox` on w1 and w2 in the same step as that read, instead of waiting to see whether it worked. Once w2 was stopped, a second `get_file` returned `NOT_YOUR_CHILD`, and so did `get_output`. The result is gone.
+- **Retry handle:** Sending the `retry-w2` request again after w2 had been created returned the same handle, `w2`. The very first duplicate, sent in parallel with the original, got `IN_PROGRESS` instead.
+
+What I do know for the JSON is `first_exit_code` = 3 and `retry_handle_same` = true. `total_errors`, `top_error` and `top_error_count` are unknown.
+
+I can start a new worker, for example with a fresh `request_id`, and read its result file before stopping it. Do you want me to?

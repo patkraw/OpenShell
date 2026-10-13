@@ -1,0 +1,5 @@
+exit: 0
+[0m
+> build · aws/anthropic/bedrock-claude-sonnet-5-5
+[0m
+[0m→ [0mRead /data/inject/report.txt

@@ -1,0 +1,9 @@
+[0m
+> build · aws/anthropic/bedrock-claude-sonnet-5-5
+[0m
+[0m⚙ [0mopenshell_create_sandbox {"name":"ma","providers":["harness-nvidia"],"command":["agent-run","/usr/local/share/bench/prompts/tree-manager-A.txt"]}
+[0m⚙ [0mopenshell_create_sandbox {"name":"mb","providers":["harness-nvidia"],"command":["agent-run","/usr/local/share/bench/prompts/tree-manager-B.txt"]}
+[0m⚙ [0mopenshell_wait {"handle":"mb","until_file":"/tmp/result.txt","return_file":true,"timeout_s":45}
+[0m⚙ [0mopenshell_wait {"handle":"ma","until_file":"/tmp/result.txt","return_file":true,"timeout_s":45}
+[0m⚙ [0mopenshell_stop_sandbox {"handle":"ma"}
+[0m⚙ [0mopenshell_stop_sandbox {"handle":"mb"}

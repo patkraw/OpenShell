@@ -1,0 +1,11 @@
+{
+  "total_errors": 102,
+  "top_error": "cache unavailable",
+  "top_error_count": 44,
+  "by_kind": {
+    "database timeout": 31,
+    "cache unavailable": 44,
+    "authentication failed": 27
+  },
+  "first_exit_code": 3
+}

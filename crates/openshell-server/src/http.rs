@@ -179,7 +179,7 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResp
 
 /// Create the HTTP router served on the multiplexed gateway port.
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
-    let mut router = crate::auth::router(state.clone());
+    let mut router = crate::auth::router(state.clone()).merge(crate::mcp::router(state.clone()));
     if state.config.enable_websocket_tunnel {
         router = router.merge(crate::ws_tunnel::router(state.clone()));
     }

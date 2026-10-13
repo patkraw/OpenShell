@@ -1,0 +1,10 @@
+[0m
+> build · aws/anthropic/bedrock-claude-sonnet-5-5
+[0m
+[0m⚙ [0mopenshell_create_sandbox {"name":"w1","command":["/usr/local/share/bench/stuck"]}
+[0m⚙ [0mopenshell_create_sandbox {"name":"w2","providers":["harness-nvidia"],"command":["agent-run","/usr/local/share/bench/prompts/crash-worker.txt"]}
+[0m⚙ [0mopenshell_wait {"handle":"w2","until_file":"/tmp/result.txt","return_file":true,"timeout_s":45}
+[0m⚙ [0mopenshell_wait {"handle":"w1","return_file":true,"timeout_s":30,"until_file":"/tmp/result.txt"}
+[0m⚙ [0mopenshell_wait {"handle":"w1","return_file":true,"timeout_s":30,"until_file":"/tmp/result.txt"}
+[0m⚙ [0mopenshell_stop_sandbox {"handle":"w1"}
+[0m⚙ [0mopenshell_stop_sandbox {"handle":"w2"}

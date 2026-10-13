@@ -1,0 +1,3 @@
+Total: 171+166+165 = 502. Cache unavailable: 71+71+68 = 210.
+
+{"total_errors": 502, "top_error": "cache unavailable", "top_error_count": 210, "children_used": 3}

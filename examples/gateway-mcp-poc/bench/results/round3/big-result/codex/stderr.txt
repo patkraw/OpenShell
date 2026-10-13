@@ -1,0 +1,32 @@
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/codex-home"))
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /workspace
+model: aws/anthropic/bedrock-claude-sonnet-5-5
+provider: nvidia
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 01a16418-f0e4-7521-8c14-a722b360e203
+--------
+user
+You are the lead agent inside an OpenShell sandbox, with the tools of the "openshell" MCP server. A child sandbox runs a test suite and writes its report.
+1. Call create_sandbox with name "tests" and command ["/usr/local/share/bench/big-report"]. It writes its report to /tmp/result.txt.
+2. For tests, call wait with its handle, until_file "/tmp/result.txt", return_file true and timeout_s 45; if it timed out, call wait again the same way until file_ready is true or the child has exited. Its content field is the report; its first line is a JSON summary. Note whether the reply says the content was truncated.
+3. Call stop_sandbox for tests.
+4. Reply with only this JSON: {"tests": N, "failed": N, "slowest_test": "name", "truncated": true|false, "saw_end_line": true|false}
+warning: Model metadata for `aws/anthropic/bedrock-claude-sonnet-5-5` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.
+mcp: openshell/create_sandbox started
+mcp: openshell/create_sandbox (completed)
+mcp: openshell/wait started
+mcp: openshell/wait (completed)
+codex
+
+mcp: openshell/stop_sandbox started
+mcp: openshell/stop_sandbox (completed)
+codex
+{"tests": 6000, "failed": 137, "slowest_test": "test_upload_large_file", "truncated": true, "saw_end_line": false}
+tokens used
+14,640

@@ -1,0 +1,69 @@
+[1792634752.254] [gateway] [INFO ] [openshell_server::grpc::sandbox] CreateSandbox request completed successfully
+[1792634752.832] [sandbox] [INFO ] [openshell_supervisor] Starting sandbox supervision command=["agent-run", "/usr/local/share/bench/prompts/inject-summarize.txt"]
+[1792634752.926] [gateway] [INFO ] [openshell_server::grpc::policy] GetSandboxConfig served from spec (backfilled version 1)
+[1792634752.936] [gateway] [INFO ] [openshell_server::grpc::policy] GetSandboxProviderEnvironment request completed successfully
+[1792634752.966] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: accepted
+[1792634752.971] [gateway] [INFO ] [openshell_server::grpc::policy] ReportPolicyStatus: sandbox reported policy load result
+[1792634752.922] [sandbox] [INFO ] [openshell_supervisor] Fetching sandbox policy via gRPC endpoint=http://127.0.0.1:18080 sandbox=summarizer sandbox_id=f4b48ceb-4d24-4a66-9960-db5b5c44f368
+[1792634752.936] [sandbox] [INFO ] [openshell_supervisor_network::opa] Configured OPA runtime binary identity mode require_binary_identity=true source=proto
+[1792634752.936] [sandbox] [OCSF ] [ocsf] CONFIG:CONFIGURED [INFO] OPA runtime binary identity mode configured [source:proto require_binary_identity:true] [source:proto]
+[1792634752.952] [sandbox] [INFO ] [openshell_supervisor] Isolation boundary attached backend=openshell-sandbox
+[1792634752.953] [sandbox] [INFO ] [openshell_supervisor] Isolation boundary enforcement confirmed backend=openshell-sandbox
+[1792634752.954] [sandbox] [OCSF ] [ocsf] CONFIG:ENABLED [INFO] TLS termination enabled: ephemeral CA generated
+[1792634752.954] [sandbox] [OCSF ] [ocsf] CONFIG:READY [INFO] Policy DNS connected to isolation boundary
+[1792634752.954] [sandbox] [OCSF ] [ocsf] NET:LISTEN [INFO] 127.0.0.1:3128
+[1792634752.954] [sandbox] [WARN ] [openshell_supervisor_network::proxy] host.openshell.internal maps to a non-link-local IP; trusted-gateway SSRF exemption disabled ip=127.0.0.1
+[1792634752.963] [sandbox] [INFO ] [openshell_supervisor] Isolation boundary agent started backend=openshell-sandbox
+[1792634752.964] [sandbox] [OCSF ] [ocsf] SSH:LISTEN [INFO]
+[1792634752.964] [sandbox] [INFO ] [openshell_supervisor] Control-mode access plane started backend=openshell-sandbox
+[1792634752.969] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] 127.0.0.1:18080
+[1792634752.971] [sandbox] [OCSF ] [ocsf] CONFIG:LOADED [INFO] Acknowledged initial policy revision as loaded [version:1] [hash:faa30439c30bee988a6c6fa41f1a95e7a191a6c14b771e54626bedcd0e9115df]
+[1792634753.171] [sandbox] [OCSF ] [ocsf] CONFIG:PUBLISHED [INFO] Policy DNS mapped inference-api.nvidia.com resolved=32.185.76.2,35.80.253.140,44.232.191.203 synthetic=198.18.0.2 ports=443 mapping_id=84a41ce4-0dbb-4c67-8f82-b93504dbe625
+[1792634753.433] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=200
+[1792634753.449] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=202
+[1792634753.466] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=200
+[1792634753.504] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/local/bin/node(0) -> inference-api.nvidia.com:443 [policy:_provider_harness_nvidia engine:opa]
+[1792634753.582] [sandbox] [OCSF ] [ocsf] HTTP:POST [INFO] ALLOWED POST http://inference-api.nvidia.com:443/v1/chat/completions [policy:_provider_harness_nvidia engine:l7]
+[1792634754.087] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792634754.088] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792634754.088] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792634754.087] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=cda9b604-3883-490e-8369-8bd989577044, target=unix:/run/openshell/ssh.sock)
+[1792634754.087] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792634754.099] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=cda9b604-3883-490e-8369-8bd989577044, target=unix:/run/openshell/ssh.sock)
+[1792634755.333] [sandbox] [OCSF ] [ocsf] CONFIG:PUBLISHED [INFO] Policy DNS mapped inference-api.nvidia.com resolved=32.185.76.2,35.80.253.140,44.232.191.203 synthetic=198.18.0.2 ports=443 mapping_id=40866f66-739a-4e51-b6ca-81b8073ca054
+[1792634755.336] [sandbox] [OCSF ] [ocsf] CONFIG:PUBLISHED [INFO] Policy DNS mapped inference-api.nvidia.com resolved=32.185.76.2,35.80.253.140,44.232.191.203 synthetic=198.18.0.2 ports=443 mapping_id=0e01c0b1-89f5-4980-9f35-a3647e9d5eee
+[1792634755.406] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/local/bin/node(0) -> inference-api.nvidia.com:443 [policy:_provider_harness_nvidia engine:opa]
+[1792634755.409] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/local/bin/node(0) -> inference-api.nvidia.com:443 [policy:_provider_harness_nvidia engine:opa]
+[1792634755.484] [sandbox] [OCSF ] [ocsf] HTTP:POST [INFO] ALLOWED POST http://inference-api.nvidia.com:443/v1/chat/completions [policy:_provider_harness_nvidia engine:l7]
+[1792634757.110] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792634757.112] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792634757.112] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792634757.109] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=e9f0cabd-5e2d-408c-9433-63250a4a8b0e, target=unix:/run/openshell/ssh.sock)
+[1792634757.109] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792634757.128] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=e9f0cabd-5e2d-408c-9433-63250a4a8b0e, target=unix:/run/openshell/ssh.sock)
+[1792634760.139] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792634760.140] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792634760.140] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792634760.138] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=b0de14e1-85a7-4a8e-aaa2-feec43f64496, target=unix:/run/openshell/ssh.sock)
+[1792634760.138] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792634760.159] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=b0de14e1-85a7-4a8e-aaa2-feec43f64496, target=unix:/run/openshell/ssh.sock)
+[1792634763.170] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792634763.172] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792634763.172] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792634763.169] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=974c16c9-3a0a-4e08-8dfc-9c24d6c528d0, target=unix:/run/openshell/ssh.sock)
+[1792634763.169] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792634763.195] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=974c16c9-3a0a-4e08-8dfc-9c24d6c528d0, target=unix:/run/openshell/ssh.sock)
+[1792634765.234] [sandbox] [OCSF ] [ocsf] CONFIG:PUBLISHED [INFO] Policy DNS mapped inference-api.nvidia.com resolved=32.185.76.2,35.80.253.140,44.232.191.203 synthetic=198.18.0.2 ports=443 mapping_id=0b14767e-0e90-44bc-9571-3b65bd7650bf
+[1792634765.309] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/local/bin/node(0) -> inference-api.nvidia.com:443 [policy:_provider_harness_nvidia engine:opa]
+[1792634766.205] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792634766.207] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792634766.207] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792634766.204] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=fc604faa-db98-4c2d-be3e-445a493465ab, target=unix:/run/openshell/ssh.sock)
+[1792634766.204] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792634766.232] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=fc604faa-db98-4c2d-be3e-445a493465ab, target=unix:/run/openshell/ssh.sock)
+[1792634768.052] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792634768.053] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792634768.053] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792634768.051] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=a72e02e4-d790-4c66-ac47-32b485b44d4a, target=unix:/run/openshell/ssh.sock)
+[1792634768.052] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792634768.067] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=a72e02e4-d790-4c66-ac47-32b485b44d4a, target=unix:/run/openshell/ssh.sock)

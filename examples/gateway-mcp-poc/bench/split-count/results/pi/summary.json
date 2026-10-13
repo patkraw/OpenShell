@@ -1,0 +1,1 @@
+{"harness":"pi","exit":0,"seconds":24,"openshell_children":2,"children_left_running":0,"score":{"pass": true, "checks": {"found_answer": true, "total_errors": true, "top_error": true, "top_error_count": true}, "answer": {"total_errors": 790, "top_error": "cache unavailable", "top_error_count": 285}}}

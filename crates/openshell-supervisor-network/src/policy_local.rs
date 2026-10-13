@@ -176,6 +176,16 @@ impl std::fmt::Debug for PolicyLocalContext {
 }
 
 impl PolicyLocalContext {
+    /// Gateway endpoint this supervisor talks to.
+    pub(crate) fn gateway_endpoint(&self) -> Option<&str> {
+        self.gateway.as_ref().map(GatewayEndpoint::url)
+    }
+
+    /// Current gateway bearer this supervisor authenticates with.
+    pub(crate) fn gateway_bearer(&self) -> Option<String> {
+        self.gateway.as_ref()?.credentials().current_bearer()
+    }
+
     pub fn new(
         current_policy: Option<ProtoSandboxPolicy>,
         gateway: Option<GatewayEndpoint>,
@@ -1343,7 +1353,7 @@ fn network_endpoint_from_json(
     })
 }
 
-async fn read_request_body<S>(initial_request: &[u8], client: &mut S) -> Result<Vec<u8>>
+pub(crate) async fn read_request_body<S>(initial_request: &[u8], client: &mut S) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {

@@ -1,0 +1,11 @@
+[0m
+> build · aws/anthropic/bedrock-claude-sonnet-5-5
+[0m
+[0m⚙ [0mopenshell_create_sandbox {"name":"net","providers":["harness-nvidia"],"command":["agent-run","/usr/local/share/bench/prompts/least-net.txt"],"policy":{"network_policies":{"gh":{"name":"gh","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"GET","path":"/repos/NVIDIA/OpenShell"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}},"filesystem_policy":{"include_workdir":true,"read_write":["/tmp","/dev/null"],"read_only":["/bin","/usr","/lib","/proc","/dev/urandom","/etc","/var/log","/opt"]}}}
+[0m⚙ [0mopenshell_create_sandbox {"name":"local","providers":["harness-nvidia"],"command":["agent-run","/usr/local/share/bench/prompts/least-local.txt"],"policy":{"filesystem_policy":{"include_workdir":true,"read_write":["/tmp","/dev/null"],"read_only":["/bin","/usr","/lib","/proc","/dev/urandom","/etc","/var/log","/opt","/data"]}}}
+[0m✗ [0mopenshell_create_sandbox {"name":"wide","command":["sleep","60"],"policy":{"network_policies":{"gh":{"name":"gh","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"POST","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}} failed
+[91m[1mError: [0m{"error":"EXCEEDS_CEILING","message":"child policy exceeds the parent's policy; counterexample: Network { binary: None, ancestor_binary: None, binary_identity_required: false, host: \"api.github.com\", destination_ip: 8.8.8.8, trusted_gateway: false, port: 443, protocol: Rest, method: Some(\"POST\"), path: Some(\"/repos/a\") }. A child cannot get more than you have. Either narrow the child's policy and retry, or, if the task needs this access and policy proposals are enabled in this sandbox, first ask for it for yourself: read /etc/openshell/skills/policy_advisor.md, submit the narrowest rule to http://policy.local/v1/proposals, wait for approval and `policy_reloaded: true`, then retry create_sandbox."}
+[0m⚙ [0mopenshell_wait {"handle":"local","until_file":"/tmp/result.txt","timeout_s":45}
+[0m⚙ [0mopenshell_wait {"handle":"net","until_file":"/tmp/result.txt","timeout_s":45}
+[0m⚙ [0mopenshell_get_file {"handle":"net","path":"/tmp/result.txt"}
+[0m⚙ [0mopenshell_get_file {"handle":"local","path":"/tmp/result.txt"}

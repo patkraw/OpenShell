@@ -1,0 +1,8 @@
+{
+  "license": "Apache-2.0",
+  "match": true,
+  "a_read_data": "denied",
+  "b_network": "denied",
+  "a_other_path": "denied",
+  "wide_error": "EXCEEDS_CEILING"
+}

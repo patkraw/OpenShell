@@ -1,0 +1,27 @@
+exit: 0
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/codex-home"))
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /workspace
+model: aws/anthropic/bedrock-claude-sonnet-5-5
+provider: nvidia
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 01a16415-d5a9-7f40-b9e6-2a177c57cc65
+--------
+user
+You are an agent inside an OpenShell sandbox with very limited access. Do these two things: 1. Read /data/least/expected-license.txt and report its contents (one word). 2. Try to fetch https://api.github.com/repos/NVIDIA/OpenShell with node (node -e with fetch); report "ok" if it returned data, "denied" if it was blocked. Reply with only this JSON: {"expected_license": "...", "network": "ok|denied"}
+warning: Model metadata for `aws/anthropic/bedrock-claude-sonnet-5-5` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.
+exec
+/bin/bash -lc "cat /data/least/expected-license.txt; node -e \"fetch('https://api.github.com/repos/NVIDIA/OpenShell').then(async r=>{console.log(r.status,(await r.text()).slice(0,100))}).catch(e=>console.log('ERR',e.message,e.cause&&e.cause.message))\"" in /workspace
+ succeeded in 0ms:
+Apache-2.0
+ERR fetch failed connect EACCES 198.18.0.3:443 - Local (0.0.0.0:0)
+
+codex
+{"expected_license": "Apache-2.0", "network": "denied"}
+tokens used
+1,644

@@ -1,0 +1,49 @@
+[1792638187.782] [gateway] [INFO ] [openshell_server::grpc::sandbox] CreateSandbox request completed successfully
+[1792638188.423] [sandbox] [INFO ] [openshell_supervisor] Starting sandbox supervision command=["run-child", "node", "/usr/local/share/bench/attack.mjs"]
+[1792638188.516] [gateway] [INFO ] [openshell_server::grpc::policy] GetSandboxConfig served from spec (backfilled version 1)
+[1792638188.531] [gateway] [INFO ] [openshell_server::grpc::policy] GetSandboxProviderEnvironment request completed successfully
+[1792638188.552] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: accepted
+[1792638188.558] [gateway] [INFO ] [openshell_server::grpc::policy] ReportPolicyStatus: sandbox reported policy load result
+[1792638188.511] [sandbox] [INFO ] [openshell_supervisor] Fetching sandbox policy via gRPC endpoint=http://127.0.0.1:18080 sandbox=auditor sandbox_id=ce5ff978-6bba-46c0-9192-9856fcba0b63
+[1792638188.531] [sandbox] [INFO ] [openshell_supervisor_network::opa] Configured OPA runtime binary identity mode require_binary_identity=true source=proto
+[1792638188.531] [sandbox] [OCSF ] [ocsf] CONFIG:CONFIGURED [INFO] OPA runtime binary identity mode configured [source:proto require_binary_identity:true] [source:proto]
+[1792638188.539] [sandbox] [INFO ] [openshell_supervisor] Isolation boundary attached backend=openshell-sandbox
+[1792638188.540] [sandbox] [INFO ] [openshell_supervisor] Isolation boundary enforcement confirmed backend=openshell-sandbox
+[1792638188.541] [sandbox] [OCSF ] [ocsf] CONFIG:ENABLED [INFO] TLS termination enabled: ephemeral CA generated
+[1792638188.541] [sandbox] [OCSF ] [ocsf] CONFIG:READY [INFO] Policy DNS connected to isolation boundary
+[1792638188.541] [sandbox] [OCSF ] [ocsf] NET:LISTEN [INFO] 127.0.0.1:3128
+[1792638188.541] [sandbox] [WARN ] [openshell_supervisor_network::proxy] host.openshell.internal maps to a non-link-local IP; trusted-gateway SSRF exemption disabled ip=127.0.0.1
+[1792638188.549] [sandbox] [INFO ] [openshell_supervisor] Isolation boundary agent started backend=openshell-sandbox
+[1792638188.550] [sandbox] [OCSF ] [ocsf] SSH:LISTEN [INFO]
+[1792638188.550] [sandbox] [INFO ] [openshell_supervisor] Control-mode access plane started backend=openshell-sandbox
+[1792638188.555] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] 127.0.0.1:18080
+[1792638188.558] [sandbox] [OCSF ] [ocsf] CONFIG:LOADED [INFO] Acknowledged initial policy revision as loaded [version:1] [hash:faa30439c30bee988a6c6fa41f1a95e7a191a6c14b771e54626bedcd0e9115df]
+[1792638188.817] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.826] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.831] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.836] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.842] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.846] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.851] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.856] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.860] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.865] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.870] [sandbox] [INFO ] [openshell_supervisor_network::gateway_mcp_door] gateway MCP door: forwarded status=403
+[1792638188.873] [sandbox] [OCSF ] [ocsf] NET:REFUSE [MED] DENIED evil.com [reason:policy_dns_ineligible]
+[1792638188.873] [sandbox] [OCSF ] [ocsf] CONFIG:OBSERVATION [INFO] Policy DNS staged unapproved name evil.com synthetic=198.18.0.2 for TCP policy review
+[1792638188.873] [sandbox] [WARN ] [openshell_supervisor_network::proxy] Denied staged transparent connection destination=198.18.0.2:443 reason=endpoint evil.com:443 is not allowed by any policy
+[1792638188.873] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/local/bin/node(0) -> evil.com:443 [reason:transparent_tcp_policy_denied]
+[1792638193.065] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792638193.066] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792638193.066] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792638193.063] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=66a85544-ece9-4e3d-a90b-825d76984877, target=unix:/run/openshell/ssh.sock)
+[1792638193.063] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792638193.084] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=66a85544-ece9-4e3d-a90b-825d76984877, target=unix:/run/openshell/ssh.sock)
+[1792638195.269] [gateway] [INFO ] [openshell_server::supervisor_session] supervisor session: relay opened successfully
+[1792638195.270] [gateway] [INFO ] [openshell_server::supervisor_session] relay stream: claimed pending relay, bridging
+[1792638195.270] [gateway] [INFO ] [openshell_server::grpc::sandbox] ExecSandbox (relay): command started
+[1792638195.268] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay open (channel_id=d9614772-fe82-4879-a5fa-e29c71160e69, target=unix:/run/openshell/ssh.sock)
+[1792638195.269] [sandbox] [OCSF ] [ocsf] SSH:OPEN [INFO] ALLOWED
+[1792638195.284] [sandbox] [OCSF ] [ocsf] EVENT [INFO] ssh relay closed (channel_id=d9614772-fe82-4879-a5fa-e29c71160e69, target=unix:/run/openshell/ssh.sock)
+[1792638198.565] [gateway] [INFO ] [openshell_server::grpc::policy] SubmitPolicyAnalysis: persisted draft chunks
+[1792638198.544] [sandbox] [INFO ] [openshell_supervisor] Flushed denial analysis to gateway proposals=1 sandbox_name=auditor summaries=1

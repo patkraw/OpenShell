@@ -176,6 +176,14 @@ impl GatewayCredentials {
         self.inner.sandbox_bearer.clone()
     }
 
+    /// The current gateway bearer (`"Bearer <jwt>"`), or `None` once revoked.
+    /// Used by the supervisor's gateway MCP door to forward calls as this sandbox.
+    #[must_use]
+    pub fn current_bearer(&self) -> Option<String> {
+        let value = self.inner.bearer.read().ok()?;
+        value.as_ref()?.to_str().ok().map(str::to_string)
+    }
+
     /// Clear both credentials and stop renewal. Existing clients fail their
     /// next request locally instead of presenting a revoked identity.
     pub fn revoke(&self) {

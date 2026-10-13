@@ -1,0 +1,12 @@
+{
+  "total_errors": 502,
+  "top_error": "cache unavailable",
+  "top_error_count": 210,
+  "by_kind": {
+    "database timeout": 91,
+    "cache unavailable": 210,
+    "disk full": 54,
+    "authentication failed": 90,
+    "upstream 502": 57
+  }
+}

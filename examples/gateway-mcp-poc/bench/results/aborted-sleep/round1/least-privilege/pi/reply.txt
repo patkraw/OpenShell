@@ -1,0 +1,7 @@
+I couldn't get the comparison done. Both children, "net" and "local", failed at startup, so neither produced a result file.
+
+Both sandboxes went into `SANDBOX_PHASE_ERROR` with the same gateway log. The supervisor exited with: "sandbox JWT validation failed: session token was issued in the future". That looks like a clock-skew problem in the infrastructure. I waited twice on each child, and both waits returned the error phase with `file_ready` false and no exit code. I didn't stop either child.
+
+"wide" was rejected with `EXCEEDS_CEILING`. Its policy allows POST to `/repos/**`, which is more than my own policy allows.
+
+I have no values for the license, the expected license, or net's `read_data` and `other_path`, or local's `network`. I haven't filled in a JSON reply with guesses. Retrying "net" and "local" once the clock issue is fixed should work. The only other option is more waits, which won't help while they stay in the error phase.

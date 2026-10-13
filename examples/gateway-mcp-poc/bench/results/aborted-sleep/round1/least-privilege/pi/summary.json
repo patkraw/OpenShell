@@ -1,0 +1,1 @@
+{"task":"least-privilege","harness":"pi","exit":0,"seconds":948,"score":{"pass": false, "checks": {"license": false, "match": false, "a_read_data": false, "b_network": false, "a_other_path": false, "wide_error": false, "ceiling_refused_by_gateway": true, "wide_never_created": true, "net_denial_logged": true, "local_denial_logged": true}, "answer": {}}}

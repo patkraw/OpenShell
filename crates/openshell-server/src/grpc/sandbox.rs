@@ -294,7 +294,7 @@ fn generate_routable_name() -> String {
 // Sandbox lifecycle handlers
 // ---------------------------------------------------------------------------
 
-pub(super) async fn handle_create_sandbox(
+pub(crate) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
@@ -586,6 +586,13 @@ async fn handle_create_sandbox_inner(
         validate_no_reserved_provider_policy_keys(policy)?;
         *policy = validate_and_canonicalize_policy(policy.clone())?;
     }
+    // Gateway MCP POC: a grant set at start records the ceiling and adds the door rule.
+    let mcp_grant = crate::mcp::prepare_granted_create(&principal, &request.annotations, &mut spec)?;
+    if mcp_grant.is_some()
+        && let Some(ref mut policy) = spec.policy
+    {
+        *policy = validate_and_canonicalize_policy(policy.clone())?;
+    }
 
     // Process identity and MCP default materialization can increase the
     // protobuf size. Recheck the exact canonical spec before any middleware or
@@ -770,6 +777,9 @@ async fn handle_create_sandbox_inner(
         service_urls.insert(exposure.service.clone(), endpoint.into_inner().url);
     }
 
+    if let Some((grant, ceiling)) = mcp_grant {
+        crate::mcp::register_granted_sandbox(state, &principal, &sandbox, grant, ceiling);
+    }
     info!(
         sandbox_id = %id,
         sandbox_name = %name,
@@ -1725,6 +1735,12 @@ async fn handle_delete_sandbox_inner(
     // identity/version fields. The compute layer still binds the resolved
     // object ID and lifecycle guards before committing deletion.
     let preconditions = SandboxDeletePreconditions::default();
+
+    // Gateway MCP POC: cascade stop, children first.
+    if let Ok(Some(existing)) = state.store.get_message_by_name::<Sandbox>(&workspace, &name).await {
+        crate::mcp::cascade_stop_children(state, existing.object_id()).await;
+        state.mcp.forget(existing.object_id());
+    }
     let result = state
         .compute
         .delete_sandbox_allow_missing_with_preconditions(

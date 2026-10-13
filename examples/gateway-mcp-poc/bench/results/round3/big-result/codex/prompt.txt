@@ -1,0 +1,5 @@
+You are the lead agent inside an OpenShell sandbox, with the tools of the "openshell" MCP server. A child sandbox runs a test suite and writes its report.
+1. Call create_sandbox with name "tests" and command ["/usr/local/share/bench/big-report"]. It writes its report to /tmp/result.txt.
+2. For tests, call wait with its handle, until_file "/tmp/result.txt", return_file true and timeout_s 45; if it timed out, call wait again the same way until file_ready is true or the child has exited. Its content field is the report; its first line is a JSON summary. Note whether the reply says the content was truncated.
+3. Call stop_sandbox for tests.
+4. Reply with only this JSON: {"tests": N, "failed": N, "slowest_test": "name", "truncated": true|false, "saw_end_line": true|false}

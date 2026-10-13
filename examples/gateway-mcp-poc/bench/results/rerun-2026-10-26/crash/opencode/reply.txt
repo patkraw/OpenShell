@@ -1,0 +1,3 @@
+w1 failed with exit code 3.
+w3 exit=4 (not usable).
+{"total_errors": 102, "top_error": "cache unavailable", "top_error_count": 44, "first_exit_code": 3, "retry_handle_same": true, "w3_exit_code": 4}

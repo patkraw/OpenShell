@@ -1,0 +1,9 @@
+I couldn't get the error counts. Both child sandboxes failed at startup, so neither produced `/tmp/result.txt`, and I didn't read the log myself as instructed.
+
+- **w1:** `wait` returned phase `SANDBOX_PHASE_ERROR`, `file_ready` false and no exit code, so `first_exit_code` is null.
+- **w2:** it failed the same way.
+- **Cause:** both supervisors exited with "sandbox JWT validation failed: session token was issued in the future". That points to a clock mismatch between the gateway and the sandboxes. A retry will probably fail the same way until it's fixed.
+- **Retry:** the second `create_sandbox` call with `request_id` "retry-w2" returned handle `w2` with `repeated_request: true`, so the handle was the same.
+- **Cleanup:** I stopped both w1 and w2.
+
+{"total_errors": null, "top_error": null, "top_error_count": null, "first_exit_code": null, "retry_handle_same": true}

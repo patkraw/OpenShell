@@ -1,0 +1,10 @@
+I couldn't get the error counts, so I'm not giving the JSON. Any numbers I put in it would be made up.
+
+- **w1:** it failed with exit code 3 and never wrote `/tmp/result.txt`.
+- **w2:** `wait` reported its `/tmp/result.txt` as ready. But `get_file` on `w2` returned `NOT_YOUR_CHILD` ("'w2' is not your child"), so I couldn't read it.
+- **Retry:** the second `create_sandbox` call with `request_id` "retry-w2" returned the same handle, `w2`, flagged `repeated_request: true`.
+- **Cleanup:** I stopped both `w1` and `w2` after the failed read, so I haven't retried `get_file`.
+
+What I can confirm for the JSON is `"first_exit_code": 3` and `"retry_handle_same": true`. `total_errors`, `top_error` and `top_error_count` are still unknown.
+
+I can re-run `w2` and try to read the result again if you want. It would probably hit the same error unless the handle problem is fixed.

@@ -1,0 +1,3 @@
+Total 255+244=499. Cache unavailable 107+104=211.
+
+{"total_errors": 499, "top_error": "cache unavailable", "top_error_count": 211, "probe_errors": ["LIMIT_REACHED", "LIMIT_REACHED", "LIMIT_REACHED", "LIMIT_REACHED"]}

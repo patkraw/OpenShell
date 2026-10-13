@@ -1536,6 +1536,12 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
+        /// Let this sandbox's tree create child sandboxes through the gateway MCP
+        /// (proof of concept). Example:
+        /// `max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node`.
+        #[arg(long)]
+        grant: Option<String>,
+
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
@@ -3395,6 +3401,7 @@ async fn run_async() -> Result<()> {
                     driver_config_json,
                     providers,
                     policy,
+                    grant,
                     forward,
                     expose,
                     expose_authorization_mode,
@@ -3483,6 +3490,7 @@ async fn run_async() -> Result<()> {
                             editor,
                             providers: &providers,
                             policy: policy.as_deref(),
+                            grant: grant.as_deref(),
                             forward,
                             expose,
                             expose_authorization_mode: expose_authorization_mode.into(),

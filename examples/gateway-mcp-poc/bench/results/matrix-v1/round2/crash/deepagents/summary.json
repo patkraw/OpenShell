@@ -1,0 +1,1 @@
+{"task":"crash","harness":"deepagents","exit":0,"seconds":40,"score":{"pass": false, "checks": {"total_errors": false, "top_error": false, "top_error_count": false, "crash_seen": false, "retry_deduplicated": false, "none_left_running": true}, "answer": {}, "sandboxes": ["w1", "w2"]}}

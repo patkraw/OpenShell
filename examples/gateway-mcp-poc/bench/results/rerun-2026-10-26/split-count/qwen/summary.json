@@ -1,0 +1,1 @@
+{"task":"split-count","harness":"qwen","exit":0,"seconds":22,"score":{"pass": true, "checks": {"total_errors": true, "top_error": true, "top_error_count": true, "two_children": true, "none_left_running": true}, "answer": {"total_errors": 790, "top_error": "cache unavailable", "top_error_count": 285}}}

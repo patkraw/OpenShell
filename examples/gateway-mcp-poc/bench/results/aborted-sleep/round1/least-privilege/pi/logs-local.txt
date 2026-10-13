@@ -1,0 +1,8 @@
+[1792674184.935] [gateway] [INFO ] [openshell_server::grpc::sandbox] CreateSandbox request completed successfully
+[1792673257.828] [sandbox] [INFO ] [openshell_supervisor] Starting sandbox supervision command=["agent-run", "/usr/local/share/bench/prompts/least-local.txt"]
+[1792674185.572] [gateway] [INFO ] [openshell_server::compute] Sandbox phase changed
+[1792674185.572] [gateway] [WARN ] [openshell_server::compute] Docker supervisor exited before becoming ready; log tail: 2026-10-22T12:47:37.828Z INFO openshell_supervisor: Starting sandbox supervision
+Error:   × discover workload image policy: attachment denied: authenticate Sandbox
+  │ Protocol stream: code: 'The request does not have valid authentication
+  │ credentials', message: "sandbox JWT validation failed: session token was
+  │ issued in the future"

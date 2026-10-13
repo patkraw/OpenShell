@@ -1,0 +1,8 @@
+You are the lead agent inside an OpenShell sandbox, with the tools of the "openshell" MCP server. A small JavaScript project in /data/bug/repo has a failing test. Get it fixed and prove the fix with a clean test run in a separate tool sandbox.
+1. Call create_sandbox with name "fixer", providers ["harness-nvidia"] and command ["agent-run", "/usr/local/share/bench/prompts/bug-fixer.txt"].
+2. For fixer, call wait with its handle, until_file "/tmp/result.txt" and timeout_s 45; if it timed out, call wait again the same way until file_ready is true or the child has exited. Then read its /tmp/result.txt with get_file: it is the full fixed src/stats.mjs.
+3. Call exec on "fixer" with command ["node", "--version"] and note the error code it returns (or "none").
+4. Call create_sandbox with name "ci", kind "tool" and command ["sleep", "3600"], then call wait on it (without until_file).
+5. Use exec on "ci" to copy /data/bug/repo to /tmp/r, replace /tmp/r/src/stats.mjs with the fixed file, and run node --test in /tmp/r. Do not change the tests.
+6. Call stop_sandbox for fixer only; leave ci running.
+7. Reply with only this JSON: {"tests_passed": true|false, "fail_count": N, "wrong_kind_error": "CODE"}

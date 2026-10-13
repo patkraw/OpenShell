@@ -1,0 +1,21 @@
+# Pi coding agent for OpenShell, from docs/tutorials/run-pi-with-openrouter.mdx,
+# plus the gateway MCP POC client config (Pi has built-in MCP since 0.99).
+FROM node:24-bookworm-slim
+
+ARG PI_VERSION=latest
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates fd-find git ripgrep curl \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+# Scripted MCP client used by the POC checks.
+COPY mcp-client.mjs /usr/local/lib/gateway-mcp/mcp-client.mjs
+
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+WORKDIR /workspace
+
+ENV PI_CODING_AGENT_DIR=/tmp/pi-agent PI_OFFLINE=1 PI_TELEMETRY=0

@@ -1,0 +1,11 @@
+I couldn't get the error counts, so I'm not giving the JSON, because any numbers in it would be made up.
+
+- **w1:** It failed with exit code 3 and never wrote `/tmp/result.txt`.
+- **w2:** It was created, and `wait` reported `/tmp/result.txt` ready. The first `get_file` then failed with `EXEC_FAILED: relay open timed out`. I stopped both sandboxes in the same step as that read, so w2 was gone when I retried. The retry returned `NOT_YOUR_CHILD`, and I can't read the file now. I should have retried the read before stopping w2.
+- **Retry handle:** Two `create_sandbox` calls with `request_id` "retry-w2" went out in the same step. The first returned handle `w2`. The second returned `IN_PROGRESS`. A third call afterwards returned `{"handle":"w2","repeated_request":true}`, so the handle was the same.
+
+The values I do have:
+- `first_exit_code`: 3
+- `retry_handle_same`: true
+
+I don't have `total_errors`, `top_error` or `top_error_count`. Getting them means re-running the w2 worker and reading its result before stopping it. I haven't done that, because it goes beyond the steps you gave me.

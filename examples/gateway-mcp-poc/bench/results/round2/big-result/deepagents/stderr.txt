@@ -1,0 +1,2 @@
+MCP tools: ['create_sandbox', 'wait', 'exec', 'get_file', 'get_output', 'stop_sandbox', 'list_children', 'get_limits']
+final message: type=ai finish_reason=stop chars=114
