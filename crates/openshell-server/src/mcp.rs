@@ -50,6 +50,19 @@ pub const DOOR_RULE_KEY: &str = "openshell_gateway_mcp";
 pub const DOOR_HOST: &str = "openshell.local";
 pub const DOOR_PORT: u32 = 80;
 
+pub const KIND_AGENT: &str = "agent";
+pub const KIND_TOOL: &str = "tool";
+/// Default idle timeout for tool sandboxes.
+const DEFAULT_TOOL_IDLE: Duration = Duration::from_secs(600);
+const REAPER_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Whether a new child gets the door rule: only agents, and only with depth left.
+/// Tool sandboxes run commands for their parent and never create children.
+pub fn gets_door_rule(kind: &str, depth: u32, max_depth: u32) -> bool {
+    kind == KIND_AGENT && depth < max_depth
+}
+
 const PROVER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WAIT: Duration = Duration::from_secs(600);
 
@@ -91,6 +104,9 @@ pub struct Lineage {
     pub kind: String,
     pub lifetime: String,
     pub children_created: u32,
+    /// Tool sandboxes: stopped after this long without an `exec` / `get_file`.
+    pub idle_timeout_ms: Option<i64>,
+    pub last_used_ms: i64,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +118,7 @@ struct Inner {
 #[derive(Debug, Default)]
 pub struct McpState {
     inner: Mutex<Inner>,
+    reaper_started: std::sync::atomic::AtomicBool,
 }
 
 impl McpState {
@@ -132,6 +149,23 @@ impl McpState {
         }
         out.sort_by(|a, b| b.depth.cmp(&a.depth));
         out
+    }
+
+    fn touch(&self, sandbox_id: &str) {
+        if let Some(l) = self.lock().lineage.get_mut(sandbox_id) {
+            l.last_used_ms = now_ms();
+        }
+    }
+
+    /// Tool sandboxes idle past their timeout.
+    fn idle_tools(&self, now: i64) -> Vec<Lineage> {
+        self.lock()
+            .lineage
+            .values()
+            .filter(|l| l.kind == KIND_TOOL)
+            .filter(|l| l.idle_timeout_ms.is_some_and(|t| now - l.last_used_ms > t))
+            .cloned()
+            .collect()
     }
 
     pub fn forget(&self, sandbox_id: &str) {
@@ -282,9 +316,11 @@ pub fn register_granted_sandbox(
             parent_id: None,
             depth: 0,
             grant_id: grant_id.clone(),
-            kind: "agent".into(),
+            kind: KIND_AGENT.into(),
             lifetime: "until_stopped".into(),
             children_created: 0,
+            idle_timeout_ms: None,
+            last_used_ms: now_ms(),
         },
     );
     info!(grant_id = %grant_id, holder = %sandbox.object_name(), "mcp: grant registered");
@@ -453,6 +489,16 @@ fn tools_for(state: &ServerState, principal: &Principal) -> Vec<Value> {
             tools.push(tool("wait", "Wait until a child is ready or has exited.", json!({"type": "object", "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}}, "required": ["handle"]})));
             tools.push(tool("get_output", "Recent log output of a child.", handle.clone()));
             tools.push(tool(
+                "exec",
+                "Run a command in one of your TOOL children (kind \"tool\"); not allowed on agent children. \
+                 Every command is logged. Returns stdout, stderr and exit_code.",
+                json!({"type": "object", "properties": {
+                    "handle": {"type": "string"},
+                    "command": {"type": "array", "items": {"type": "string"}},
+                    "timeout_s": {"type": "integer"}
+                }, "required": ["handle", "command"]}),
+            ));
+            tools.push(tool(
                 "get_file",
                 "Read a file from a running child (e.g. its result file). Max 256 KiB.",
                 json!({"type": "object", "properties": {"handle": {"type": "string"}, "path": {"type": "string"}}, "required": ["handle", "path"]}),
@@ -484,6 +530,9 @@ fn can_create(state: &ServerState, sandbox_id: &str) -> Result<(Lineage, Grant),
         .mcp
         .lineage(sandbox_id)
         .ok_or_else(|| terr("NOT_ALLOWED", "this sandbox has no grant"))?;
+    if lineage.kind == KIND_TOOL {
+        return Err(terr("NOT_ALLOWED", "tool sandboxes cannot create children"));
+    }
     let grant = state
         .mcp
         .grant(&lineage.grant_id)
@@ -514,6 +563,7 @@ async fn call_tool(
         (Principal::Sandbox(s), "wait") => wait_child(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "get_output") => child_output(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "get_file") => child_file(state, &s.sandbox_id, args).await,
+        (Principal::Sandbox(s), "exec") => child_exec(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "stop_sandbox") => stop_child(state, &s.sandbox_id, args).await,
         (Principal::Sandbox(s), "list_children") => Ok(list_children(state, &s.sandbox_id)),
         (Principal::Sandbox(s), "get_limits") => Ok(get_limits(state, &s.sandbox_id)),
@@ -579,6 +629,10 @@ async fn create_child(
     }
     // 3. Grant and limits.
     let (parent_lineage, grant) = can_create(state, caller_id)?;
+    let kind = str_arg(args, "kind").unwrap_or(KIND_AGENT).to_string();
+    if kind != KIND_AGENT && kind != KIND_TOOL {
+        return Err(terr("INVALID_ARGUMENT", "kind must be \"agent\" or \"tool\""));
+    }
     let parent = state
         .store
         .get_message::<Sandbox>(caller_id)
@@ -637,9 +691,9 @@ async fn create_child(
         }
     };
 
-    // 8. Door rule only if the child may create children itself.
+    // 8. Door rule only for agents that may create children themselves.
     let mut policy = candidate;
-    if depth < grant.max_depth {
+    if gets_door_rule(&kind, depth, grant.max_depth) {
         let rule = door_rule(&grant.program).map_err(|e| terr("INTERNAL", e))?;
         policy.network_policies.insert(DOOR_RULE_KEY.to_string(), rule);
     }
@@ -647,11 +701,15 @@ async fn create_child(
     // 9. Same image, CPU and memory as the parent; no GPU.
     let mut template = parent_spec.template.clone().unwrap_or_default();
     template.driver_config = None;
-    let command: Vec<String> = args
+    let mut command: Vec<String> = args
         .get("command")
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default();
+    if command.is_empty() && kind == KIND_TOOL {
+        // A tool sandbox just stays up and runs what its parent sends with `exec`.
+        command = vec!["sleep".into(), "infinity".into()];
+    }
     if command.is_empty() {
         rollback(state);
         return Err(terr("INVALID_ARGUMENT", "command is required"));
@@ -660,7 +718,10 @@ async fn create_child(
     if let Some(task) = str_arg(args, "task") {
         environment.insert("OPENSHELL_TASK".to_string(), task.to_string());
     }
-    let kind = str_arg(args, "kind").unwrap_or("agent").to_string();
+    let idle_timeout_ms = (kind == KIND_TOOL).then(|| {
+        let secs = args.get("idle_timeout_s").and_then(Value::as_u64).unwrap_or(DEFAULT_TOOL_IDLE.as_secs());
+        i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX)
+    });
     let lifetime = str_arg(args, "lifetime").unwrap_or("until_stopped").to_string();
     let name = str_arg(args, "name").map_or_else(
         || format!("{}-c{}", parent.object_name(), parent_lineage.children_created + 1),
@@ -707,18 +768,24 @@ async fn create_child(
                 kind: kind.clone(),
                 lifetime: lifetime.clone(),
                 children_created: 0,
+                idle_timeout_ms,
+                last_used_ms: now_ms(),
             },
         );
         if let (Some(rid), Some(g)) = (request_id, inner.grants.get_mut(&grant.id)) {
             g.request_ids.insert(rid, created.object_name().to_string());
         }
     }
-    info!(parent = %parent.object_name(), child = %created.object_name(), depth, "mcp: child created");
+    if kind == KIND_TOOL {
+        start_idle_reaper(state);
+    }
+    info!(parent = %parent.object_name(), child = %created.object_name(), depth, %kind, "mcp: child created");
     Ok(json!({
         "handle": created.object_name(),
         "depth": depth,
-        "can_create_children": depth < grant.max_depth,
-        "kind": kind, "lifetime": lifetime
+        "can_create_children": gets_door_rule(&kind, depth, grant.max_depth),
+        "kind": kind, "lifetime": lifetime,
+        "idle_timeout_s": idle_timeout_ms.map(|ms| ms / 1000)
     }))
 }
 
@@ -792,17 +859,22 @@ async fn child_output(state: &Arc<ServerState>, caller_id: &str, args: &Value) -
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
 
-async fn child_file(state: &Arc<ServerState>, caller_id: &str, args: &Value) -> Result<Value, ToolError> {
+/// Run a command in a child through ExecSandbox, acting for the grant's user.
+async fn run_in_child(
+    state: &Arc<ServerState>,
+    child: &Lineage,
+    command: Vec<String>,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>, i32), ToolError> {
     use openshell_core::proto::{ExecSandboxRequest, exec_sandbox_event::Payload};
     use tokio_stream::StreamExt;
-    let child = own_child(state, caller_id, args)?;
-    let path = str_arg(args, "path").ok_or_else(|| terr("INVALID_ARGUMENT", "path is required"))?;
     let grant = state.mcp.grant(&child.grant_id).ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
     let mut req = tonic::Request::new(ExecSandboxRequest {
         workspace_scope: Some(workspace_selector(child.workspace.clone())),
         sandbox: child.name.clone(),
-        command: vec!["cat".to_string(), path.to_string()],
+        command,
         no_login_shell: true,
+        execution_timeout: prost_types::Duration::try_from(timeout).ok(),
         ..Default::default()
     });
     req.extensions_mut()
@@ -811,23 +883,81 @@ async fn child_file(state: &Arc<ServerState>, caller_id: &str, args: &Value) -> 
         .await
         .map_err(|s| terr("EXEC_FAILED", s.message()))?
         .into_inner();
-    let (mut out, mut err, mut code) = (Vec::new(), Vec::new(), None);
+    let (mut out, mut err, mut code) = (Vec::new(), Vec::new(), 0);
     while let Some(ev) = stream.next().await {
         match ev.map_err(|s| terr("EXEC_FAILED", s.message()))?.payload {
             Some(Payload::Stdout(o)) => out.extend_from_slice(&o.data),
             Some(Payload::Stderr(e)) => err.extend_from_slice(&e.data),
-            Some(Payload::Exit(x)) => code = Some(x.exit_code),
+            Some(Payload::Exit(x)) => code = x.exit_code,
             None => {}
         }
-        if out.len() > MAX_FILE_BYTES {
-            out.truncate(MAX_FILE_BYTES);
-            break;
-        }
+        out.truncate(MAX_FILE_BYTES);
+        err.truncate(MAX_FILE_BYTES);
     }
-    if code.unwrap_or(0) != 0 {
+    state.mcp.touch(&child.sandbox_id);
+    Ok((out, err, code))
+}
+
+async fn child_file(state: &Arc<ServerState>, caller_id: &str, args: &Value) -> Result<Value, ToolError> {
+    let child = own_child(state, caller_id, args)?;
+    let path = str_arg(args, "path").ok_or_else(|| terr("INVALID_ARGUMENT", "path is required"))?;
+    let (out, err, code) =
+        run_in_child(state, &child, vec!["cat".into(), path.to_string()], Duration::from_secs(30)).await?;
+    if code != 0 {
         return Err(terr("FILE_ERROR", String::from_utf8_lossy(&err).trim().to_string()));
     }
     Ok(json!({"handle": child.name, "path": path, "content": String::from_utf8_lossy(&out)}))
+}
+
+/// `exec` is only for tool children: an agent child runs its own task.
+async fn child_exec(state: &Arc<ServerState>, caller_id: &str, args: &Value) -> Result<Value, ToolError> {
+    let child = own_child(state, caller_id, args)?;
+    if child.kind != KIND_TOOL {
+        return Err(terr("WRONG_KIND", format!("'{}' is an agent sandbox; exec is for tool sandboxes", child.name)));
+    }
+    let command: Vec<String> = args
+        .get("command")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    if command.is_empty() {
+        return Err(terr("INVALID_ARGUMENT", "command is required"));
+    }
+    let timeout = args
+        .get("timeout_s")
+        .and_then(Value::as_u64)
+        .map_or(Duration::from_secs(60), Duration::from_secs)
+        .min(MAX_EXEC_TIMEOUT);
+    // Audit every command run in a tool sandbox (R35).
+    info!(parent = %caller_id, child = %child.name, command = ?command, "mcp: tool exec");
+    let (out, err, code) = run_in_child(state, &child, command, timeout).await?;
+    Ok(json!({
+        "handle": child.name,
+        "exit_code": code,
+        "stdout": String::from_utf8_lossy(&out),
+        "stderr": String::from_utf8_lossy(&err)
+    }))
+}
+
+/// Stop tool sandboxes that have been idle past their timeout.
+fn start_idle_reaper(state: &Arc<ServerState>) {
+    use std::sync::atomic::Ordering;
+    if state.mcp.reaper_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(REAPER_INTERVAL).await;
+            for idle in state.mcp.idle_tools(now_ms()) {
+                info!(child = %idle.name, "mcp: tool sandbox idle timeout, stopping");
+                if let Err(e) = state.compute.delete_sandbox_by_id(&idle.sandbox_id, &idle.name).await {
+                    warn!(child = %idle.name, error = %e, "mcp: idle stop failed");
+                }
+                state.mcp.forget(&idle.sandbox_id);
+            }
+        }
+    });
 }
 
 async fn stop_child(state: &Arc<ServerState>, caller_id: &str, args: &Value) -> Result<Value, ToolError> {
@@ -939,12 +1069,21 @@ mod tests {
     }
 
     #[test]
+    fn tool_sandboxes_never_get_the_door_rule() {
+        assert!(gets_door_rule(KIND_AGENT, 1, 2));
+        assert!(!gets_door_rule(KIND_AGENT, 2, 2));
+        assert!(!gets_door_rule(KIND_TOOL, 1, 2));
+        assert!(!gets_door_rule(KIND_TOOL, 1, 9));
+    }
+
+    #[test]
     fn descendants_are_deepest_first() {
         let s = McpState::default();
         let mk = |id: &str, parent: Option<&str>, depth| Lineage {
             sandbox_id: id.into(), name: id.into(), workspace: "w".into(),
             parent_id: parent.map(str::to_string), depth, grant_id: "g".into(),
             kind: "agent".into(), lifetime: "until_stopped".into(), children_created: 0,
+            idle_timeout_ms: None, last_used_ms: 0,
         };
         {
             let mut i = s.lock();
