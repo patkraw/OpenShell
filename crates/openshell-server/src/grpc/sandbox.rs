@@ -587,7 +587,8 @@ async fn handle_create_sandbox_inner(
         *policy = validate_and_canonicalize_policy(policy.clone())?;
     }
     // Gateway MCP POC: a grant set at start records the ceiling and adds the door rule.
-    let mcp_grant = crate::mcp::prepare_granted_create(&principal, &request.annotations, &mut spec)?;
+    let mcp_grant =
+        crate::children::prepare_granted_create(&principal, &request.annotations, &mut spec)?;
     if mcp_grant.is_some()
         && let Some(ref mut policy) = spec.policy
     {
@@ -778,7 +779,7 @@ async fn handle_create_sandbox_inner(
     }
 
     if let Some((grant, ceiling)) = mcp_grant {
-        crate::mcp::register_granted_sandbox(state, &principal, &sandbox, grant, ceiling);
+        crate::children::register_granted_sandbox(state, &principal, &sandbox, grant, ceiling);
     }
     info!(
         sandbox_id = %id,
@@ -1737,9 +1738,13 @@ async fn handle_delete_sandbox_inner(
     let preconditions = SandboxDeletePreconditions::default();
 
     // Gateway MCP POC: cascade stop, children first.
-    if let Ok(Some(existing)) = state.store.get_message_by_name::<Sandbox>(&workspace, &name).await {
-        crate::mcp::cascade_stop_children(state, existing.object_id()).await;
-        state.mcp.forget(existing.object_id());
+    if let Ok(Some(existing)) = state
+        .store
+        .get_message_by_name::<Sandbox>(&workspace, &name)
+        .await
+    {
+        crate::children::cascade_stop_children(state, existing.object_id()).await;
+        state.children.forget(existing.object_id());
     }
     let result = state
         .compute

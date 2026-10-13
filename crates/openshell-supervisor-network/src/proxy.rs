@@ -2715,9 +2715,17 @@ async fn handle_mediated_connection(
         let ctx = policy_local_ctx
             .as_ref()
             .ok_or_else(|| miette::miette!("sandbox-local policy context is unavailable"))?;
-        let allowed = door_program_allowed(&opa_engine, &identity_cache, supplied_identity.as_ref());
-        return crate::gateway_mcp_door::handle(ctx, allowed, method, target, &buf[..used], &mut client)
-            .await;
+        let allowed =
+            door_program_allowed(&opa_engine, &identity_cache, supplied_identity.as_ref());
+        return crate::gateway_mcp_door::handle(
+            ctx,
+            allowed,
+            method,
+            target,
+            &buf[..used],
+            &mut client,
+        )
+        .await;
     }
 
     if policy_local_transparent {
@@ -5553,10 +5561,21 @@ async fn handle_forward_proxy(
             Err("use http://openshell.local/mcp".to_string())
         };
         if let Some(ctx) = policy_local_ctx {
-            return crate::gateway_mcp_door::handle(&ctx, allowed, method, &path, &buf[..used], client)
-                .await;
+            return crate::gateway_mcp_door::handle(
+                &ctx,
+                allowed,
+                method,
+                &path,
+                &buf[..used],
+                client,
+            )
+            .await;
         }
-        respond(client, b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await?;
+        respond(
+            client,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await?;
         return Ok(());
     }
 

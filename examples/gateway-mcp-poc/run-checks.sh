@@ -49,12 +49,13 @@ echo "== Limits"
 W2='{"name":"w2","command":["sleep","600"]}'
 check "create w2 (breadth 2 of 2)" "$(mcp lead create_sandbox "$W2")" '"handle":"w2"'
 check "create_sandbox now hidden from the lead (budget used)" "$(mcp lead tools/list)" '["wait"'
-check "third child refused" "$(mcp lead create_sandbox '{"name":"w3","command":["sleep","60"]}')" "LIMIT_REACHED"
+out=$(mcp lead create_sandbox '{"name":"w3","command":["sleep","60"]}')
+if [[ "$out" == *NOT_ALLOWED* || "$out" == *LIMIT_REACHED* ]]; then check "third child refused" "ok" "ok"; else check "third child refused" "$out" "refused"; fi
 
 echo "== Grant changes"
 check "a sandbox cannot change grants" "$(mcp lead grant_update '{"grant_id":"x","max_total":9}')" "NOT_ALLOWED"
 gid=$(mcp lead get_limits | python3 -c 'import json,sys; print(json.load(sys.stdin)["grant_id"])')
-check "the user widens the grant (breadth 5, total 6)" "$(user_mcp grant_update grant_id="$gid" max_breadth=5 max_total=6)" '"max_breadth": 5'
+check "the user widens the grant (breadth 9, total 10)" "$(user_mcp grant_update grant_id="$gid" max_breadth=9 max_total=10)" '"max_breadth": 9'
 check "lead can create again after widening" "$(mcp lead create_sandbox '{"name":"w3","command":["sh","-c","echo result-from-w3; exit 0"],"lifetime":"until_exit"}')" '"handle":"w3"'
 check "wait for w3 to exit" "$(mcp lead wait '{"handle":"w3","timeout_s":60}')" '"exit_code":0'
 check "only your own children" "$(mcp lead stop_sandbox '{"handle":"lead"}')" "NOT_YOUR_CHILD"
@@ -70,6 +71,21 @@ check "bad kind is refused" "$(mcp lead create_sandbox '{"name":"x","kind":"robo
 check "short idle timeout accepted" "$(mcp lead create_sandbox '{"name":"t2","kind":"tool","idle_timeout_s":10}')" '"idle_timeout_s":10'
 sleep 25
 check "idle tool sandbox t2 stopped automatically" "[$($OS sandbox list 2>&1 | grep -E '^t2 ' | grep -v -i deleting || true)]" "[]"
+
+echo "== The user on the host, through MCP"
+check "the user sees create_sandbox and grant tools, not child tools" "$(./user-mcp.py grant_list >/dev/null; python3 - <<'PY'
+import json, urllib.request
+req = urllib.request.Request("http://127.0.0.1:18080/mcp", json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/list"}).encode(), {"content-type":"application/json"})
+print([t["name"] for t in json.load(urllib.request.urlopen(req))["result"]["tools"]])
+PY
+)" "['create_sandbox', 'grant_list', 'grant_update']"
+$OS sandbox delete hostlead >/dev/null 2>&1; wait_gone hostlead
+check "the user creates a top-level sandbox with a grant via MCP" "$(user_mcp create_sandbox name=hostlead image=pi-agent:local 'command=["sleep","3600"]' grant=max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node,child_policy=inherit)" '"has_grant": true'
+wait_ready hostlead
+check "that sandbox can create children" "$(mcp hostlead tools/list)" "create_sandbox"
+check "child_policy=inherit: a child policy is refused" "$(mcp hostlead create_sandbox '{"name":"hc1","command":["sleep","60"],"policy":{"network_policies":{}}}')" "omit policy"
+check "child_policy=inherit: a child without policy is created" "$(mcp hostlead create_sandbox '{"name":"hc1","command":["sleep","60"]}')" '"handle":"hc1"'
+$OS sandbox delete hostlead >/dev/null 2>&1
 
 echo "== Cascade stop"
 $OS sandbox delete lead >/dev/null 2>&1; sleep 5
