@@ -2634,7 +2634,7 @@ fn pty_dimensions(cols: u32, rows: u32) -> (u32, u32) {
     )
 }
 
-pub(super) async fn handle_exec_sandbox(
+pub(crate) async fn handle_exec_sandbox(
     state: &Arc<ServerState>,
     request: Request<ExecSandboxRequest>,
 ) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {

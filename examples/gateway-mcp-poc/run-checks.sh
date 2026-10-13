@@ -42,6 +42,8 @@ check "w1 runs the lead's image" "$(docker inspect --format '{{.Image}}' $(docke
 echo "== Worker w1 (depth 1 = max)"
 check "w1 has no door rule" "$($OS sandbox get w1 --policy-only 2>&1 | grep -c openshell_gateway_mcp)" "0"
 check "w1 cannot reach the door at all" "$(mcp w1 tools/list)" "door_denied"
+check "lead reads a file from w1 (get_file)" "$(mcp lead get_file '{"handle":"w1","path":"/etc/hostname"}')" '"content":'
+check "lead cannot read files of a non-child" "$(mcp lead get_file '{"handle":"lead","path":"/etc/hostname"}')" "NOT_YOUR_CHILD"
 
 echo "== Limits"
 W2='{"name":"w2","command":["sleep","600"]}'

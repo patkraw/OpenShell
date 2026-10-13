@@ -1,0 +1,7 @@
+#!/bin/sh
+# Start Pi with the seeded config (model endpoint + gateway MCP). OPENAI_API_KEY in the
+# sandbox is only a placeholder; the supervisor swaps in the real key for
+# inference-api.nvidia.com, for Node only.
+mkdir -p "$PI_CODING_AGENT_DIR"
+cp -n /usr/local/share/pi-seed/*.json "$PI_CODING_AGENT_DIR"/ 2>/dev/null
+exec pi --offline --no-approve --model nvidia/aws/anthropic/bedrock-claude-sonnet-5-5 "$@"

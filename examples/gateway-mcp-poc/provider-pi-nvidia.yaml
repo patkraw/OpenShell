@@ -1,0 +1,24 @@
+# NVIDIA's OpenAI-compatible inference API for Pi (Node). The key stays in OpenShell;
+# inside the sandbox OPENAI_API_KEY is a placeholder swapped in only for Node's
+# requests to inference-api.nvidia.com.
+id: pi-nvidia
+display_name: Pi (NVIDIA inference API)
+description: Pi with models from inference-api.nvidia.com
+category: agent
+inference_capable: true
+credentials:
+  - name: api_key
+    description: NVIDIA inference API key
+    env_vars: [OPENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: inference-api.nvidia.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/node]
