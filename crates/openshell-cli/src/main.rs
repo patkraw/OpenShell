@@ -1448,6 +1448,30 @@ enum GrantCommands {
     /// List grants.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List,
+    /// Attach a grant to a running top-level sandbox that has none.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Sandbox that becomes the holder.
+        sandbox: String,
+        /// Levels of agents below the sandbox.
+        #[arg(long, default_value_t = 1)]
+        max_depth: u32,
+        /// Children per parent.
+        #[arg(long, default_value_t = 2)]
+        max_breadth: u32,
+        /// Sandboxes in the whole tree, including the holder.
+        #[arg(long, default_value_t = 3)]
+        max_total: u32,
+        /// Grant lifetime, e.g. 4h.
+        #[arg(long, default_value = "4h")]
+        expires: String,
+        /// Absolute path of the program allowed to call the gateway MCP.
+        #[arg(long)]
+        program: String,
+        /// `narrow` (agents write their children's policies) or `inherit`.
+        #[arg(long, default_value = "narrow")]
+        child_policy: String,
+    },
     /// Widen or shrink a grant. Affects new creates only.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
@@ -3120,6 +3144,31 @@ async fn run_async() -> Result<()> {
             match grant_cmd {
                 GrantCommands::List => {
                     openshell_cli::grant::grant_list(&ctx.endpoint, &tls).await?
+                }
+                GrantCommands::Create {
+                    sandbox,
+                    max_depth,
+                    max_breadth,
+                    max_total,
+                    expires,
+                    program,
+                    child_policy,
+                } => {
+                    openshell_cli::grant::grant_create(
+                        &ctx.endpoint,
+                        openshell_cli::grant::GrantCreate {
+                            sandbox: &sandbox,
+                            workspace: &cli.workspace,
+                            max_depth,
+                            max_breadth,
+                            max_total,
+                            expires: &expires,
+                            program: &program,
+                            child_policy: &child_policy,
+                        },
+                        &tls,
+                    )
+                    .await?;
                 }
                 GrantCommands::Update {
                     grant_id,

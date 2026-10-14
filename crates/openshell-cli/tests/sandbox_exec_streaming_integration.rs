@@ -229,6 +229,7 @@ mock_gateway! {
         get_sandbox_limits(proto::GetSandboxLimitsRequest) -> proto::GetSandboxLimitsResponse;
         list_child_sandboxes(proto::ListChildSandboxesRequest) -> proto::ListChildSandboxesResponse;
         list_sandbox_grants(proto::ListSandboxGrantsRequest) -> proto::ListSandboxGrantsResponse;
+        create_sandbox_grant(proto::CreateSandboxGrantRequest) -> proto::CreateSandboxGrantResponse;
         update_sandbox_grant(proto::UpdateSandboxGrantRequest) -> proto::UpdateSandboxGrantResponse;
         revoke_sandbox_grant(proto::RevokeSandboxGrantRequest) -> proto::RevokeSandboxGrantResponse;
         get_gateway_info(proto::GetGatewayInfoRequest) -> proto::GetGatewayInfoResponse;

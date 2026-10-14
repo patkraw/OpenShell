@@ -1161,6 +1161,38 @@ class SandboxClient:
             for g in response.grants
         ]
 
+    def create_grant(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        program: str,
+        max_depth: int = 1,
+        max_breadth: int = 2,
+        max_total: int = 3,
+        expires: str = "4h",
+        child_policy: str = "narrow",
+    ) -> SandboxGrant:
+        """Attach a grant to a running top-level sandbox that has none."""
+        response = self._stub.CreateSandboxGrant(
+            openshell_pb2.CreateSandboxGrantRequest(
+                sandbox=sandbox,
+                workspace_scope=_workspace_scope(workspace),
+                max_depth=max_depth,
+                max_breadth=max_breadth,
+                max_total=max_total,
+                expires=expires,
+                program=program,
+                child_policy=child_policy,
+            ),
+            timeout=self._timeout,
+        )
+        g = response.grant
+        return SandboxGrant(
+            g.grant_id, g.holder, g.max_depth, g.max_breadth, g.max_total,
+            g.total, g.program, g.user,
+        )
+
     def update_grant(
         self,
         grant_id: str,

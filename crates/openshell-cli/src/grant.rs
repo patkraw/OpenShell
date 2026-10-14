@@ -8,8 +8,8 @@
 use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::proto::{
-    ListChildSandboxesRequest, ListSandboxGrantsRequest, RevokeSandboxGrantRequest,
-    UpdateSandboxGrantRequest, workspace_selector,
+    CreateSandboxGrantRequest, ListChildSandboxesRequest, ListSandboxGrantsRequest,
+    RevokeSandboxGrantRequest, UpdateSandboxGrantRequest, workspace_selector,
 };
 
 pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
@@ -40,6 +40,43 @@ pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
             g.user
         );
     }
+    Ok(())
+}
+
+/// Arguments of `openshell grant create`.
+pub struct GrantCreate<'a> {
+    pub sandbox: &'a str,
+    pub workspace: &'a str,
+    pub max_depth: u32,
+    pub max_breadth: u32,
+    pub max_total: u32,
+    pub expires: &'a str,
+    pub program: &'a str,
+    pub child_policy: &'a str,
+}
+
+pub async fn grant_create(server: &str, args: GrantCreate<'_>, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let g = client
+        .create_sandbox_grant(CreateSandboxGrantRequest {
+            sandbox: args.sandbox.to_string(),
+            workspace_scope: Some(workspace_selector(args.workspace)),
+            max_depth: args.max_depth,
+            max_breadth: args.max_breadth,
+            max_total: args.max_total,
+            expires: args.expires.to_string(),
+            program: args.program.to_string(),
+            child_policy: args.child_policy.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .grant
+        .unwrap_or_default();
+    println!(
+        "✓ Grant {} attached to {}: max_depth={} max_breadth={} max_total={} program={}",
+        g.grant_id, g.holder, g.max_depth, g.max_breadth, g.max_total, g.program
+    );
     Ok(())
 }
 

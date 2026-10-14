@@ -47,7 +47,7 @@ pub struct Access {
     pub create_sandbox: bool,
     /// `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`.
     pub manage_children: bool,
-    /// `grant_list`, `grant_update` (users only).
+    /// `grant_list`, `grant_create`, `grant_update` (users only).
     pub grants: bool,
 }
 
@@ -149,6 +149,17 @@ pub struct GrantUpdateArgs {
     pub revoke: Option<bool>,
 }
 
+/// Attach a grant to a running top-level sandbox (users only).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantCreateArgs {
+    /// Name of the sandbox that becomes the holder.
+    pub sandbox: String,
+    /// Same form as `create_sandbox`'s `grant`, e.g.
+    /// `max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node`.
+    pub grant: String,
+}
+
 /// One tool call, parsed and validated.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
@@ -161,6 +172,7 @@ pub enum Operation {
     ListChildren,
     GetLimits,
     GrantList,
+    GrantCreate(GrantCreateArgs),
     GrantUpdate(GrantUpdateArgs),
 }
 
@@ -274,6 +286,17 @@ const TOOLS: &[ToolDef] = &[
         schema: || json!({"type": "object", "additionalProperties": false, "properties": {}}),
     },
     ToolDef {
+        name: "grant_create",
+        group: Group::Grants,
+        description: "Attach a grant to a running top-level sandbox that has none (users only), so \
+            it can create children, e.g. grant=max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node",
+        schema: || {
+            json!({"type": "object", "additionalProperties": false, "properties": {
+            "sandbox": {"type": "string"}, "grant": {"type": "string"}},
+            "required": ["sandbox", "grant"]})
+        },
+    },
+    ToolDef {
         name: "grant_update",
         group: Group::Grants,
         description: "Widen, shrink or revoke a grant (users only). Affects new creates only.",
@@ -333,6 +356,7 @@ pub fn parse_operation(name: &str, arguments: Value) -> Result<Operation, ApiErr
         "list_children" => Operation::ListChildren,
         "get_limits" => Operation::GetLimits,
         "grant_list" => Operation::GrantList,
+        "grant_create" => Operation::GrantCreate(args(arguments)?),
         "grant_update" => Operation::GrantUpdate(args(arguments)?),
         other => {
             return Err(ApiError::new(
@@ -346,7 +370,9 @@ pub fn parse_operation(name: &str, arguments: Value) -> Result<Operation, ApiErr
 fn group_of(op: &Operation) -> Group {
     match op {
         Operation::CreateSandbox(_) => Group::Create,
-        Operation::GrantList | Operation::GrantUpdate(_) => Group::Grants,
+        Operation::GrantList | Operation::GrantCreate(_) | Operation::GrantUpdate(_) => {
+            Group::Grants
+        }
         _ => Group::Manage,
     }
 }
@@ -612,9 +638,11 @@ mod tests {
         let user = names(&rpc(&app, Some("user"), list).await.1);
         assert!(lead.contains(&"create_sandbox".to_string()));
         assert!(!lead.contains(&"grant_update".to_string()));
+        assert!(!lead.contains(&"grant_create".to_string()));
         assert!(!worker.contains(&"create_sandbox".to_string()));
         assert!(worker.contains(&"wait".to_string()));
         assert!(user.contains(&"grant_update".to_string()));
+        assert!(user.contains(&"grant_create".to_string()));
         assert!(!user.contains(&"exec".to_string()));
     }
 
@@ -653,6 +681,25 @@ mod tests {
         };
         assert_eq!(a.kind.as_deref(), Some("tool"));
         assert_eq!(a.request_id.as_deref(), Some("r1"));
+    }
+
+    #[tokio::test]
+    async fn grant_create_is_for_users_only() {
+        let fake = Arc::new(Fake::default());
+        let app = router(fake.clone());
+        let args = json!({"sandbox": "box", "grant": "max_depth=1,program=/usr/local/bin/node"});
+        let (_, v) = rpc(&app, Some("lead"), call("grant_create", args.clone())).await;
+        assert_eq!(v["result"]["structuredContent"]["error"], "NOT_ALLOWED");
+        assert!(fake.calls.lock().unwrap().is_empty());
+        rpc(&app, Some("user"), call("grant_create", args)).await;
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(
+            calls[0].1,
+            Operation::GrantCreate(GrantCreateArgs {
+                sandbox: "box".into(),
+                grant: "max_depth=1,program=/usr/local/bin/node".into(),
+            })
+        );
     }
 
     #[tokio::test]

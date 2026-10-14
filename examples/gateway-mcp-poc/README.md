@@ -19,7 +19,7 @@ an agent on the host can create sandboxes as the user. Design:
 | Gateway rules | `crates/openshell-server/src/children.rs` | Implements `SandboxApi`: grants, lineage, the prover check against the parent's policy, limits, retries, tool sandboxes, cascade stop. |
 | Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in every sandbox; forwards with the sandbox's token and the calling program's path. The gateway decides every call. |
 | gRPC API | `proto/openshell.proto` (`CreateChildSandbox`, `ListSandboxGrants`, ...) | The same operations as the MCP tools, for the SDKs and the CLI. Handlers in `children.rs` (`grpc_surface`) call the same rules as MCP. |
-| CLI | `openshell sandbox create --grant ...`, `openshell grant list/update/revoke`, `openshell sandbox children` | Start a tree, manage grants, see children. |
+| CLI | `openshell sandbox create --grant ...`, `openshell grant create/list/update/revoke`, `openshell sandbox children` | Start a tree, add a grant to a running sandbox, manage grants, see children. |
 | Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
 
 The MCP endpoint is on by default. Set `OPENSHELL_GATEWAY_MCP_ENABLED=false`

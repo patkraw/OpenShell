@@ -79,7 +79,7 @@ import json, urllib.request
 req = urllib.request.Request("http://127.0.0.1:18080/mcp", json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/list"}).encode(), {"content-type":"application/json"})
 print([t["name"] for t in json.load(urllib.request.urlopen(req))["result"]["tools"]])
 PY
-)" "['create_sandbox', 'grant_list', 'grant_update']"
+)" "['create_sandbox', 'grant_list', 'grant_create', 'grant_update']"
 $OS sandbox delete hostlead >/dev/null 2>&1; wait_gone hostlead
 check "the user creates a top-level sandbox with a grant via MCP" "$(user_mcp create_sandbox name=hostlead image=pi-agent:local 'command=["sleep","3600"]' grant=max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node,child_policy=inherit)" '"has_grant": true'
 wait_ready hostlead
@@ -118,6 +118,17 @@ check "the user approves it" "$($OS rule approve deeplead --chunk-id "$cid" 2>&1
 check "deeplead's policy reloads with the rule" "$($OS sandbox exec deeplead -- curl -s -m 100 "http://policy.local/v1/proposals/$cid/wait?timeout=90" 2>&1 | tail -1)" '"policy_reloaded":true'
 check "retry: the child now fits deeplead's policy" "$(mcp deeplead create_sandbox "$WRITER")" '"handle":"writer"'
 $OS sandbox delete deeplead >/dev/null 2>&1
+
+echo "== Adding a grant to a running sandbox"
+$OS sandbox delete plain >/dev/null 2>&1; wait_gone plain
+$OS sandbox create --name plain --from pi-agent:local --policy lead.yaml --no-tty --detach -- sleep 3600 >/dev/null 2>&1
+wait_ready plain || echo "plain did not become ready"
+check "a sandbox started without a grant cannot create children" "$(mcp plain create_sandbox '{"name":"pc1","command":["sleep","60"]}')" "NOT_ALLOWED"
+check "the user attaches a grant to it (grant create)" "$($OS grant create plain --program /usr/local/bin/node --max-depth 1 --max-breadth 2 --max-total 3 2>&1)" "attached to plain"
+check "now it can create a child" "$(mcp plain create_sandbox '{"name":"pc1","command":["sleep","60"]}')" '"handle":"pc1"'
+check "grant create on a sandbox that already holds a grant is refused" "$($OS grant create plain --program /usr/local/bin/node 2>&1)" "already holds"
+check "grant create on a child is refused" "$($OS grant create pc1 --program /usr/local/bin/node 2>&1)" "is a child"
+$OS sandbox delete plain >/dev/null 2>&1
 
 echo "== Cascade stop"
 $OS sandbox delete lead >/dev/null 2>&1; sleep 5
