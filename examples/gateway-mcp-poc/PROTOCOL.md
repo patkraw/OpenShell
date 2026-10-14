@@ -231,7 +231,7 @@ HTTP 200 application/json
         "name": "grant_list"
       },
       {
-        "description": "Widen, shrink or revoke a grant (users only). Affects new creates only.",
+        "description": "Widen, shrink or revoke a grant (users only). Applies from the next call in its tree.",
         "inputSchema": {
           "additionalProperties": false,
           "properties": {

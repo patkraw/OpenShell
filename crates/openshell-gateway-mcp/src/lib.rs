@@ -299,7 +299,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "grant_update",
         group: Group::Grants,
-        description: "Widen, shrink or revoke a grant (users only). Affects new creates only.",
+        description: "Widen, shrink or revoke a grant (users only). Applies from the next call in its tree.",
         schema: || {
             json!({"type": "object", "additionalProperties": false, "properties": {
             "grant_id": {"type": "string"}, "max_depth": {"type": "integer"},

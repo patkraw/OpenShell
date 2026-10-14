@@ -1165,7 +1165,7 @@ class SandboxClient:
         max_breadth: int | None = None,
         max_total: int | None = None,
     ) -> SandboxGrant:
-        """Widen or shrink a grant. Only its user may; affects new creates only."""
+        """Widen or shrink a grant. Only its user may; applies from the next call in its tree."""
         request = openshell_pb2.UpdateSandboxGrantRequest(grant_id=grant_id)
         if max_depth is not None:
             request.max_depth = max_depth
