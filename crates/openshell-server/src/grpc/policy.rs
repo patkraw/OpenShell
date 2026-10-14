@@ -4188,6 +4188,9 @@ async fn handle_update_config_inner(
     let provider_layers =
         provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers).await?;
     validate_candidate_effective_policy(&new_policy, &provider_layers)?;
+    // Gateway MCP POC: a child's policy stays within its parent's policy.
+    crate::children::check_child_policy_write(state.store.as_ref(), &sandbox_id, &new_policy)
+        .await?;
     let provider_profile_catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -7154,6 +7157,11 @@ async fn apply_merge_operations_with_retry(
         }
         validate_policy_safety(&new_policy)?;
         validate_candidate_effective_policy(&new_policy, provider_layers)?;
+        if merged.changed {
+            // Gateway MCP POC: approved proposals for a child stay within its
+            // parent's policy.
+            crate::children::check_child_policy_write(store, sandbox_id, &new_policy).await?;
+        }
         let mut effective_policy = if provider_layers.is_empty() {
             new_policy.clone()
         } else {

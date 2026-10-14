@@ -44,6 +44,9 @@ use tracing::{info, warn};
 
 /// Annotation carrying the grant on a user's `CreateSandbox` request.
 pub const GRANT_ANNOTATION: &str = "openshell.io/mcp-grant";
+/// Annotation on a child sandbox naming its parent's sandbox id. Later writes
+/// to the child's policy are proved against that parent's policy.
+pub const PARENT_ANNOTATION: &str = "openshell.io/mcp-parent";
 /// Header in which the supervisor door names the calling program (the
 /// kernel-resolved executable path). The door overwrites any value the
 /// workload sends.
@@ -726,13 +729,77 @@ async fn prove(ceiling: &SandboxPolicy, candidate: &SandboxPolicy) -> Result<(),
         CheckResult::Exceeds(ev) => Err(terr(
             "EXCEEDS_CEILING",
             format!(
-                "child policy exceeds the parent's policy; counterexample: {:?}. {EXCEEDS_HINT}",
+                "child policy exceeds the parent's policy; counterexample: {:?}",
                 ev.counterexample()
             ),
         )),
         CheckResult::Unsupported(ev) => Err(terr("UNSUPPORTED_RULES", ev.reason().to_string())),
         CheckResult::Inconclusive(ev) => Err(terr("PROVER_INCONCLUSIVE", ev.reason().to_string())),
     }
+}
+
+/// Add the next-step hint to a create refused for exceeding the parent.
+fn with_create_hint(err: ToolError) -> ToolError {
+    if err.code == "EXCEEDS_CEILING" {
+        ToolError {
+            code: err.code,
+            message: format!("{}. {EXCEEDS_HINT}", err.message),
+        }
+    } else {
+        err
+    }
+}
+
+/// Later writes to a child's policy (user `UpdateConfig`, supervisor sync,
+/// approved or auto-approved proposals) must stay within its parent's current
+/// policy, the same rule as at creation. Sandboxes that are not children, and
+/// writes that leave the policy unchanged, pass.
+pub(crate) async fn check_child_policy_write(
+    store: &crate::persistence::Store,
+    sandbox_id: &str,
+    candidate: &SandboxPolicy,
+) -> Result<(), tonic::Status> {
+    let internal = |e: String| tonic::Status::internal(e);
+    let Some(child) = store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| internal(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let Some(parent_id) = child
+        .metadata
+        .as_ref()
+        .and_then(|m| m.annotations.get(PARENT_ANNOTATION))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let current = crate::grpc::policy::current_base_policy_for_sandbox(store, &child).await?;
+    if current == *candidate {
+        return Ok(());
+    }
+    let parent = store
+        .get_message::<Sandbox>(&parent_id)
+        .await
+        .map_err(|e| internal(e.to_string()))?
+        .ok_or_else(|| {
+            tonic::Status::failed_precondition("this sandbox's parent no longer exists")
+        })?;
+    let ceiling = crate::grpc::policy::current_base_policy_for_sandbox(store, &parent).await?;
+    prove(&ceiling, candidate).await.map_err(|e| {
+        warn!(
+            sandbox_id,
+            code = e.code,
+            "policy write refused: exceeds parent's policy"
+        );
+        tonic::Status::failed_precondition(format!(
+            "{}: a child sandbox's policy must stay within its parent's policy ({}); {}",
+            e.code,
+            parent.object_name(),
+            e.message
+        ))
+    })
 }
 
 async fn create_child(
@@ -823,7 +890,9 @@ async fn create_child(
     //    parent's own, so it fits by construction, including rules the prover
     //    cannot model.
     if !grant.inherit_child_policy {
-        prove(&ceiling, &candidate).await?;
+        prove(&ceiling, &candidate)
+            .await
+            .map_err(with_create_hint)?;
     }
 
     // 6. Providers must be a subset of the parent's.
@@ -931,6 +1000,10 @@ async fn create_child(
         workspace_scope: Some(workspace_selector(parent.object_workspace().to_string())),
         spec: Some(spec),
         name: name.clone(),
+        annotations: HashMap::from([(
+            PARENT_ANNOTATION.to_string(),
+            parent.object_id().to_string(),
+        )]),
         ..Default::default()
     });
     // Acts for the user who set the grant (root user).
@@ -1752,7 +1825,7 @@ mod tests {
         );
         let mut child = parent.clone();
         child.network_policies.get_mut("ex").unwrap().endpoints[0].host = "other.com".into();
-        let err = prove(&parent, &child).await.unwrap_err();
+        let err = with_create_hint(prove(&parent, &child).await.unwrap_err());
         assert_eq!(err.code, "EXCEEDS_CEILING");
         assert!(err.message.contains("http://policy.local/v1/proposals"));
     }
@@ -1788,6 +1861,59 @@ mod tests {
             "version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr, /lib]\n  read_write: [/sandbox, /tmp, /etc]\n",
         );
         assert!(prove(&parent, &child).await.is_err());
+    }
+
+    fn stored_sandbox(id: &str, policy: SandboxPolicy, parent: Option<&str>) -> Sandbox {
+        let mut annotations = HashMap::new();
+        if let Some(parent) = parent {
+            annotations.insert(PARENT_ANNOTATION.to_string(), parent.to_string());
+        }
+        Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                annotations,
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(policy),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn later_policy_writes_to_a_child_stay_within_its_parent() {
+        let store = crate::persistence::test_store().await;
+        let example = "version: 1\nnetwork_policies:\n  ex:\n    name: ex\n    endpoints:\n      - host: example.com\n        port: 443\n    binaries: [{ path: /usr/local/bin/node }]\n";
+        let other = example.replace("example.com", "other.com");
+        store
+            .put_message(&stored_sandbox("p1", policy(example), None))
+            .await
+            .unwrap();
+        store
+            .put_message(&stored_sandbox("c1", policy("version: 1\n"), Some("p1")))
+            .await
+            .unwrap();
+        // Within the parent: allowed.
+        check_child_policy_write(&store, "c1", &policy(example))
+            .await
+            .unwrap();
+        // Beyond the parent: refused.
+        let err = check_child_policy_write(&store, "c1", &policy(&other))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().starts_with("EXCEEDS_CEILING"),
+            "{}",
+            err.message()
+        );
+        // The parent itself is not a child: no check.
+        check_child_policy_write(&store, "p1", &policy(&other))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
