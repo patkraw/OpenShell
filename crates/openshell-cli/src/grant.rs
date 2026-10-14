@@ -14,12 +14,23 @@ use openshell_core::proto::{
 
 pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let grants = client
-        .list_sandbox_grants(ListSandboxGrantsRequest {})
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .grants;
+    let mut grants = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let page = client
+            .list_sandbox_grants(ListSandboxGrantsRequest {
+                page_size: 0,
+                page_token,
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        grants.extend(page.grants);
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        page_token = page.next_page_token;
+    }
     if grants.is_empty() {
         println!("No grants found.");
         return Ok(());
@@ -130,15 +141,25 @@ pub async fn sandbox_children(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let children = client
-        .list_child_sandboxes(ListChildSandboxesRequest {
-            parent: parent.to_string(),
-            workspace_scope: Some(workspace_selector(workspace)),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .children;
+    let mut children = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let page = client
+            .list_child_sandboxes(ListChildSandboxesRequest {
+                parent: parent.to_string(),
+                workspace_scope: Some(workspace_selector(workspace)),
+                page_size: 0,
+                page_token,
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        children.extend(page.children);
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        page_token = page.next_page_token;
+    }
     if children.is_empty() {
         println!("{parent} has no children.");
         return Ok(());

@@ -1101,29 +1101,44 @@ class SandboxClient:
 
     def list_children(self, parent: str, *, workspace: str) -> list[ChildSandboxRef]:
         """Sandboxes that `parent` created through the gateway."""
-        response = self._stub.ListChildSandboxes(
-            openshell_pb2.ListChildSandboxesRequest(
-                parent=parent, workspace_scope=_workspace_scope(workspace)
-            ),
-            timeout=self._timeout,
-        )
-        return [
-            ChildSandboxRef(c.handle, c.kind, c.lifetime, c.depth)
-            for c in response.children
-        ]
+        children: list[ChildSandboxRef] = []
+        page_token = ""
+        while True:
+            response = self._stub.ListChildSandboxes(
+                openshell_pb2.ListChildSandboxesRequest(
+                    parent=parent,
+                    workspace_scope=_workspace_scope(workspace),
+                    page_token=page_token,
+                ),
+                timeout=self._timeout,
+            )
+            children.extend(
+                ChildSandboxRef(c.handle, c.kind, c.lifetime, c.depth)
+                for c in response.children
+            )
+            if not response.next_page_token:
+                return children
+            page_token = response.next_page_token
 
     def list_grants(self) -> list[SandboxGrant]:
         """Grants set when sandboxes were created with `grant=`."""
-        response = self._stub.ListSandboxGrants(
-            openshell_pb2.ListSandboxGrantsRequest(), timeout=self._timeout
-        )
-        return [
-            SandboxGrant(
-                g.grant_id, g.holder, g.max_depth, g.max_breadth, g.max_total,
-                g.total, g.program, g.user,
+        grants: list[SandboxGrant] = []
+        page_token = ""
+        while True:
+            response = self._stub.ListSandboxGrants(
+                openshell_pb2.ListSandboxGrantsRequest(page_token=page_token),
+                timeout=self._timeout,
             )
-            for g in response.grants
-        ]
+            grants.extend(
+                SandboxGrant(
+                    g.grant_id, g.holder, g.max_depth, g.max_breadth, g.max_total,
+                    g.total, g.program, g.user,
+                )
+                for g in response.grants
+            )
+            if not response.next_page_token:
+                return grants
+            page_token = response.next_page_token
 
     def create_grant(
         self,
