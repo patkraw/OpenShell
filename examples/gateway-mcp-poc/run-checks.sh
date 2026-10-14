@@ -92,7 +92,7 @@ $OS sandbox delete hostlead >/dev/null 2>&1
 echo "== Each level can only narrow (child proved against its parent's policy)"
 $OS sandbox delete deeplead >/dev/null 2>&1; wait_gone deeplead
 $OS sandbox create --name deeplead --from pi-agent:local --policy lead.yaml \
-  --grant max_depth=2,max_breadth=2,max_total=4,expires=1h,program=/usr/local/bin/node \
+  --grant max_depth=2,max_breadth=2,max_total=5,expires=1h,program=/usr/local/bin/node \
   --no-tty --detach -- sleep 3600 >/dev/null 2>&1
 wait_ready deeplead || echo "deeplead did not become ready"
 GH_ONLY='{"name":"mid","command":["sleep","3600"],"policy":{"network_policies":{"github_read":{"name":"github_read","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"GET","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
@@ -101,6 +101,9 @@ wait_ready mid || echo "mid did not become ready"
 EX='{"name":"leaf","command":["true"],"policy":{"network_policies":{"example":{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
 check "mid cannot give a grandchild example.com (deeplead has it, mid does not)" "$(mcp mid create_sandbox "$EX")" "EXCEEDS_CEILING"
 check "mid can give a grandchild what mid has" "$(mcp mid create_sandbox "${GH_ONLY/\"mid\"/\"leaf\"}")" '"handle":"leaf"'
+wait_ready leaf || echo "leaf did not become ready"
+check "leaf (max depth) cannot create an agent" "$(mcp leaf create_sandbox '{"name":"x","command":["true"]}')" "LIMIT_REACHED"
+check "leaf (max depth) can still create a tool sandbox" "$(mcp leaf create_sandbox '{"name":"leaftool","kind":"tool"}')" '"kind":"tool"'
 
 echo "== Asking for more: refused, propose for yourself, user approves, retry"
 # Agent proposals are off by default; the user turns them on for this sandbox.
