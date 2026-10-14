@@ -710,6 +710,78 @@ impl OpenShell for OpenShellService {
         policy::handle_report_sandbox_configuration(&self.state, request).await
     }
 
+    // --- Child sandboxes (gateway MCP proof of concept) ---
+
+    async fn create_child_sandbox(
+        &self,
+        request: Request<openshell_core::proto::CreateChildSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateChildSandboxResponse>, Status> {
+        crate::children::grpc_surface::create_child(&self.state, request).await
+    }
+
+    async fn wait_child_sandbox(
+        &self,
+        request: Request<openshell_core::proto::WaitChildSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::WaitChildSandboxResponse>, Status> {
+        crate::children::grpc_surface::wait_child(&self.state, request).await
+    }
+
+    async fn exec_child_sandbox(
+        &self,
+        request: Request<openshell_core::proto::ExecChildSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::ExecChildSandboxResponse>, Status> {
+        crate::children::grpc_surface::exec_child(&self.state, request).await
+    }
+
+    async fn get_child_sandbox_file(
+        &self,
+        request: Request<openshell_core::proto::GetChildSandboxFileRequest>,
+    ) -> Result<Response<openshell_core::proto::GetChildSandboxFileResponse>, Status> {
+        crate::children::grpc_surface::get_child_file(&self.state, request).await
+    }
+
+    async fn stop_child_sandbox(
+        &self,
+        request: Request<openshell_core::proto::StopChildSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::StopChildSandboxResponse>, Status> {
+        crate::children::grpc_surface::stop_child(&self.state, request).await
+    }
+
+    async fn get_sandbox_limits(
+        &self,
+        request: Request<openshell_core::proto::GetSandboxLimitsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxLimitsResponse>, Status> {
+        crate::children::grpc_surface::get_limits(&self.state, request).await
+    }
+
+    async fn list_child_sandboxes(
+        &self,
+        request: Request<openshell_core::proto::ListChildSandboxesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListChildSandboxesResponse>, Status> {
+        crate::children::grpc_surface::list_children_rpc(&self.state, request).await
+    }
+
+    async fn list_sandbox_grants(
+        &self,
+        request: Request<openshell_core::proto::ListSandboxGrantsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxGrantsResponse>, Status> {
+        crate::children::grpc_surface::list_grants(&self.state, request).await
+    }
+
+    async fn update_sandbox_grant(
+        &self,
+        request: Request<openshell_core::proto::UpdateSandboxGrantRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateSandboxGrantResponse>, Status> {
+        crate::children::grpc_surface::update_grant(&self.state, request).await
+    }
+
+    async fn revoke_sandbox_grant(
+        &self,
+        request: Request<openshell_core::proto::RevokeSandboxGrantRequest>,
+    ) -> Result<Response<openshell_core::proto::RevokeSandboxGrantResponse>, Status> {
+        crate::children::grpc_surface::revoke_grant(&self.state, request).await
+    }
+
     // --- Sandbox logs ---
 
     async fn get_sandbox_logs(

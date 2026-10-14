@@ -1206,6 +1206,339 @@ fn grant_update(
     )
 }
 
+// ---------------------------------------------------------------------------
+// gRPC surface: the same rules as MCP, through `GatewaySandboxApi::call`
+// ---------------------------------------------------------------------------
+
+/// gRPC handlers for the child-sandbox and grant RPCs. Each one builds the
+/// same `Operation` the MCP surface builds, so both surfaces enforce the same
+/// rules in the same code.
+pub(crate) mod grpc_surface {
+    use super::{ApiError, GatewaySandboxApi, ServerState, list_children};
+    use crate::auth::principal::Principal;
+    use crate::auth::workspace_authz::{
+        MinWorkspaceRole, authorize_workspace, selected_workspace_name,
+    };
+    use openshell_core::proto as pb;
+    use openshell_core::{ObjectId, proto::Sandbox};
+    use openshell_gateway_mcp::{
+        CreateSandboxArgs, ExecArgs, FileArgs, GrantUpdateArgs, HandleArgs, Operation, SandboxApi,
+        WaitArgs,
+    };
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tonic::{Request, Response, Status};
+
+    fn status_of(e: ApiError) -> Status {
+        let msg = format!("{}: {}", e.code, e.message);
+        match e.code.as_str() {
+            "NOT_ALLOWED" | "NOT_YOUR_CHILD" | "WRONG_KIND" | "GLOBAL_POLICY_ACTIVE" => {
+                Status::permission_denied(msg)
+            }
+            "LIMIT_REACHED" => Status::resource_exhausted(msg),
+            "EXCEEDS_CEILING" | "UNSUPPORTED_RULES" | "INVALID_ARGUMENT" | "INVALID_POLICY" => {
+                Status::invalid_argument(msg)
+            }
+            "NOT_FOUND" => Status::not_found(msg),
+            "UNAUTHENTICATED" => Status::unauthenticated(msg),
+            "PROVER_INCONCLUSIVE" => Status::failed_precondition(msg),
+            _ => Status::internal(msg),
+        }
+    }
+
+    async fn run<T>(
+        state: &Arc<ServerState>,
+        req: &Request<T>,
+        op: Operation,
+    ) -> Result<Value, Status> {
+        let principal = crate::grpc::extract_principal(req)?;
+        GatewaySandboxApi::new(state.clone())
+            .call(&principal, op)
+            .await
+            .map_err(status_of)
+    }
+
+    fn s(v: &Value, k: &str) -> String {
+        v.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+    fn n(v: &Value, k: &str) -> u32 {
+        v.get(k)
+            .and_then(Value::as_u64)
+            .and_then(|x| u32::try_from(x).ok())
+            .unwrap_or_default()
+    }
+    fn b(v: &Value, k: &str) -> bool {
+        v.get(k).and_then(Value::as_bool).unwrap_or_default()
+    }
+    fn opt(x: String) -> Option<String> {
+        (!x.trim().is_empty()).then_some(x)
+    }
+    fn timeout(secs: u32) -> Option<u64> {
+        (secs > 0).then_some(u64::from(secs))
+    }
+
+    /// Policy text (JSON or YAML) to the JSON value the rules take.
+    fn policy_value(text: &str) -> Result<Option<Value>, Status> {
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = openshell_policy::parse_sandbox_policy(text)
+            .map_err(|e| Status::invalid_argument(format!("INVALID_POLICY: {e}")))?;
+        let json = openshell_policy::serialize_sandbox_policy_json(&parsed)
+            .map_err(|e| Status::invalid_argument(format!("INVALID_POLICY: {e}")))?;
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    pub(crate) async fn create_child(
+        state: &Arc<ServerState>,
+        req: Request<pb::CreateChildSandboxRequest>,
+    ) -> Result<Response<pb::CreateChildSandboxResponse>, Status> {
+        let r = req.get_ref().clone();
+        let args = CreateSandboxArgs {
+            command: r.command,
+            kind: opt(r.kind),
+            lifetime: opt(r.lifetime),
+            name: opt(r.name),
+            task: opt(r.task),
+            policy: policy_value(&r.policy)?,
+            providers: (!r.providers.is_empty()).then_some(r.providers),
+            request_id: opt(r.request_id),
+            idle_timeout_s: timeout(r.idle_timeout_seconds),
+            image: None,
+            grant: None,
+        };
+        let v = run(state, &req, Operation::CreateSandbox(args)).await?;
+        Ok(Response::new(pb::CreateChildSandboxResponse {
+            handle: s(&v, "handle"),
+            depth: n(&v, "depth"),
+            can_create_children: b(&v, "can_create_children"),
+            repeated_request: b(&v, "repeated_request"),
+            kind: s(&v, "kind"),
+            lifetime: s(&v, "lifetime"),
+        }))
+    }
+
+    pub(crate) async fn wait_child(
+        state: &Arc<ServerState>,
+        req: Request<pb::WaitChildSandboxRequest>,
+    ) -> Result<Response<pb::WaitChildSandboxResponse>, Status> {
+        let r = req.get_ref().clone();
+        let op = Operation::Wait(WaitArgs {
+            handle: r.handle,
+            timeout_s: timeout(r.timeout_seconds),
+        });
+        let v = run(state, &req, op).await?;
+        Ok(Response::new(pb::WaitChildSandboxResponse {
+            phase: s(&v, "phase"),
+            exit_code: v
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .and_then(|x| i32::try_from(x).ok()),
+            timed_out: b(&v, "timed_out"),
+        }))
+    }
+
+    pub(crate) async fn exec_child(
+        state: &Arc<ServerState>,
+        req: Request<pb::ExecChildSandboxRequest>,
+    ) -> Result<Response<pb::ExecChildSandboxResponse>, Status> {
+        let r = req.get_ref().clone();
+        if r.command.is_empty() {
+            return Err(Status::invalid_argument(
+                "INVALID_ARGUMENT: command must not be empty",
+            ));
+        }
+        let op = Operation::Exec(ExecArgs {
+            handle: r.handle,
+            command: r.command,
+            timeout_s: timeout(r.timeout_seconds),
+        });
+        let v = run(state, &req, op).await?;
+        Ok(Response::new(pb::ExecChildSandboxResponse {
+            exit_code: v
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .and_then(|x| i32::try_from(x).ok())
+                .unwrap_or_default(),
+            stdout: s(&v, "stdout"),
+            stderr: s(&v, "stderr"),
+        }))
+    }
+
+    pub(crate) async fn get_child_file(
+        state: &Arc<ServerState>,
+        req: Request<pb::GetChildSandboxFileRequest>,
+    ) -> Result<Response<pb::GetChildSandboxFileResponse>, Status> {
+        let r = req.get_ref().clone();
+        let v = run(
+            state,
+            &req,
+            Operation::GetFile(FileArgs {
+                handle: r.handle,
+                path: r.path,
+            }),
+        )
+        .await?;
+        Ok(Response::new(pb::GetChildSandboxFileResponse {
+            content: s(&v, "content"),
+        }))
+    }
+
+    pub(crate) async fn stop_child(
+        state: &Arc<ServerState>,
+        req: Request<pb::StopChildSandboxRequest>,
+    ) -> Result<Response<pb::StopChildSandboxResponse>, Status> {
+        let r = req.get_ref().clone();
+        let v = run(
+            state,
+            &req,
+            Operation::Stop(HandleArgs { handle: r.handle }),
+        )
+        .await?;
+        Ok(Response::new(pb::StopChildSandboxResponse {
+            stopped: b(&v, "stopped"),
+        }))
+    }
+
+    pub(crate) async fn get_limits(
+        state: &Arc<ServerState>,
+        req: Request<pb::GetSandboxLimitsRequest>,
+    ) -> Result<Response<pb::GetSandboxLimitsResponse>, Status> {
+        let v = run(state, &req, Operation::GetLimits).await?;
+        Ok(Response::new(pb::GetSandboxLimitsResponse {
+            has_grant: b(&v, "has_grant"),
+            grant_id: s(&v, "grant_id"),
+            depth: n(&v, "depth"),
+            max_depth: n(&v, "max_depth"),
+            children_created: n(&v, "children_created"),
+            max_breadth: n(&v, "max_breadth"),
+            total: n(&v, "total"),
+            max_total: n(&v, "max_total"),
+            can_create_children: b(&v, "can_create_children"),
+        }))
+    }
+
+    fn children_of(v: &Value) -> Vec<pb::ChildSandbox> {
+        v.get("children")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|c| pb::ChildSandbox {
+                        handle: s(c, "handle"),
+                        kind: s(c, "kind"),
+                        lifetime: s(c, "lifetime"),
+                        depth: n(c, "depth"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Sandboxes list their own children; users name the parent.
+    pub(crate) async fn list_children_rpc(
+        state: &Arc<ServerState>,
+        req: Request<pb::ListChildSandboxesRequest>,
+    ) -> Result<Response<pb::ListChildSandboxesResponse>, Status> {
+        let principal = crate::grpc::extract_principal(&req)?;
+        if matches!(principal, Principal::Sandbox(_)) {
+            let v = run(state, &req, Operation::ListChildren).await?;
+            return Ok(Response::new(pb::ListChildSandboxesResponse {
+                children: children_of(&v),
+            }));
+        }
+        let r = req.get_ref();
+        if r.parent.trim().is_empty() {
+            return Err(Status::invalid_argument("parent is required"));
+        }
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            selected_workspace_name(r.workspace_scope.as_ref())?,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        let parent = state
+            .store
+            .get_message_by_name::<Sandbox>(&authz.workspace, &r.parent)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let v = list_children(state, parent.object_id());
+        Ok(Response::new(pb::ListChildSandboxesResponse {
+            children: children_of(&v),
+        }))
+    }
+
+    pub(crate) async fn list_grants(
+        state: &Arc<ServerState>,
+        req: Request<pb::ListSandboxGrantsRequest>,
+    ) -> Result<Response<pb::ListSandboxGrantsResponse>, Status> {
+        let v = run(state, &req, Operation::GrantList).await?;
+        let grants = v
+            .get("grants")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|g| pb::SandboxGrant {
+                        grant_id: s(g, "grant_id"),
+                        holder: s(g, "holder"),
+                        max_depth: n(g, "max_depth"),
+                        max_breadth: n(g, "max_breadth"),
+                        max_total: n(g, "max_total"),
+                        total: n(g, "total"),
+                        program: s(g, "program"),
+                        user: s(g, "user"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Response::new(pb::ListSandboxGrantsResponse { grants }))
+    }
+
+    pub(crate) async fn update_grant(
+        state: &Arc<ServerState>,
+        req: Request<pb::UpdateSandboxGrantRequest>,
+    ) -> Result<Response<pb::UpdateSandboxGrantResponse>, Status> {
+        let r = req.get_ref().clone();
+        let op = Operation::GrantUpdate(GrantUpdateArgs {
+            grant_id: r.grant_id,
+            max_depth: r.max_depth,
+            max_breadth: r.max_breadth,
+            max_total: r.max_total,
+            revoke: None,
+        });
+        let v = run(state, &req, op).await?;
+        Ok(Response::new(pb::UpdateSandboxGrantResponse {
+            grant_id: s(&v, "grant_id"),
+            max_depth: n(&v, "max_depth"),
+            max_breadth: n(&v, "max_breadth"),
+            max_total: n(&v, "max_total"),
+        }))
+    }
+
+    pub(crate) async fn revoke_grant(
+        state: &Arc<ServerState>,
+        req: Request<pb::RevokeSandboxGrantRequest>,
+    ) -> Result<Response<pb::RevokeSandboxGrantResponse>, Status> {
+        let r = req.get_ref().clone();
+        let op = Operation::GrantUpdate(GrantUpdateArgs {
+            grant_id: r.grant_id,
+            revoke: Some(true),
+            ..Default::default()
+        });
+        let v = run(state, &req, op).await?;
+        Ok(Response::new(pb::RevokeSandboxGrantResponse {
+            revoked: b(&v, "revoked"),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

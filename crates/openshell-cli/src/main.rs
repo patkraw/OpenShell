@@ -515,6 +515,13 @@ enum Commands {
         command: Option<SandboxCommands>,
     },
 
+    /// Manage grants that let a sandbox create child sandboxes.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Grant {
+        #[command(subcommand)]
+        command: Option<GrantCommands>,
+    },
+
     /// Manage port forwarding to a sandbox.
     #[command(alias = "fwd", after_help = FORWARD_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Forward {
@@ -1437,11 +1444,39 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum GrantCommands {
+    /// List grants.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List,
+    /// Widen or shrink a grant. Affects new creates only.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Grant id (see `openshell grant list`).
+        grant_id: String,
+        /// Levels below the sandbox started with the grant.
+        #[arg(long)]
+        max_depth: Option<u32>,
+        /// Children per parent.
+        #[arg(long)]
+        max_breadth: Option<u32>,
+        /// Sandboxes in the whole tree.
+        #[arg(long)]
+        max_total: Option<u32>,
+    },
+    /// Revoke a grant: its tree can create no more children.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Revoke {
+        /// Grant id.
+        grant_id: String,
+    },
+}
+
 // `Create` carries enough optional fields to be ~3x larger than the next
 // variant; boxing it would obscure the clap derive ergonomics for one
 // (rare) enum allocation per parse, which isn't worth the readability
 // cost.
 #[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug)]
 enum SandboxCommands {
     /// Create a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1658,6 +1693,14 @@ enum SandboxCommands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
+    },
+
+    /// List a sandbox's children (sandboxes it created through the gateway MCP).
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Children {
+        /// Parent sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
     },
 
     /// List sandboxes.
@@ -3068,6 +3111,44 @@ async fn run_async() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
+        Some(Commands::Grant {
+            command: Some(grant_cmd),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            match grant_cmd {
+                GrantCommands::List => {
+                    openshell_cli::grant::grant_list(&ctx.endpoint, &tls).await?
+                }
+                GrantCommands::Update {
+                    grant_id,
+                    max_depth,
+                    max_breadth,
+                    max_total,
+                } => {
+                    openshell_cli::grant::grant_update(
+                        &ctx.endpoint,
+                        &grant_id,
+                        max_depth,
+                        max_breadth,
+                        max_total,
+                        &tls,
+                    )
+                    .await?;
+                }
+                GrantCommands::Revoke { grant_id } => {
+                    openshell_cli::grant::grant_revoke(&ctx.endpoint, &grant_id, &tls).await?;
+                }
+            }
+        }
+        Some(Commands::Grant { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("grant")
+                .expect("grant subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
@@ -3578,6 +3659,16 @@ async fn run_async() -> Result<()> {
                                 &name,
                                 policy_only,
                                 output.as_str(),
+                                &cli.workspace,
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        SandboxCommands::Children { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            openshell_cli::grant::sandbox_children(
+                                &ctx.endpoint,
+                                &name,
                                 &cli.workspace,
                                 &tls,
                             )

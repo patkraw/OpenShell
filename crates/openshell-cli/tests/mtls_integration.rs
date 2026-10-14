@@ -39,6 +39,86 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn create_child_sandbox(
+        &self,
+        _: tonic::Request<openshell_core::proto::CreateChildSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::CreateChildSandboxResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn wait_child_sandbox(
+        &self,
+        _: tonic::Request<openshell_core::proto::WaitChildSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::WaitChildSandboxResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn exec_child_sandbox(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExecChildSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ExecChildSandboxResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn get_child_sandbox_file(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetChildSandboxFileRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetChildSandboxFileResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn stop_child_sandbox(
+        &self,
+        _: tonic::Request<openshell_core::proto::StopChildSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::StopChildSandboxResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn get_sandbox_limits(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetSandboxLimitsRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxLimitsResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn list_child_sandboxes(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListChildSandboxesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ListChildSandboxesResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn list_sandbox_grants(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListSandboxGrantsRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ListSandboxGrantsResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn update_sandbox_grant(
+        &self,
+        _: tonic::Request<openshell_core::proto::UpdateSandboxGrantRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::UpdateSandboxGrantResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn revoke_sandbox_grant(
+        &self,
+        _: tonic::Request<openshell_core::proto::RevokeSandboxGrantRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::RevokeSandboxGrantResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,

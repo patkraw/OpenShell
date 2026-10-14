@@ -18,7 +18,9 @@ an agent on the host can create sandboxes as the user. Design:
 | MCP surface | `crates/openshell-gateway-mcp/` | MCP protocol only: handshake, tool list, argument parsing, errors. Talks to OpenShell through the `SandboxApi` trait; tested on its own with a fake backend. |
 | Gateway rules | `crates/openshell-server/src/children.rs` | Implements `SandboxApi`: grants, lineage, the prover check against the ceiling, limits, retries, tool sandboxes, cascade stop. |
 | Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in each sandbox; checks the calling program against the door rule and forwards with the sandbox's token. |
-| CLI | `openshell sandbox create --grant ...` | Starts a sandbox that may create children. |
+| gRPC API | `proto/openshell.proto` (`CreateChildSandbox`, `ListSandboxGrants`, ...) | The same operations as the MCP tools, for the SDKs and the CLI. Handlers in `children.rs` (`grpc_surface`) call the same rules as MCP. |
+| CLI | `openshell sandbox create --grant ...`, `openshell grant list/update/revoke`, `openshell sandbox children` | Start a tree, manage grants, see children. |
+| Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
 
 The MCP endpoint is on by default. Set `OPENSHELL_GATEWAY_MCP_ENABLED=false`
 on the gateway to turn it off; grants and the CLI keep working.
@@ -95,4 +97,4 @@ restrictive default policy is used; a tree never relies on an image's own policy
 - The door forwards the sandbox's session token, not a dedicated short-lived token.
 - The global policy works as today (`replace`); a child create with a policy is refused while one is active. `maximum` mode from the RFC is not built.
 - The door handles only plain HTTP to the gateway (the dev gateway has TLS off).
-- The child-sandbox gRPC service from the RFC is not built; the MCP surface calls the gateway's rules directly.
+- The door forwards only MCP, not gRPC: code inside a sandbox uses MCP; the gRPC child functions are used from the host.

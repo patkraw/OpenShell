@@ -221,6 +221,16 @@ mock_gateway! {
     unary {
         health(proto::HealthRequest) -> proto::HealthResponse;
         get_current_user(proto::GetCurrentUserRequest) -> proto::GetCurrentUserResponse;
+        create_child_sandbox(proto::CreateChildSandboxRequest) -> proto::CreateChildSandboxResponse;
+        wait_child_sandbox(proto::WaitChildSandboxRequest) -> proto::WaitChildSandboxResponse;
+        exec_child_sandbox(proto::ExecChildSandboxRequest) -> proto::ExecChildSandboxResponse;
+        get_child_sandbox_file(proto::GetChildSandboxFileRequest) -> proto::GetChildSandboxFileResponse;
+        stop_child_sandbox(proto::StopChildSandboxRequest) -> proto::StopChildSandboxResponse;
+        get_sandbox_limits(proto::GetSandboxLimitsRequest) -> proto::GetSandboxLimitsResponse;
+        list_child_sandboxes(proto::ListChildSandboxesRequest) -> proto::ListChildSandboxesResponse;
+        list_sandbox_grants(proto::ListSandboxGrantsRequest) -> proto::ListSandboxGrantsResponse;
+        update_sandbox_grant(proto::UpdateSandboxGrantRequest) -> proto::UpdateSandboxGrantResponse;
+        revoke_sandbox_grant(proto::RevokeSandboxGrantRequest) -> proto::RevokeSandboxGrantResponse;
         get_gateway_info(proto::GetGatewayInfoRequest) -> proto::GetGatewayInfoResponse;
         create_sandbox(proto::CreateSandboxRequest) -> proto::SandboxResponse;
         begin_rootfs_tar_staging(proto::BeginRootfsTarStagingRequest) -> proto::BeginRootfsTarStagingResponse;

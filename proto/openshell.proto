@@ -856,6 +856,87 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+
+  // --- Child sandboxes (gateway MCP proof of concept) ---
+  // The same rules back the MCP endpoint (/mcp) and these RPCs.
+
+  // Create a child of the calling sandbox, within its tree's grant.
+  rpc CreateChildSandbox(CreateChildSandboxRequest) returns (CreateChildSandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Wait until a child of the calling sandbox is ready or has exited.
+  rpc WaitChildSandbox(WaitChildSandboxRequest) returns (WaitChildSandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Run a command in a tool child of the calling sandbox.
+  rpc ExecChildSandbox(ExecChildSandboxRequest) returns (ExecChildSandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Read a file from a running child of the calling sandbox.
+  rpc GetChildSandboxFile(GetChildSandboxFileRequest) returns (GetChildSandboxFileResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Stop a child of the calling sandbox; its own children are stopped first.
+  rpc StopChildSandbox(StopChildSandboxRequest) returns (StopChildSandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Depth, children and total used and allowed for the calling sandbox.
+  rpc GetSandboxLimits(GetSandboxLimitsRequest) returns (GetSandboxLimitsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Children of a sandbox. Sandboxes see their own; users name the parent.
+  rpc ListChildSandboxes(ListChildSandboxesRequest) returns (ListChildSandboxesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Grants set with `sandbox create --grant`.
+  rpc ListSandboxGrants(ListSandboxGrantsRequest) returns (ListSandboxGrantsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Widen or shrink a grant. Only the user who set it; new creates only.
+  rpc UpdateSandboxGrant(UpdateSandboxGrantRequest) returns (UpdateSandboxGrantResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Revoke a grant: the tree can create no more children.
+  rpc RevokeSandboxGrant(RevokeSandboxGrantRequest) returns (RevokeSandboxGrantResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the
@@ -4168,4 +4249,150 @@ message EndpointFailure {
   // Supervisor-minted UUID of the refused exchange. The workload receives the
   // same value in the x-openshell-request-id response header.
   string request_id = 8;
+}
+
+// --- Child sandboxes (gateway MCP proof of concept) ---
+
+// Create a child of the calling sandbox.
+message CreateChildSandboxRequest {
+  // Child sandbox name. Generated when empty.
+  string name = 1;
+  // "agent" (default) or "tool".
+  string kind = 2;
+  // "until_stopped" (default) or "until_exit".
+  string lifetime = 3;
+  // Command to run. Optional for tool sandboxes.
+  repeated string command = 4;
+  // Task text, passed to the child as OPENSHELL_TASK.
+  string task = 5;
+  // The child's network rules as policy JSON or YAML, e.g.
+  // {"network_policies": {...}}. Must fit inside the tree's ceiling.
+  string policy = 6;
+  // Providers for the child; a subset of the parent's. Empty: the parent's.
+  repeated string providers = 7;
+  // The same id on a retry returns the first result, counted once.
+  string request_id = 8;
+  // Tool sandboxes: stop after this many idle seconds. 0: default.
+  uint32 idle_timeout_seconds = 9;
+}
+
+message CreateChildSandboxResponse {
+  string handle = 1;
+  uint32 depth = 2;
+  bool can_create_children = 3;
+  bool repeated_request = 4;
+  string kind = 5;
+  string lifetime = 6;
+}
+
+message WaitChildSandboxRequest {
+  string handle = 1;
+  uint32 timeout_seconds = 2;
+}
+
+message WaitChildSandboxResponse {
+  string phase = 1;
+  optional int32 exit_code = 2;
+  bool timed_out = 3;
+}
+
+message ExecChildSandboxRequest {
+  string handle = 1;
+  repeated string command = 2;
+  uint32 timeout_seconds = 3;
+}
+
+message ExecChildSandboxResponse {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
+}
+
+message GetChildSandboxFileRequest {
+  string handle = 1;
+  string path = 2;
+}
+
+message GetChildSandboxFileResponse {
+  string content = 1;
+}
+
+message StopChildSandboxRequest {
+  string handle = 1;
+}
+
+message StopChildSandboxResponse {
+  bool stopped = 1;
+}
+
+message GetSandboxLimitsRequest {}
+
+message GetSandboxLimitsResponse {
+  bool has_grant = 1;
+  string grant_id = 2;
+  uint32 depth = 3;
+  uint32 max_depth = 4;
+  uint32 children_created = 5;
+  uint32 max_breadth = 6;
+  uint32 total = 7;
+  uint32 max_total = 8;
+  bool can_create_children = 9;
+}
+
+message ListChildSandboxesRequest {
+  // Users: the parent sandbox's name. Sandboxes: empty (their own children).
+  string parent = 1;
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+}
+
+message ChildSandbox {
+  string handle = 1;
+  string kind = 2;
+  string lifetime = 3;
+  uint32 depth = 4;
+}
+
+message ListChildSandboxesResponse {
+  repeated ChildSandbox children = 1;
+}
+
+message SandboxGrant {
+  string grant_id = 1;
+  // Name of the sandbox started with the grant.
+  string holder = 2;
+  uint32 max_depth = 3;
+  uint32 max_breadth = 4;
+  uint32 max_total = 5;
+  // Sandboxes created in the tree so far, including the holder.
+  uint32 total = 6;
+  string program = 7;
+  string user = 8;
+}
+
+message ListSandboxGrantsRequest {}
+
+message ListSandboxGrantsResponse {
+  repeated SandboxGrant grants = 1;
+}
+
+message UpdateSandboxGrantRequest {
+  string grant_id = 1;
+  optional uint32 max_depth = 2;
+  optional uint32 max_breadth = 3;
+  optional uint32 max_total = 4;
+}
+
+message UpdateSandboxGrantResponse {
+  string grant_id = 1;
+  uint32 max_depth = 2;
+  uint32 max_breadth = 3;
+  uint32 max_total = 4;
+}
+
+message RevokeSandboxGrantRequest {
+  string grant_id = 1;
+}
+
+message RevokeSandboxGrantResponse {
+  bool revoked = 1;
 }
