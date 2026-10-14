@@ -216,6 +216,20 @@ mod tests {
     const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
         "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
     ];
+    // Child-sandbox and grant RPCs used by the gateway MCP endpoint.
+    const GATEWAY_MCP_RPC_SIGNATURES: [&str; 11] = [
+        "openshell.v1.OpenShell/CreateChildSandbox|.openshell.v1.CreateChildSandboxRequest|.openshell.v1.CreateChildSandboxResponse|false|false",
+        "openshell.v1.OpenShell/CreateSandboxGrant|.openshell.v1.CreateSandboxGrantRequest|.openshell.v1.CreateSandboxGrantResponse|false|false",
+        "openshell.v1.OpenShell/ExecChildSandbox|.openshell.v1.ExecChildSandboxRequest|.openshell.v1.ExecChildSandboxResponse|false|false",
+        "openshell.v1.OpenShell/GetChildSandboxFile|.openshell.v1.GetChildSandboxFileRequest|.openshell.v1.GetChildSandboxFileResponse|false|false",
+        "openshell.v1.OpenShell/GetSandboxLimits|.openshell.v1.GetSandboxLimitsRequest|.openshell.v1.GetSandboxLimitsResponse|false|false",
+        "openshell.v1.OpenShell/ListChildSandboxes|.openshell.v1.ListChildSandboxesRequest|.openshell.v1.ListChildSandboxesResponse|false|false",
+        "openshell.v1.OpenShell/ListSandboxGrants|.openshell.v1.ListSandboxGrantsRequest|.openshell.v1.ListSandboxGrantsResponse|false|false",
+        "openshell.v1.OpenShell/RevokeSandboxGrant|.openshell.v1.RevokeSandboxGrantRequest|.openshell.v1.RevokeSandboxGrantResponse|false|false",
+        "openshell.v1.OpenShell/StopChildSandbox|.openshell.v1.StopChildSandboxRequest|.openshell.v1.StopChildSandboxResponse|false|false",
+        "openshell.v1.OpenShell/UpdateSandboxGrant|.openshell.v1.UpdateSandboxGrantRequest|.openshell.v1.UpdateSandboxGrantResponse|false|false",
+        "openshell.v1.OpenShell/WaitChildSandbox|.openshell.v1.WaitChildSandboxRequest|.openshell.v1.WaitChildSandboxResponse|false|false",
+    ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
     const PRE_READINESS_SANDBOX_SPEC: &str =
@@ -629,10 +643,17 @@ mod tests {
                 "peer config RPC is missing or changed: {signature}"
             );
         }
+        for signature in GATEWAY_MCP_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "gateway MCP RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
             106 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
+                + GATEWAY_MCP_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
                 + sandbox_protocol_methods.len()
@@ -643,6 +664,7 @@ mod tests {
             methods.len(),
             80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
+                + GATEWAY_MCP_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
@@ -653,6 +675,7 @@ mod tests {
                 .count(),
             80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
+                + GATEWAY_MCP_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));

@@ -1400,6 +1400,7 @@ pub(crate) mod grpc_surface {
     use crate::auth::workspace_authz::{
         MinWorkspaceRole, authorize_workspace, selected_workspace_name,
     };
+    use crate::pagination::Pagination;
     use openshell_core::proto as pb;
     use openshell_core::{ObjectId, proto::Sandbox};
     use openshell_gateway_mcp::{
@@ -1458,8 +1459,53 @@ pub(crate) mod grpc_surface {
     fn opt(x: String) -> Option<String> {
         (!x.trim().is_empty()).then_some(x)
     }
-    fn timeout(secs: u32) -> Option<u64> {
-        (secs > 0).then_some(u64::from(secs))
+    /// An optional request duration to whole seconds for the shared rules.
+    /// Unset or zero means the operation's default.
+    fn timeout(value: Option<&prost_types::Duration>) -> Result<Option<u64>, Status> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let duration = openshell_core::time::duration_to_std(value)
+            .map_err(|e| Status::invalid_argument(format!("INVALID_ARGUMENT: {e}")))?;
+        let secs = duration.as_secs();
+        Ok((secs > 0).then_some(secs))
+    }
+
+    /// One page of `items`, ordered by `key`, after the token's key.
+    fn page<T>(
+        mut items: Vec<T>,
+        key: impl Fn(&T) -> &str,
+        pagination: &Pagination,
+    ) -> Result<(Vec<T>, String), Status> {
+        items.sort_by(|a, b| key(a).cmp(key(b)));
+        if let Some(after) = pagination.profile_cursor()? {
+            items.retain(|item| key(item) > after);
+        }
+        let size = usize::try_from(pagination.page_size()).unwrap_or(usize::MAX);
+        if items.len() <= size {
+            return Ok((items, String::new()));
+        }
+        items.truncate(size);
+        let next = pagination.next_profile_token(items.last().map(&key));
+        Ok((items, next))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Pagination, page};
+
+        #[test]
+        fn pages_follow_the_key_order() {
+            let items = vec!["c", "a", "b"];
+            let first = Pagination::new(2, "", "ListSandboxGrants", &[]).unwrap();
+            let (got, next) = page(items.clone(), |s| s, &first).unwrap();
+            assert_eq!(got, ["a", "b"]);
+            assert!(!next.is_empty());
+            let second = Pagination::new(2, &next, "ListSandboxGrants", &[]).unwrap();
+            let (got, next) = page(items, |s| s, &second).unwrap();
+            assert_eq!(got, ["c"]);
+            assert!(next.is_empty());
+        }
     }
 
     /// Policy text (JSON or YAML) to the JSON value the rules take.
@@ -1490,7 +1536,7 @@ pub(crate) mod grpc_surface {
             policy: policy_value(&r.policy)?,
             providers: (!r.providers.is_empty()).then_some(r.providers),
             request_id: opt(r.request_id),
-            idle_timeout_s: timeout(r.idle_timeout_seconds),
+            idle_timeout_s: timeout(r.idle_timeout.as_ref())?,
             image: None,
             grant: None,
         };
@@ -1512,7 +1558,7 @@ pub(crate) mod grpc_surface {
         let r = req.get_ref().clone();
         let op = Operation::Wait(WaitArgs {
             handle: r.handle,
-            timeout_s: timeout(r.timeout_seconds),
+            timeout_s: timeout(r.timeout.as_ref())?,
         });
         let v = run(state, &req, op).await?;
         Ok(Response::new(pb::WaitChildSandboxResponse {
@@ -1538,7 +1584,7 @@ pub(crate) mod grpc_surface {
         let op = Operation::Exec(ExecArgs {
             handle: r.handle,
             command: r.command,
-            timeout_s: timeout(r.timeout_seconds),
+            timeout_s: timeout(r.timeout.as_ref())?,
         });
         let v = run(state, &req, op).await?;
         Ok(Response::new(pb::ExecChildSandboxResponse {
@@ -1627,13 +1673,28 @@ pub(crate) mod grpc_surface {
         req: Request<pb::ListChildSandboxesRequest>,
     ) -> Result<Response<pb::ListChildSandboxesResponse>, Status> {
         let principal = crate::grpc::extract_principal(&req)?;
+        let r = req.get_ref();
+        let workspace = r
+            .workspace_scope
+            .as_ref()
+            .map(|w| format!("{w:?}"))
+            .unwrap_or_default();
+        // The cursor is the last child's handle; children sort by handle.
+        let pagination = Pagination::new(
+            r.page_size,
+            &r.page_token,
+            "ListChildSandboxes",
+            &[&r.parent, &workspace],
+        )?;
         if matches!(principal, Principal::Sandbox(_)) {
             let v = run(state, &req, Operation::ListChildren).await?;
+            let (children, next_page_token) =
+                page(children_of(&v), |c| c.handle.as_str(), &pagination)?;
             return Ok(Response::new(pb::ListChildSandboxesResponse {
-                children: children_of(&v),
+                children,
+                next_page_token,
             }));
         }
-        let r = req.get_ref();
         if r.parent.trim().is_empty() {
             return Err(Status::invalid_argument("parent is required"));
         }
@@ -1652,8 +1713,11 @@ pub(crate) mod grpc_surface {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         let v = list_children(state, parent.object_id());
+        let (children, next_page_token) =
+            page(children_of(&v), |c| c.handle.as_str(), &pagination)?;
         Ok(Response::new(pb::ListChildSandboxesResponse {
-            children: children_of(&v),
+            children,
+            next_page_token,
         }))
     }
 
@@ -1661,6 +1725,9 @@ pub(crate) mod grpc_surface {
         state: &Arc<ServerState>,
         req: Request<pb::ListSandboxGrantsRequest>,
     ) -> Result<Response<pb::ListSandboxGrantsResponse>, Status> {
+        let r = req.get_ref();
+        // The cursor is the last grant's id; grants sort by id.
+        let pagination = Pagination::new(r.page_size, &r.page_token, "ListSandboxGrants", &[])?;
         let v = run(state, &req, Operation::GrantList).await?;
         let grants = v
             .get("grants")
@@ -1680,7 +1747,11 @@ pub(crate) mod grpc_surface {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Response::new(pb::ListSandboxGrantsResponse { grants }))
+        let (grants, next_page_token) = page(grants, |g| g.grant_id.as_str(), &pagination)?;
+        Ok(Response::new(pb::ListSandboxGrantsResponse {
+            grants,
+            next_page_token,
+        }))
     }
 
     pub(crate) async fn update_grant(
