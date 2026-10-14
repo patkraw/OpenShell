@@ -57,6 +57,11 @@ gid=$(mcp lead get_limits | python3 -c 'import json,sys; print(json.load(sys.std
 check "the user widens the grant (depth 2, breadth 9, total 10)" "$(user_mcp grant_update grant_id="$gid" max_depth=2 max_breadth=9 max_total=10)" '"max_depth": 2'
 check "lead can create again after widening" "$(mcp lead create_sandbox '{"name":"w3","command":["sh","-c","echo result-from-w3; exit 0"],"lifetime":"until_exit"}')" '"handle":"w3"'
 check "w1, a leaf before, creates a child at once (no policy change)" "$(mcp w1 create_sandbox '{"name":"g1","command":["sleep","60"]}')" '"handle":"g1"'
+FS_RO='{"name":"fsro","command":["sleep","60"],"policy":{"filesystem_policy":{"include_workdir":true,"read_only":["/bin","/usr","/lib","/proc","/dev/urandom","/etc","/var/log","/tmp"],"read_write":["/dev/null"]}}}'
+check "child with narrower filesystem (/tmp read-only) is created" "$(mcp lead create_sandbox "$FS_RO")" '"handle":"fsro"'
+FS_RW='{"name":"fsrw","command":["sleep","60"],"policy":{"filesystem_policy":{"include_workdir":true,"read_only":["/bin","/usr","/lib","/proc","/dev/urandom","/var/log"],"read_write":["/tmp","/dev/null","/etc"]}}}'
+out=$(mcp lead create_sandbox "$FS_RW")
+if [[ "$out" == *EXCEEDS_CEILING* || "$out" == *UNSUPPORTED_RULES* ]]; then check "child with wider filesystem (/etc writable) is refused" ok ok; else check "child with wider filesystem (/etc writable) is refused" "$out" refused; fi
 check "wait for w3 to exit" "$(mcp lead wait '{"handle":"w3","timeout_s":60}')" '"exit_code":0'
 check "only your own children" "$(mcp lead stop_sandbox '{"handle":"lead"}')" "NOT_YOUR_CHILD"
 

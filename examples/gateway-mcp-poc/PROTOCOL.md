@@ -158,7 +158,7 @@ HTTP 200 application/json
   "result": {
     "tools": [
       {
-        "description": "Create a sandbox. From a sandbox: creates a child that runs your template (image, CPU, memory); `policy` holds only its network_policies and must fit inside your own policy. From the host: creates a top-level sandbox as the user. Returns a handle.",
+        "description": "Create a sandbox. From a sandbox: creates a child that runs your template (image, CPU, memory); `policy` may narrow any section (network_policies, filesystem_policy, process, landlock) and must fit inside your own policy. From the host: creates a top-level sandbox as the user. Returns a handle.",
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
