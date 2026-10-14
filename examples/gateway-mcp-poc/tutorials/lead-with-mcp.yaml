@@ -1,0 +1,30 @@
+# A lead whose policy also allows one tool of a remote MCP server (per-tool rule).
+# The prover cannot check MCP rules, so children can get everything else here,
+# but not this rule.
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /etc, /var/log]
+  read_write: [/tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+network_policies:
+  github_mcp:
+    name: github_mcp
+    endpoints:
+      - host: api.githubcopilot.com
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow: {method: tools/call, tool: get_issue}
+    binaries:
+      - path: /usr/local/bin/node
+  example:
+    name: example
+    endpoints:
+      - host: example.com
+        port: 443
+    binaries:
+      - path: /usr/local/bin/node

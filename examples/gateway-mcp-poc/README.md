@@ -6,8 +6,10 @@ an agent on the host can create sandboxes as the user. Design:
 [RFC draft](../../rfc/NNNN-gateway-mcp-sandbox-creation/README.md) (on branch
 `docs/gateway-mcp-rfc/patkraw`).
 
-- **[TUTORIAL.md](TUTORIAL.md)**: step by step with the CLI, MCP from inside and
-  outside a sandbox, and the official Python and TypeScript MCP SDKs.
+- **[tutorials/](tutorials/README.md)**: run it yourself, one feature at a time:
+  setup, the CLI, MCP inside a sandbox, child policies, asking for more, MCP
+  from the host, the SDKs and tool sandboxes. Real output in every step.
+- **[TUTORIAL.md](TUTORIAL.md)**: a quick tour of everything on one page.
 - **[PROTOCOL.md](PROTOCOL.md)**: the protocol agreement (transport, methods,
   tools per caller, results, error codes) with real captured exchanges.
 
@@ -20,7 +22,7 @@ an agent on the host can create sandboxes as the user. Design:
 | Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in every sandbox; forwards with the sandbox's token and the calling program's path. The gateway decides every call. |
 | gRPC API | `proto/openshell.proto` (`CreateChildSandbox`, `ListSandboxGrants`, ...) | The same operations as the MCP tools, for the SDKs and the CLI. Handlers in `children.rs` (`grpc_surface`) call the same rules as MCP. |
 | CLI | `openshell sandbox create --grant ...`, `openshell grant create/list/update/revoke`, `openshell sandbox children` | Start a tree, add a grant to a running sandbox, manage grants, see children. |
-| Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
+| Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `create_grant`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
 
 The MCP endpoint is on by default. Set `OPENSHELL_GATEWAY_MCP_ENABLED=false`
 on the gateway to turn it off; grants and the CLI keep working.

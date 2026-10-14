@@ -1472,7 +1472,7 @@ enum GrantCommands {
         #[arg(long, default_value = "narrow")]
         child_policy: String,
     },
-    /// Widen or shrink a grant. Affects new creates only.
+    /// Widen or shrink a grant. Applies from the next call in its tree.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
         /// Grant id (see `openshell grant list`).

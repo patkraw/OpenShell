@@ -105,7 +105,7 @@ pub async fn grant_update(
         .into_diagnostic()?
         .into_inner();
     println!(
-        "✓ Grant {} updated: max_depth={} max_breadth={} max_total={} (new creates only)",
+        "✓ Grant {} updated: max_depth={} max_breadth={} max_total={} (applies from the next call)",
         g.grant_id, g.max_depth, g.max_breadth, g.max_total
     );
     Ok(())

@@ -1,0 +1,36 @@
+# lead.yaml plus api.openai.com: wider than the lead. Used in tutorial 04 to show
+# that a child's policy cannot be set beyond its parent's.
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /etc, /var/log]
+  read_write: [/tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+network_policies:
+  github_read:
+    name: github_read
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {method: GET, path: "/repos/**"}
+    binaries:
+      - path: /usr/local/bin/node
+  example:
+    name: example
+    endpoints:
+      - host: example.com
+        port: 443
+    binaries:
+      - path: /usr/local/bin/node
+      - path: /usr/bin/curl
+  openai:
+    name: openai
+    endpoints:
+      - host: api.openai.com
+        port: 443
+    binaries:
+      - path: /usr/local/bin/node

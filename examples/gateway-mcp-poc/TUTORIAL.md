@@ -7,6 +7,9 @@ same from the host, and then use the official MCP SDKs from your own code.
 Every command here was run against a development gateway with the Docker
 driver. The protocol is described in [PROTOCOL.md](PROTOCOL.md).
 
+This page is the quick tour. For one feature at a time, with real output in
+every step, see the [tutorials](tutorials/README.md).
+
 ## 0. Set up
 
 You need Docker, the Rust toolchain from `rust-toolchain.toml`, `mise`, and `uv`
@@ -124,7 +127,7 @@ examples/gateway-mcp-poc/user-mcp.py create_sandbox name=box1 image=pi-agent:loc
 ```
 
 Manage grants and see a tree with the CLI (these call the gateway's gRPC API;
-only the user can change a grant, and changes apply to new creates only):
+only the user can change a grant, and changes apply from the next call):
 
 ```shell
 target/debug/openshell -g docker-dev grant list

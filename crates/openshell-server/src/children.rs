@@ -1381,7 +1381,7 @@ fn grant_update(
     set(&mut g.max_depth, "max_depth");
     set(&mut g.max_breadth, "max_breadth");
     set(&mut g.max_total, "max_total");
-    info!(grant_id = %id, user = %user.identity.subject, ?args, "mcp: grant updated (affects new creates only)");
+    info!(grant_id = %id, user = %user.identity.subject, ?args, "mcp: grant updated (applies from the next call)");
     Ok(
         json!({"grant_id": id, "max_depth": g.max_depth, "max_breadth": g.max_breadth, "max_total": g.max_total}),
     )
