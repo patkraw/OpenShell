@@ -81,7 +81,7 @@ see the script header).
 
 | Key | Meaning |
 |-----|---------|
-| `max_depth` | Levels below this sandbox. `1`: its children cannot create children. |
+| `max_depth` | Levels of agents below this sandbox. `1`: its children cannot create agents. Tool sandboxes ignore depth and count only toward breadth and total. |
 | `max_breadth` | Children per parent. |
 | `max_total` | Sandboxes in the tree, including this one. |
 | `expires` | e.g. `4h`. |

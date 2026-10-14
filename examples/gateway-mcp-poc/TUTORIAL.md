@@ -39,7 +39,7 @@ target/debug/openshell -g docker-dev sandbox create --name lead --from pi-agent:
 
 | Key | Here | Meaning |
 |---|---|---|
-| `max_depth` | `1` | the lead's children cannot create children |
+| `max_depth` | `1` | the lead's children cannot create agents (tool sandboxes still allowed) |
 | `max_breadth` | `2` | at most two children per parent |
 | `max_total` | `3` | at most three sandboxes in the tree, including the lead |
 | `expires` | `1h` | the grant ends after an hour |

@@ -422,7 +422,14 @@ fn terr(code: &'static str, message: impl Into<String>) -> ToolError {
 }
 
 /// Why `sandbox_id` may not create a child, if it may not.
-fn can_create(state: &ServerState, sandbox_id: &str) -> Result<(Lineage, Grant), ToolError> {
+/// Whether `sandbox_id` may create a child of `kind` now. Tool sandboxes
+/// ignore the depth limit, so a sandbox at the bottom of the tree can still
+/// run commands in its own tool sandboxes; they count toward breadth and total.
+fn can_create(
+    state: &ServerState,
+    sandbox_id: &str,
+    kind: &str,
+) -> Result<(Lineage, Grant), ToolError> {
     let lineage = state
         .children
         .lineage(sandbox_id)
@@ -437,7 +444,7 @@ fn can_create(state: &ServerState, sandbox_id: &str) -> Result<(Lineage, Grant),
     if now_ms() > grant.expires_at_ms {
         return Err(terr("NOT_ALLOWED", "grant expired"));
     }
-    if lineage.depth >= grant.max_depth {
+    if kind == KIND_AGENT && lineage.depth >= grant.max_depth {
         return Err(terr(
             "LIMIT_REACHED",
             format!("depth: {} of {}", lineage.depth, grant.max_depth),
@@ -702,7 +709,6 @@ async fn create_child(
         ));
     }
     // 3. Grant and limits.
-    let (parent_lineage, grant) = can_create(state, caller_id)?;
     let kind = str_arg(args, "kind").unwrap_or(KIND_AGENT).to_string();
     if kind != KIND_AGENT && kind != KIND_TOOL {
         return Err(terr(
@@ -710,6 +716,7 @@ async fn create_child(
             "kind must be \"agent\" or \"tool\"",
         ));
     }
+    let (parent_lineage, grant) = can_create(state, caller_id, &kind)?;
     let parent = state
         .store
         .get_message::<Sandbox>(caller_id)
@@ -1173,7 +1180,8 @@ fn get_limits(state: &ServerState, caller_id: &str) -> Value {
         "depth": l.depth, "max_depth": g.max_depth,
         "children_created": l.children_created, "max_breadth": g.max_breadth,
         "total": g.total, "max_total": g.max_total,
-        "can_create_children": can_create(state, caller_id).is_ok()
+        "can_create_children": can_create(state, caller_id, KIND_AGENT).is_ok(),
+        "can_create_tools": can_create(state, caller_id, KIND_TOOL).is_ok()
     })
 }
 
