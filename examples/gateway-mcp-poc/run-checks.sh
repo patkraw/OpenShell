@@ -101,6 +101,19 @@ wait_ready mid || echo "mid did not become ready"
 EX='{"name":"leaf","command":["true"],"policy":{"network_policies":{"example":{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
 check "mid cannot give a grandchild example.com (deeplead has it, mid does not)" "$(mcp mid create_sandbox "$EX")" "EXCEEDS_CEILING"
 check "mid can give a grandchild what mid has" "$(mcp mid create_sandbox "${GH_ONLY/\"mid\"/\"leaf\"}")" '"handle":"leaf"'
+
+echo "== Asking for more: refused, propose for yourself, user approves, retry"
+# Agent proposals are off by default; the user turns them on for this sandbox.
+$OS settings set deeplead --key agent_policy_proposals_enabled --value true >/dev/null 2>&1; sleep 15
+GH_WRITE_RULE='{"name":"github_write","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"POST","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}'
+WRITER="{\"name\":\"writer\",\"command\":[\"sleep\",\"60\"],\"policy\":{\"network_policies\":{\"github_write\":$GH_WRITE_RULE}}}"
+check "child with GitHub write is refused, with a hint to use policy.local" "$(mcp deeplead create_sandbox "$WRITER")" "policy.local/v1/proposals"
+PROPOSAL="{\"intent_summary\":\"Let a child sandbox open GitHub pull requests.\",\"operations\":[{\"addRule\":{\"ruleName\":\"github_write\",\"rule\":$GH_WRITE_RULE}}]}"
+cid=$($OS sandbox exec deeplead -- curl -s -m 20 -X POST http://policy.local/v1/proposals -H 'content-type: application/json' -d "$PROPOSAL" 2>&1 | tail -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["accepted_chunk_ids"][0])' 2>/dev/null)
+check "deeplead proposes the rule for itself through policy.local" "$([ -n "$cid" ] && echo accepted)" "accepted"
+check "the user approves it" "$($OS rule approve deeplead --chunk-id "$cid" 2>&1)" "pprove"
+check "deeplead's policy reloads with the rule" "$($OS sandbox exec deeplead -- curl -s -m 100 "http://policy.local/v1/proposals/$cid/wait?timeout=90" 2>&1 | tail -1)" '"policy_reloaded":true'
+check "retry: the child now fits deeplead's policy" "$(mcp deeplead create_sandbox "$WRITER")" '"handle":"writer"'
 $OS sandbox delete deeplead >/dev/null 2>&1
 
 echo "== Cascade stop"

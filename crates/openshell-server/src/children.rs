@@ -640,6 +640,14 @@ fn modelable_boundary(policy: &SandboxPolicy) -> SandboxPolicy {
     boundary
 }
 
+/// Next step for an agent whose child policy was refused, in the style of the
+/// supervisor's `policy.local` guidance for blocked requests.
+const EXCEEDS_HINT: &str = "A child cannot get more than you have. Either narrow the \
+    child's policy and retry, or, if the task needs this access and policy proposals are \
+    enabled in this sandbox, first ask for it for yourself: read /etc/openshell/skills/policy_advisor.md, submit the narrowest rule to \
+    http://policy.local/v1/proposals, wait for approval and `policy_reloaded: true`, then \
+    retry create_sandbox.";
+
 /// Prove `candidate` fits inside `ceiling`. Only `Within` passes.
 async fn prove(ceiling: &SandboxPolicy, candidate: &SandboxPolicy) -> Result<(), ToolError> {
     let ser = |p: &SandboxPolicy| {
@@ -661,7 +669,7 @@ async fn prove(ceiling: &SandboxPolicy, candidate: &SandboxPolicy) -> Result<(),
         CheckResult::Exceeds(ev) => Err(terr(
             "EXCEEDS_CEILING",
             format!(
-                "child policy exceeds the parent's policy; counterexample: {:?}",
+                "child policy exceeds the parent's policy; counterexample: {:?}. {EXCEEDS_HINT}",
                 ev.counterexample()
             ),
         )),
@@ -1608,6 +1616,18 @@ mod tests {
         let mut child = parent.clone();
         child.network_policies.remove("gh");
         prove(&parent, &child).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refusal_tells_the_agent_how_to_ask_for_more() {
+        let parent = policy(
+            "version: 1\nnetwork_policies:\n  ex:\n    name: ex\n    endpoints:\n      - host: example.com\n        port: 443\n    binaries: [{ path: /usr/local/bin/node }]\n",
+        );
+        let mut child = parent.clone();
+        child.network_policies.get_mut("ex").unwrap().endpoints[0].host = "other.com".into();
+        let err = prove(&parent, &child).await.unwrap_err();
+        assert_eq!(err.code, "EXCEEDS_CEILING");
+        assert!(err.message.contains("http://policy.local/v1/proposals"));
     }
 
     #[tokio::test]
