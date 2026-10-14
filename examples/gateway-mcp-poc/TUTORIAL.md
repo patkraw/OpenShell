@@ -127,11 +127,17 @@ examples/gateway-mcp-poc/user-mcp.py grant_list
 examples/gateway-mcp-poc/user-mcp.py create_sandbox name=box1 image=pi-agent:local 'command=["sleep","300"]'
 ```
 
-Widen a grant while the tree runs (new creates only; only the user can do this):
+Manage grants and see a tree with the CLI (these call the gateway's gRPC API;
+only the user can change a grant, and changes apply to new creates only):
 
 ```shell
-examples/gateway-mcp-poc/user-mcp.py grant_update grant_id=<id> max_breadth=3 max_total=4
+target/debug/openshell -g docker-dev grant list
+target/debug/openshell -g docker-dev grant update <grant-id> --max-breadth 3 --max-total 4
+target/debug/openshell -g docker-dev grant revoke <grant-id>
+target/debug/openshell -g docker-dev sandbox children lead
 ```
+
+The same through MCP: `user-mcp.py grant_update grant_id=<id> max_breadth=3 max_total=4`.
 
 To use it from an agent on your machine, add the URL to that agent's MCP
 configuration, for example for Pi (`~/.pi/agent/mcp.json`):
@@ -180,11 +186,31 @@ exec: ok {"exit_code":0,"stdout":"hello from 44774938feb6\n",...}
 stop_sandbox: ok {"handle":"sdk-tool","stopped":true}
 ```
 
-### OpenShell's own SDK
+### OpenShell's own SDK (gRPC)
 
-The OpenShell Python SDK (`python/openshell`) creates sandboxes as the user, but
-its `create` does not yet take a grant, and the child-sandbox gRPC service from
-the RFC is not built in this proof of concept. Use MCP for both for now.
+The OpenShell Python SDK talks to the gateway's gRPC API, which has the same
+child-sandbox and grant functions as the MCP tools, backed by the same rules.
+[`sdk/host_grpc.py`](sdk/host_grpc.py) creates a sandbox with a grant, widens
+the grant and lists the sandbox's children:
+
+```shell
+uv run --frozen python examples/gateway-mcp-poc/sdk/host_grpc.py
+```
+
+```text
+created: grpc-lead
+grant: SandboxGrant(grant_id='gr-...', holder='grpc-lead', max_depth=1, max_breadth=2, max_total=3, total=1, ...)
+widened: 3 4
+children: []
+```
+
+New SDK methods: `SandboxClient.create(..., grant=...)`, `list_grants()`,
+`update_grant(...)`, `revoke_grant(...)`, `list_children(parent, workspace=...)`.
+
+The gRPC functions a sandbox calls for its own children (`CreateChildSandbox`,
+`WaitChildSandbox`, `ExecChildSandbox`, `GetChildSandboxFile`, `StopChildSandbox`,
+`GetSandboxLimits`) exist too, but the door forwards only MCP so far, so code
+inside a sandbox uses MCP.
 
 ### Rust: implement the backend yourself
 

@@ -508,6 +508,34 @@ class SandboxWorkloadTemplateProvenanceRef:
 
 
 @dataclass(frozen=True)
+class SandboxGrant:
+    """A grant set with `create(..., grant=...)` (gateway MCP proof of concept)."""
+
+    grant_id: str
+    holder: str
+    max_depth: int
+    max_breadth: int
+    max_total: int
+    total: int
+    program: str
+    user: str
+
+
+@dataclass(frozen=True)
+class ChildSandboxRef:
+    """A sandbox created by another sandbox."""
+
+    handle: str
+    kind: str
+    lifetime: str
+    depth: int
+
+
+# Annotation that carries a grant on CreateSandbox.
+_GRANT_ANNOTATION = "openshell.io/mcp-grant"
+
+
+@dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
@@ -838,7 +866,13 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        grant: str | None = None,
     ) -> SandboxRef:
+        """Create a sandbox.
+
+        `grant` lets the sandbox's tree create child sandboxes, e.g.
+        ``"max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node"``.
+        """
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
@@ -846,6 +880,7 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
+                annotations={_GRANT_ANNOTATION: grant} if grant else {},
                 service_exposures=_service_exposure_messages(service_exposures),
             ),
             timeout=self._timeout,
@@ -1063,6 +1098,59 @@ class SandboxClient:
         return DeletionResult(
             DeletionOutcome(response.outcome), response.sandbox_id or None
         )
+
+    def list_children(self, parent: str, *, workspace: str) -> list[ChildSandboxRef]:
+        """Sandboxes that `parent` created through the gateway."""
+        response = self._stub.ListChildSandboxes(
+            openshell_pb2.ListChildSandboxesRequest(
+                parent=parent, workspace_scope=_workspace_scope(workspace)
+            ),
+            timeout=self._timeout,
+        )
+        return [
+            ChildSandboxRef(c.handle, c.kind, c.lifetime, c.depth)
+            for c in response.children
+        ]
+
+    def list_grants(self) -> list[SandboxGrant]:
+        """Grants set when sandboxes were created with `grant=`."""
+        response = self._stub.ListSandboxGrants(
+            openshell_pb2.ListSandboxGrantsRequest(), timeout=self._timeout
+        )
+        return [
+            SandboxGrant(
+                g.grant_id, g.holder, g.max_depth, g.max_breadth, g.max_total,
+                g.total, g.program, g.user,
+            )
+            for g in response.grants
+        ]
+
+    def update_grant(
+        self,
+        grant_id: str,
+        *,
+        max_depth: int | None = None,
+        max_breadth: int | None = None,
+        max_total: int | None = None,
+    ) -> SandboxGrant:
+        """Widen or shrink a grant. Only its user may; affects new creates only."""
+        request = openshell_pb2.UpdateSandboxGrantRequest(grant_id=grant_id)
+        if max_depth is not None:
+            request.max_depth = max_depth
+        if max_breadth is not None:
+            request.max_breadth = max_breadth
+        if max_total is not None:
+            request.max_total = max_total
+        self._stub.UpdateSandboxGrant(request, timeout=self._timeout)
+        return next(g for g in self.list_grants() if g.grant_id == grant_id)
+
+    def revoke_grant(self, grant_id: str) -> bool:
+        """Revoke a grant: its tree can create no more children."""
+        response = self._stub.RevokeSandboxGrant(
+            openshell_pb2.RevokeSandboxGrantRequest(grant_id=grant_id),
+            timeout=self._timeout,
+        )
+        return response.revoked
 
     def stop(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(

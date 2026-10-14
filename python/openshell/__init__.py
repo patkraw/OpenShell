@@ -8,6 +8,7 @@ from __future__ import annotations
 from .errors import ErrorInfo, FieldViolation, GatewayError, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
 from .sandbox import (
+    ChildSandboxRef,
     ClientCredentialsAuth,
     ExecChunk,
     ExecResult,
@@ -16,6 +17,7 @@ from .sandbox import (
     Sandbox,
     SandboxClient,
     SandboxError,
+    SandboxGrant,
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
@@ -36,6 +38,7 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "ChildSandboxRef",
     "ClientCredentialsAuth",
     "DeletionOutcome",
     "DeletionResult",
@@ -49,6 +52,7 @@ __all__ = [
     "Sandbox",
     "SandboxClient",
     "SandboxError",
+    "SandboxGrant",
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",

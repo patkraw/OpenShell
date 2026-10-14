@@ -1,0 +1,117 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `openshell grant ...` and `openshell sandbox children` (gateway MCP proof
+//! of concept). These call the gateway's gRPC child-sandbox API; the MCP
+//! endpoint calls the same rules.
+
+use crate::tls::{TlsOptions, grpc_client};
+use miette::{IntoDiagnostic, Result};
+use openshell_core::proto::{
+    ListChildSandboxesRequest, ListSandboxGrantsRequest, RevokeSandboxGrantRequest,
+    UpdateSandboxGrantRequest, workspace_selector,
+};
+
+pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let grants = client
+        .list_sandbox_grants(ListSandboxGrantsRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .grants;
+    if grants.is_empty() {
+        println!("No grants found.");
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<16} {:>5} {:>7} {:>9} {:<22} USER",
+        "GRANT", "HOLDER", "DEPTH", "BREADTH", "TOTAL", "PROGRAM"
+    );
+    for g in grants {
+        println!(
+            "{:<14} {:<16} {:>5} {:>7} {:>9} {:<22} {}",
+            g.grant_id,
+            g.holder,
+            g.max_depth,
+            g.max_breadth,
+            format!("{}/{}", g.total, g.max_total),
+            g.program,
+            g.user
+        );
+    }
+    Ok(())
+}
+
+pub async fn grant_update(
+    server: &str,
+    grant_id: &str,
+    max_depth: Option<u32>,
+    max_breadth: Option<u32>,
+    max_total: Option<u32>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if max_depth.is_none() && max_breadth.is_none() && max_total.is_none() {
+        return Err(miette::miette!(
+            "nothing to change: pass --max-depth, --max-breadth or --max-total"
+        ));
+    }
+    let mut client = grpc_client(server, tls).await?;
+    let g = client
+        .update_sandbox_grant(UpdateSandboxGrantRequest {
+            grant_id: grant_id.to_string(),
+            max_depth,
+            max_breadth,
+            max_total,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    println!(
+        "✓ Grant {} updated: max_depth={} max_breadth={} max_total={} (new creates only)",
+        g.grant_id, g.max_depth, g.max_breadth, g.max_total
+    );
+    Ok(())
+}
+
+pub async fn grant_revoke(server: &str, grant_id: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    client
+        .revoke_sandbox_grant(RevokeSandboxGrantRequest {
+            grant_id: grant_id.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    println!("✓ Grant {grant_id} revoked: its tree can create no more children");
+    Ok(())
+}
+
+pub async fn sandbox_children(
+    server: &str,
+    parent: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let children = client
+        .list_child_sandboxes(ListChildSandboxesRequest {
+            parent: parent.to_string(),
+            workspace_scope: Some(workspace_selector(workspace)),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .children;
+    if children.is_empty() {
+        println!("{parent} has no children.");
+        return Ok(());
+    }
+    println!("{:<20} {:<6} {:<14} DEPTH", "NAME", "KIND", "LIFETIME");
+    for c in children {
+        println!(
+            "{:<20} {:<6} {:<14} {}",
+            c.handle, c.kind, c.lifetime, c.depth
+        );
+    }
+    Ok(())
+}
