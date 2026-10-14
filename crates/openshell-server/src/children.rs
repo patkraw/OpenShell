@@ -776,8 +776,9 @@ async fn create_child(
     let parent_spec = parent.spec.clone().unwrap_or_default();
 
     // 4. The child's ceiling is its parent's current policy, so each level can
-    //    only narrow. Child policy = the ceiling's non-network parts + the
-    //    agent's network rules.
+    //    only narrow. The agent may narrow every section the prover checks:
+    //    filesystem, process and Landlock sections it omits are the parent's;
+    //    network rules it omits are none (least privilege by default).
     let ceiling = crate::grpc::policy::current_base_policy_for_sandbox(&state.store, &parent)
         .await
         .map_err(|s| terr("INTERNAL", s.message()))?;
@@ -800,6 +801,22 @@ async fn create_child(
         }
         let parsed = openshell_policy::parse_sandbox_policy(&p.to_string())
             .map_err(|e| terr("INVALID_POLICY", e.to_string()))?;
+        let has = |key: &str| p.get(key).is_some_and(|v| !v.is_null());
+        if has("filesystem_policy") {
+            candidate.filesystem = parsed.filesystem;
+        }
+        if has("process") {
+            candidate.process = parsed.process;
+        }
+        if has("landlock") {
+            candidate.landlock = parsed.landlock;
+        }
+        if has("network_middlewares") {
+            return Err(terr(
+                "INVALID_POLICY",
+                "network middlewares are not proved and cannot be set for a child",
+            ));
+        }
         candidate.network_policies = parsed.network_policies;
     }
     // 5. Prove against the parent's policy. An inherited policy is the
@@ -1738,6 +1755,39 @@ mod tests {
         let err = prove(&parent, &child).await.unwrap_err();
         assert_eq!(err.code, "EXCEEDS_CEILING");
         assert!(err.message.contains("http://policy.local/v1/proposals"));
+    }
+
+    const FS_PARENT: &str = "version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr, /lib]\n  read_write: [/sandbox, /tmp]\n";
+
+    #[tokio::test]
+    async fn child_may_narrow_filesystem() {
+        let parent = policy(FS_PARENT);
+        let child = policy(
+            "version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr, /lib, /sandbox]\n  read_write: [/tmp]\n",
+        );
+        prove(&parent, &child).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_cannot_widen_filesystem() {
+        let parent = policy(FS_PARENT);
+        // Write access to a path the parent only reads: a counterexample.
+        let child = policy(
+            "version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr]\n  read_write: [/sandbox, /tmp, /lib]\n",
+        );
+        let err = prove(&parent, &child).await.unwrap_err();
+        assert!(
+            matches!(err.code, "EXCEEDS_CEILING" | "UNSUPPORTED_RULES"),
+            "{}: {}",
+            err.code,
+            err.message
+        );
+        // A path the parent does not list: the prover cannot resolve it and
+        // refuses rather than guessing.
+        let child = policy(
+            "version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr, /lib]\n  read_write: [/sandbox, /tmp, /etc]\n",
+        );
+        assert!(prove(&parent, &child).await.is_err());
     }
 
     #[tokio::test]
