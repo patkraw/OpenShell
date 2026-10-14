@@ -2441,7 +2441,7 @@ async fn provider_policy_layers_for_sandbox(
     Ok(layers)
 }
 
-pub(super) async fn current_base_policy_for_sandbox(
+pub(crate) async fn current_base_policy_for_sandbox(
     store: &Store,
     sandbox: &Sandbox,
 ) -> Result<ProtoSandboxPolicy, Status> {

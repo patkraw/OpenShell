@@ -27,11 +27,11 @@ check "curl in the lead is refused by the door (wrong program)" \
 
 echo "== Creating children"
 W1='{"name":"w1","command":["sleep","600"],"request_id":"r1","policy":{"network_policies":{"example":{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
-out=$(mcp lead create_sandbox "$W1"); check "create w1 inside the ceiling" "$out" '"handle":"w1"'
+out=$(mcp lead create_sandbox "$W1"); check "create w1 inside the lead's policy" "$out" '"handle":"w1"'
 check "retry with same request_id returns the first result" "$(mcp lead create_sandbox "$W1")" '"repeated_request":true'
 check "retry counted once (total 2 of 3)" "$(mcp lead get_limits)" '"total":2'
 WIDE='{"name":"wide","command":["sleep","60"],"policy":{"network_policies":{"gh":{"name":"gh","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"POST","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
-check "child wider than the ceiling is refused" "$(mcp lead create_sandbox "$WIDE")" "EXCEEDS_CEILING"
+check "child wider than the lead's policy is refused" "$(mcp lead create_sandbox "$WIDE")" "EXCEEDS_CEILING"
 MCPR='{"name":"m","command":["sleep","60"],"policy":{"network_policies":{"gh":{"name":"gh","endpoints":[{"host":"api.githubcopilot.com","port":443,"path":"/mcp","protocol":"mcp","enforcement":"enforce","rules":[{"allow":{"method":"tools/call","tool":"get_issue"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
 check "child policy with MCP rules is refused" "$(mcp lead create_sandbox "$MCPR")" "UNSUPPORTED_RULES"
 DOOR='{"name":"d","command":["sleep","60"],"policy":{"network_policies":{"openshell_gateway_mcp":{"name":"openshell_gateway_mcp","endpoints":[{"host":"openshell.local","port":80}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
@@ -87,6 +87,20 @@ check "child_policy=inherit: a child policy is refused" "$(mcp hostlead create_s
 check "child_policy=inherit: a child without policy is created" "$(mcp hostlead create_sandbox '{"name":"hc1","command":["sleep","60"]}')" '"handle":"hc1"'
 check "that child reaches Ready (explicit default policy, no image policy)" "$(wait_ready hc1 && echo ready)" "ready"
 $OS sandbox delete hostlead >/dev/null 2>&1
+
+echo "== Each level can only narrow (child proved against its parent's policy)"
+$OS sandbox delete deeplead >/dev/null 2>&1; wait_gone deeplead
+$OS sandbox create --name deeplead --from pi-agent:local --policy lead.yaml \
+  --grant max_depth=2,max_breadth=2,max_total=4,expires=1h,program=/usr/local/bin/node \
+  --no-tty --detach -- sleep 3600 >/dev/null 2>&1
+wait_ready deeplead || echo "deeplead did not become ready"
+GH_ONLY='{"name":"mid","command":["sleep","3600"],"policy":{"network_policies":{"github_read":{"name":"github_read","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"GET","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
+check "deeplead creates mid with GitHub read only" "$(mcp deeplead create_sandbox "$GH_ONLY")" '"handle":"mid"'
+wait_ready mid || echo "mid did not become ready"
+EX='{"name":"leaf","command":["true"],"policy":{"network_policies":{"example":{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
+check "mid cannot give a grandchild example.com (deeplead has it, mid does not)" "$(mcp mid create_sandbox "$EX")" "EXCEEDS_CEILING"
+check "mid can give a grandchild what mid has" "$(mcp mid create_sandbox "${GH_ONLY/\"mid\"/\"leaf\"}")" '"handle":"leaf"'
+$OS sandbox delete deeplead >/dev/null 2>&1
 
 echo "== Cascade stop"
 $OS sandbox delete lead >/dev/null 2>&1; sleep 5

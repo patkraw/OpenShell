@@ -207,7 +207,7 @@ const TOOLS: &[ToolDef] = &[
         group: Group::Create,
         description: "Create a sandbox. From a sandbox: creates a child that runs your template \
             (image, CPU, memory); `policy` holds only its network_policies and must fit inside your \
-            tree's ceiling. From the host: creates a top-level sandbox as the user. Returns a handle.",
+            own policy. From the host: creates a top-level sandbox as the user. Returns a handle.",
         schema: || {
             json!({"type": "object", "additionalProperties": false, "properties": {
                 "command": {"type": "array", "items": {"type": "string"}, "description": "Command to run, e.g. [\"pi\",\"-p\",\"...\"]. Optional for kind=tool."},

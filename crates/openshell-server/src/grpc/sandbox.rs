@@ -586,7 +586,7 @@ async fn handle_create_sandbox_inner(
         validate_no_reserved_provider_policy_keys(policy)?;
         *policy = validate_and_canonicalize_policy(policy.clone())?;
     }
-    // Gateway MCP POC: a grant set at start records the ceiling and adds the door rule.
+    // Gateway MCP POC: a grant set at start adds the door rule.
     let mcp_grant =
         crate::children::prepare_granted_create(&principal, &request.annotations, &mut spec)?;
     if mcp_grant.is_some()
@@ -778,8 +778,8 @@ async fn handle_create_sandbox_inner(
         service_urls.insert(exposure.service.clone(), endpoint.into_inner().url);
     }
 
-    if let Some((grant, ceiling)) = mcp_grant {
-        crate::children::register_granted_sandbox(state, &principal, &sandbox, grant, ceiling);
+    if let Some(grant) = mcp_grant {
+        crate::children::register_granted_sandbox(state, &principal, &sandbox, grant);
     }
     info!(
         sandbox_id = %id,

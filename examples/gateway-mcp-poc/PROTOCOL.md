@@ -83,7 +83,7 @@ On failure `isError` is `true` and `structuredContent` is
 |---|---|
 | `NOT_ALLOWED` | no grant, grant revoked or expired, tool not available to this caller, or a sandbox trying to change grants |
 | `LIMIT_REACHED` | depth, breadth or total used up |
-| `EXCEEDS_CEILING` | the child policy is wider than the tree's ceiling; includes the prover's counterexample |
+| `EXCEEDS_CEILING` | the child policy is wider than the parent's policy (the ceiling); includes the prover's counterexample |
 | `UNSUPPORTED_RULES` | the child policy has rules the prover cannot check (e.g. `protocol: mcp`) |
 | `GLOBAL_POLICY_ACTIVE` | a gateway-global policy would replace the child's policy |
 | `INVALID_ARGUMENT`, `INVALID_POLICY` | bad arguments or policy |
@@ -156,7 +156,7 @@ HTTP 200 application/json
   "result": {
     "tools": [
       {
-        "description": "Create a sandbox. From a sandbox: creates a child that runs your template (image, CPU, memory); `policy` holds only its network_policies and must fit inside your tree's ceiling. From the host: creates a top-level sandbox as the user. Returns a handle.",
+        "description": "Create a sandbox. From a sandbox: creates a child that runs your template (image, CPU, memory); `policy` holds only its network_policies and must fit inside your own policy. From the host: creates a top-level sandbox as the user. Returns a handle.",
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
