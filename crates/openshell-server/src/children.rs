@@ -625,6 +625,21 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The part of a parent's policy the prover can model. Endpoints with a
+/// protocol it does not model (MCP, GraphQL, SQL, ...) are dropped, and rules
+/// left without endpoints are removed. Dropping allow rules only shrinks the
+/// boundary, so a child that fits the result also fits the full policy; without
+/// this, one MCP rule in the parent would make every proof `Unsupported`.
+fn modelable_boundary(policy: &SandboxPolicy) -> SandboxPolicy {
+    let mut boundary = policy.clone();
+    boundary.network_policies.retain(|_, rule| {
+        rule.endpoints
+            .retain(|e| matches!(e.protocol.as_str(), "" | "tcp" | "rest"));
+        !rule.endpoints.is_empty()
+    });
+    boundary
+}
+
 /// Prove `candidate` fits inside `ceiling`. Only `Within` passes.
 async fn prove(ceiling: &SandboxPolicy, candidate: &SandboxPolicy) -> Result<(), ToolError> {
     let ser = |p: &SandboxPolicy| {
@@ -634,7 +649,7 @@ async fn prove(ceiling: &SandboxPolicy, candidate: &SandboxPolicy) -> Result<(),
                 containment::parse_policy_str(&y).map_err(|e| terr("INVALID_POLICY", e.to_string()))
             })
     };
-    let boundary = ser(ceiling)?;
+    let boundary = ser(&modelable_boundary(ceiling))?;
     let child = ser(candidate)?;
     let result = tokio::task::spawn_blocking(move || {
         containment::check_within_boundary(&boundary, &child, CheckOptions::new(PROVER_TIMEOUT))
@@ -722,8 +737,12 @@ async fn create_child(
             .map_err(|e| terr("INVALID_POLICY", e.to_string()))?;
         candidate.network_policies = parsed.network_policies;
     }
-    // 5. Prove against the parent's policy.
-    prove(&ceiling, &candidate).await?;
+    // 5. Prove against the parent's policy. An inherited policy is the
+    //    parent's own, so it fits by construction, including rules the prover
+    //    cannot model.
+    if !grant.inherit_child_policy {
+        prove(&ceiling, &candidate).await?;
+    }
 
     // 6. Providers must be a subset of the parent's.
     let providers: Vec<String> = match args.get("providers").and_then(Value::as_array) {
@@ -1575,6 +1594,34 @@ mod tests {
         assert!(parse_grant_spec("max_depth=1").is_err());
         assert!(parse_grant_spec("program=node").is_err());
         assert!(parse_grant_spec("bogus=1,program=/x").is_err());
+    }
+
+    fn policy(yaml: &str) -> SandboxPolicy {
+        openshell_policy::parse_sandbox_policy(yaml).unwrap()
+    }
+
+    const MCP_AND_EXAMPLE: &str = "version: 1\nnetwork_policies:\n  gh:\n    name: gh\n    endpoints:\n      - host: api.githubcopilot.com\n        port: 443\n        path: /mcp\n        protocol: mcp\n        enforcement: enforce\n        rules:\n          - allow: { method: tools/call, tool: get_issue }\n    binaries: [{ path: /usr/local/bin/node }]\n  ex:\n    name: ex\n    endpoints:\n      - host: example.com\n        port: 443\n    binaries: [{ path: /usr/local/bin/node }]\n";
+
+    #[tokio::test]
+    async fn parent_with_mcp_rules_can_still_create_children() {
+        let parent = policy(MCP_AND_EXAMPLE);
+        let mut child = parent.clone();
+        child.network_policies.remove("gh");
+        prove(&parent, &child).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_cannot_receive_mcp_rules() {
+        let parent = policy(MCP_AND_EXAMPLE);
+        let err = prove(&parent, &parent).await.unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_RULES");
+    }
+
+    #[test]
+    fn modelable_boundary_drops_only_unmodeled_endpoints() {
+        let b = modelable_boundary(&policy(MCP_AND_EXAMPLE));
+        assert!(!b.network_policies.contains_key("gh"));
+        assert!(b.network_policies.contains_key("ex"));
     }
 
     #[test]
