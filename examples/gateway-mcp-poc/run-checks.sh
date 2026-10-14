@@ -110,6 +110,26 @@ wait_ready leaf || echo "leaf did not become ready"
 check "leaf (max depth) cannot create an agent" "$(mcp leaf create_sandbox '{"name":"x","command":["true"]}')" "LIMIT_REACHED"
 check "leaf (max depth) can still create a tool sandbox" "$(mcp leaf create_sandbox '{"name":"leaftool","kind":"tool"}')" '"kind":"tool"'
 
+echo "== Later policy writes to a child stay within its parent"
+$OS settings set mid --key agent_policy_proposals_enabled --value true >/dev/null 2>&1; sleep 15
+propose() { # sandbox, rule-json -> chunk id
+  $OS sandbox exec "$1" -- curl -s -m 20 -X POST http://policy.local/v1/proposals -H 'content-type: application/json' \
+    -d "{\"intent_summary\":\"test\",\"operations\":[{\"addRule\":{\"ruleName\":\"$(echo "$2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')\",\"rule\":$2}}]}" 2>&1 \
+    | tail -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["accepted_chunk_ids"][0])' 2>/dev/null; }
+EX_RULE='{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}'
+cid=$(propose mid "$EX_RULE")
+check "mid proposes example.com (its parent has it)" "$([ -n "$cid" ] && echo accepted)" "accepted"
+check "approving it succeeds" "$($OS rule approve mid --chunk-id "$cid" 2>&1)" "pprove"
+check "mid's policy reloads with the rule" "$($OS sandbox exec mid -- curl -s -m 100 "http://policy.local/v1/proposals/$cid/wait?timeout=90" 2>&1 | tail -1)" '"policy_reloaded":true'
+POST_RULE='{"name":"gh_post","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"POST","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}'
+cid=$(propose mid "$POST_RULE")
+check "mid proposes GitHub POST (its parent lacks it)" "$([ -n "$cid" ] && echo accepted)" "accepted"
+check "approving it is refused: exceeds the parent" "$($OS rule approve mid --chunk-id "$cid" 2>&1)" "EXCEEDS_CEILING"
+WIDE_FILE=$(mktemp -t wide-policy).yaml
+{ cat lead.yaml; printf '  gh_post:\n    name: gh_post\n    endpoints:\n      - host: api.github.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: {method: POST, path: "/repos/**"}\n    binaries:\n      - path: /usr/local/bin/node\n'; } > "$WIDE_FILE"
+check "user policy set on mid wider than its parent is refused" "$($OS policy set mid --policy "$WIDE_FILE" 2>&1)" "EXCEEDS_CEILING"
+rm -f "$WIDE_FILE"
+
 echo "== Asking for more: refused, propose for yourself, user approves, retry"
 # Agent proposals are off by default; the user turns them on for this sandbox.
 $OS settings set deeplead --key agent_policy_proposals_enabled --value true >/dev/null 2>&1; sleep 15

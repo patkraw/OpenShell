@@ -86,10 +86,12 @@ see the script header).
 | `max_total` | Sandboxes in the tree, including this one. |
 | `expires` | e.g. `4h`. |
 | `program` | Executable allowed to call the gateway MCP from this tree, e.g. `/usr/local/bin/node` for Pi; the gateway refuses other programs with `PROGRAM_NOT_ALLOWED`. |
-| `child_policy` | `narrow` (default): agents write their children's network rules within their own policy. `inherit`: every child gets this sandbox's policy unchanged. |
+| `child_policy` | `narrow` (default): agents write their children's policies (network, filesystem, process, Landlock) within their own policy. `inherit`: every child gets this sandbox's policy unchanged. |
 
 The sandbox's policy (`--policy`) is the ceiling for its children, and each child's policy is the ceiling for its own children, so each level can only narrow. Without one, the
 restrictive default policy is used; a tree never relies on an image's own policy.
+
+Later changes to a child's policy are held to the same rule: a user `policy set`, a supervisor sync, or an approved (or auto-approved) proposal that would take a child beyond its parent's current policy is refused with `EXCEEDS_CEILING`.
 
 ## Known limits of the proof of concept
 
@@ -98,3 +100,5 @@ restrictive default policy is used; a tree never relies on an image's own policy
 - The global policy works as today (`replace`); a child create with a policy is refused while one is active. `maximum` mode from the RFC is not built.
 - The door handles only plain HTTP to the gateway (the dev gateway has TLS off).
 - The door forwards only MCP, not gRPC: code inside a sandbox uses MCP; the gRPC child functions are used from the host.
+- Children already running are not re-checked when their parent's policy shrinks (upstream issue #3808).
+- No per-sandbox rate limit on the gateway MCP yet.
