@@ -3,11 +3,11 @@
 
 //! Gateway MCP door (proof of concept).
 //!
-//! The workload reaches `http://openshell.local/mcp`. The supervisor checks the
-//! calling program against the sandbox's network policy (the "door rule" the
-//! gateway writes from a grant), then forwards the JSON-RPC body to the
-//! gateway's `/mcp` endpoint with this sandbox's own gateway token. The agent
-//! never holds a credential.
+//! The workload reaches `http://openshell.local/mcp` in every sandbox. The
+//! supervisor identifies the calling program and forwards the JSON-RPC body to
+//! the gateway's `/mcp` endpoint with this sandbox's own gateway token and the
+//! program's path. The gateway decides every call (grant, depth, program). The
+//! agent never holds a credential.
 
 use crate::policy_local::PolicyLocalContext;
 use miette::{IntoDiagnostic, Result};
@@ -61,11 +61,14 @@ async fn respond<S: AsyncWrite + Unpin>(
     client.flush().await.into_diagnostic()
 }
 
-/// Serve one door request. `program_allowed` is the result of checking the
-/// calling binary against the network policy for `openshell.local:80`.
+/// Header carrying the calling program to the gateway.
+pub const CALLER_PROGRAM_HEADER: &str = "x-openshell-caller-program";
+
+/// Serve one door request. `caller_program` is the calling binary's
+/// kernel-resolved path, or why it could not be identified.
 pub async fn handle<S>(
     ctx: &PolicyLocalContext,
-    program_allowed: std::result::Result<(), String>,
+    caller_program: std::result::Result<String, String>,
     method: &str,
     target: &str,
     initial_request: &[u8],
@@ -74,18 +77,21 @@ pub async fn handle<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(reason) = program_allowed {
-        warn!(%reason, "gateway MCP door: denied (no door rule for this program)");
-        let body = serde_json::json!({"error": "door_denied", "detail": reason}).to_string();
-        return respond(
-            client,
-            403,
-            "Forbidden",
-            "application/json",
-            body.as_bytes(),
-        )
-        .await;
-    }
+    let program = match caller_program {
+        Ok(p) => p,
+        Err(reason) => {
+            warn!(%reason, "gateway MCP door: denied (calling program unknown)");
+            let body = serde_json::json!({"error": "door_denied", "detail": reason}).to_string();
+            return respond(
+                client,
+                403,
+                "Forbidden",
+                "application/json",
+                body.as_bytes(),
+            )
+            .await;
+        }
+    };
     let path = target.split('?').next().unwrap_or(target);
     if path != DOOR_PATH {
         return respond(
@@ -132,6 +138,7 @@ where
     let mut req = reqwest::Client::new()
         .post(&url)
         .header("authorization", bearer)
+        .header(CALLER_PROGRAM_HEADER, program)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .body(body);

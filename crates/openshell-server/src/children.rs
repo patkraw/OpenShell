@@ -44,11 +44,10 @@ use tracing::{info, warn};
 
 /// Annotation carrying the grant on a user's `CreateSandbox` request.
 pub const GRANT_ANNOTATION: &str = "openshell.io/mcp-grant";
-/// Network policy key of the door rule the gateway writes from a grant.
-pub const DOOR_RULE_KEY: &str = "openshell_gateway_mcp";
-/// Host and port of the supervisor door.
-pub const DOOR_HOST: &str = "openshell.local";
-pub const DOOR_PORT: u32 = 80;
+/// Header in which the supervisor door names the calling program (the
+/// kernel-resolved executable path). The door overwrites any value the
+/// workload sends.
+pub const CALLER_PROGRAM_HEADER: &str = "x-openshell-caller-program";
 
 pub const KIND_AGENT: &str = "agent";
 pub const KIND_TOOL: &str = "tool";
@@ -57,9 +56,10 @@ const DEFAULT_TOOL_IDLE: Duration = Duration::from_secs(600);
 const REAPER_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Whether a new child gets the door rule: only agents, and only with depth left.
-/// Tool sandboxes run commands for their parent and never create children.
-pub fn gets_door_rule(kind: &str, depth: u32, max_depth: u32) -> bool {
+/// Whether a new child may create children of its own under the grant as it
+/// is now. Tool sandboxes run commands for their parent and never create
+/// children. The door is open in every sandbox; the gateway decides per call.
+pub fn may_create_children(kind: &str, depth: u32, max_depth: u32) -> bool {
     kind == KIND_AGENT && depth < max_depth
 }
 
@@ -256,23 +256,44 @@ fn parse_duration(v: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
-/// The network rule that lets `program` reach the supervisor door.
-pub fn door_rule(program: &str) -> Result<openshell_core::proto::NetworkPolicyRule, String> {
-    let yaml = format!(
-        "version: 1\nnetwork_policies:\n  {DOOR_RULE_KEY}:\n    name: {DOOR_RULE_KEY}\n    endpoints:\n      - host: {DOOR_HOST}\n        port: {DOOR_PORT}\n    binaries:\n      - path: {program}\n"
-    );
-    let mut p = openshell_policy::parse_sandbox_policy(&yaml).map_err(|e| e.to_string())?;
-    p.network_policies
-        .remove(DOOR_RULE_KEY)
-        .ok_or_else(|| "door rule missing".to_string())
+/// The door forwards every sandbox's MCP calls. A sandbox whose tree has a
+/// grant may only call through the grant's program.
+fn check_caller_program(
+    state: &ServerState,
+    sandbox_id: &str,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let Some(grant) = state
+        .children
+        .lineage(sandbox_id)
+        .and_then(|l| state.children.grant(&l.grant_id))
+    else {
+        return Ok(());
+    };
+    let program = headers
+        .get(CALLER_PROGRAM_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if program == grant.program {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "PROGRAM_NOT_ALLOWED",
+            format!(
+                "calls from '{program}' are not allowed; this tree's grant allows '{}'",
+                grant.program
+            ),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Hooks called from CreateSandbox / DeleteSandbox
 // ---------------------------------------------------------------------------
 
-/// Before a user's create: if it carries a grant, add the door rule. Returns
-/// the parsed grant spec to register after the sandbox exists.
+/// Before a user's create: if it carries a grant, check who sets it and make
+/// the policy explicit. Returns the parsed grant spec to register after the
+/// sandbox exists.
 pub fn prepare_granted_create(
     principal: &Principal,
     annotations: &HashMap<String, String>,
@@ -289,15 +310,8 @@ pub fn prepare_granted_create(
     let grant = parse_grant_spec(raw).map_err(tonic::Status::invalid_argument)?;
     // A tree always has an explicit policy: without one, the restrictive
     // default (what a supervisor would fall back to) bounds its children.
-    let policy = spec
-        .policy
+    spec.policy
         .get_or_insert_with(openshell_policy::restrictive_default_policy);
-    if grant.max_depth > 0 {
-        let rule = door_rule(&grant.program).map_err(tonic::Status::internal)?;
-        policy
-            .network_policies
-            .insert(DOOR_RULE_KEY.to_string(), rule);
-    }
     Ok(Some(grant))
 }
 
@@ -479,16 +493,22 @@ impl SandboxApi for GatewaySandboxApi {
     type Caller = Principal;
 
     async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, ApiError> {
-        authenticate(&self.state, headers)
+        let principal = authenticate(&self.state, headers)
             .await
-            .map_err(|m| ApiError::new("UNAUTHENTICATED", m))
+            .map_err(|m| ApiError::new("UNAUTHENTICATED", m))?;
+        if let Principal::Sandbox(s) = &principal {
+            check_caller_program(&self.state, &s.sandbox_id, headers)?;
+        }
+        Ok(principal)
     }
 
-    /// The gateway hides `create_sandbox` from sandboxes that cannot use it.
+    /// Sandboxes always see the child tools: a grant can be widened at any
+    /// time, so a call is refused (`LIMIT_REACHED`, `NOT_ALLOWED`) rather than
+    /// the tool hidden. `get_limits` says what is allowed right now.
     async fn access(&self, caller: &Principal) -> Access {
         match caller {
-            Principal::Sandbox(s) => Access {
-                create_sandbox: can_create(&self.state, &s.sandbox_id).is_ok(),
+            Principal::Sandbox(_) => Access {
+                create_sandbox: true,
                 manage_children: true,
                 grants: false,
             },
@@ -675,13 +695,12 @@ async fn create_child(
         .ok_or_else(|| terr("NOT_FOUND", "caller sandbox not found"))?;
     let parent_spec = parent.spec.clone().unwrap_or_default();
 
-    // 4. The child's ceiling is its parent's current policy, without the door
-    //    rule, so each level can only narrow. Child policy = the ceiling's
-    //    non-network parts + the agent's network rules.
-    let mut ceiling = crate::grpc::policy::current_base_policy_for_sandbox(&state.store, &parent)
+    // 4. The child's ceiling is its parent's current policy, so each level can
+    //    only narrow. Child policy = the ceiling's non-network parts + the
+    //    agent's network rules.
+    let ceiling = crate::grpc::policy::current_base_policy_for_sandbox(&state.store, &parent)
         .await
         .map_err(|s| terr("INTERNAL", s.message()))?;
-    ceiling.network_policies.remove(DOOR_RULE_KEY);
     let mut candidate = ceiling.clone();
     candidate.network_policies.clear();
     let wants_policy = args.get("policy").is_some_and(|p| !p.is_null());
@@ -702,12 +721,6 @@ async fn create_child(
         let parsed = openshell_policy::parse_sandbox_policy(&p.to_string())
             .map_err(|e| terr("INVALID_POLICY", e.to_string()))?;
         candidate.network_policies = parsed.network_policies;
-    }
-    if candidate.network_policies.contains_key(DOOR_RULE_KEY) {
-        return Err(terr(
-            "INVALID_POLICY",
-            "the door rule is written by the gateway",
-        ));
     }
     // 5. Prove against the parent's policy.
     prove(&ceiling, &candidate).await?;
@@ -757,14 +770,7 @@ async fn create_child(
         }
     };
 
-    // 8. Door rule only for agents that may create children themselves.
-    let mut policy = candidate;
-    if gets_door_rule(&kind, depth, grant.max_depth) {
-        let rule = door_rule(&grant.program).map_err(|e| terr("INTERNAL", e))?;
-        policy
-            .network_policies
-            .insert(DOOR_RULE_KEY.to_string(), rule);
-    }
+    let policy = candidate;
 
     // 9. Same image, CPU and memory as the parent; no GPU.
     let mut template = parent_spec.template.clone().unwrap_or_default();
@@ -868,7 +874,7 @@ async fn create_child(
     Ok(json!({
         "handle": created.object_name(),
         "depth": depth,
-        "can_create_children": gets_door_rule(&kind, depth, grant.max_depth),
+        "can_create_children": may_create_children(&kind, depth, grant.max_depth),
         "kind": kind, "lifetime": lifetime,
         "idle_timeout_s": idle_timeout_ms.map(|ms| ms / 1000)
     }))
@@ -1572,19 +1578,11 @@ mod tests {
     }
 
     #[test]
-    fn door_rule_names_host_port_and_program() {
-        let r = door_rule("/usr/local/bin/node").unwrap();
-        assert_eq!(r.endpoints[0].host, DOOR_HOST);
-        assert_eq!(r.endpoints[0].port, DOOR_PORT);
-        assert_eq!(r.binaries[0].path, "/usr/local/bin/node");
-    }
-
-    #[test]
-    fn tool_sandboxes_never_get_the_door_rule() {
-        assert!(gets_door_rule(KIND_AGENT, 1, 2));
-        assert!(!gets_door_rule(KIND_AGENT, 2, 2));
-        assert!(!gets_door_rule(KIND_TOOL, 1, 2));
-        assert!(!gets_door_rule(KIND_TOOL, 1, 9));
+    fn tool_sandboxes_never_create_children() {
+        assert!(may_create_children(KIND_AGENT, 1, 2));
+        assert!(!may_create_children(KIND_AGENT, 2, 2));
+        assert!(!may_create_children(KIND_TOOL, 1, 2));
+        assert!(!may_create_children(KIND_TOOL, 1, 9));
     }
 
     #[test]

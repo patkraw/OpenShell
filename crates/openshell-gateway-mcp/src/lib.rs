@@ -372,7 +372,12 @@ async fn handle<A: SandboxApi>(
 ) -> Response {
     let caller = match api.authenticate(&headers).await {
         Ok(c) => c,
-        Err(e) => return (StatusCode::UNAUTHORIZED, e.message).into_response(),
+        Err(e) if e.code == "UNAUTHENTICATED" => {
+            return (StatusCode::UNAUTHORIZED, e.message).into_response();
+        }
+        Err(e) => {
+            return (StatusCode::FORBIDDEN, format!("{}: {}", e.code, e.message)).into_response();
+        }
     };
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return rpc_error(Value::Null, -32700, "parse error");

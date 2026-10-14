@@ -43,26 +43,19 @@ target/debug/openshell -g docker-dev sandbox create --name lead --from pi-agent:
 | `max_breadth` | `2` | at most two children per parent |
 | `max_total` | `3` | at most three sandboxes in the tree, including the lead |
 | `expires` | `1h` | the grant ends after an hour |
-| `program` | `/usr/local/bin/node` | only Node may use the door (Pi runs on Node) |
+| `program` | `/usr/local/bin/node` | only Node may call the gateway MCP (Pi runs on Node) |
 | `child_policy` | (default `narrow`) | agents write their children's network rules; `inherit` gives every child the lead's policy |
 
 `lead.yaml` becomes the **ceiling** for the lead's children: no child may get
 more. Each child's policy is in turn the ceiling for its own children, so each
-level can only narrow. The gateway also adds the **door rule** to the lead's
-policy. See it:
-
-```shell
-target/debug/openshell -g docker-dev sandbox get lead --policy-only
-```
-
-Look for `openshell_gateway_mcp`: a network rule for `openshell.local:80`, for
-`/usr/local/bin/node` only.
+level can only narrow. Nothing is added to the policy: the door to the gateway
+MCP is open in every sandbox, and the gateway decides every call from the grant.
 
 ## 2. From inside the sandbox: MCP through the door
 
 Inside a sandbox, the gateway MCP is at `http://openshell.local/mcp`. Nothing to
-configure and no credential: the supervisor checks the calling program and adds
-the sandbox's token.
+configure and no credential: the supervisor adds the sandbox's token and the
+calling program's path, and the gateway checks both.
 
 ```shell
 target/debug/openshell -g docker-dev sandbox exec lead -- \
@@ -74,19 +67,20 @@ target/debug/openshell -g docker-dev sandbox exec lead -- \
 ```
 
 The child `w1` runs the lead's template (same image, CPU and memory, no GPU). Its
-depth is 1, the maximum, so it gets **no door rule**: it cannot reach the gateway
-MCP at all.
+depth is 1, the maximum. It reaches the gateway MCP and sees the same tools, but
+the gateway refuses its `create_sandbox` with `LIMIT_REACHED` until the user
+raises `max_depth`. Then the same call succeeds, with no policy change.
 
 Things that are refused, and why:
 
 ```shell
-# curl is not the grant's program: 403 door_denied
+# curl is not the grant's program: 403 PROGRAM_NOT_ALLOWED
 target/debug/openshell -g docker-dev sandbox exec lead -- \
   curl -s -X POST http://openshell.local/mcp -d '{}'
 
-# w1 has no door rule: 403 door_denied
+# w1 has no depth left: LIMIT_REACHED
 target/debug/openshell -g docker-dev sandbox exec w1 -- \
-  node /usr/local/lib/gateway-mcp/mcp-client.mjs tools/list
+  node /usr/local/lib/gateway-mcp/mcp-client.mjs create_sandbox '{"name":"g1","command":["true"]}'
 
 # a child wider than lead.yaml: EXCEEDS_CEILING with the prover's counterexample
 target/debug/openshell -g docker-dev sandbox exec lead -- \

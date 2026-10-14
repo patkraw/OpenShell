@@ -20,7 +20,7 @@ made behind the `SandboxApi` trait in `crates/openshell-server/src/children.rs`.
 
 | Caller | URL | Identity |
 |---|---|---|
-| Agent or code inside a sandbox | `http://openshell.local/mcp` | The sandbox. The supervisor serves `openshell.local`, checks the calling program against the door rule (`403 door_denied` otherwise) and adds the sandbox's token. The caller sends no credential. |
+| Agent or code inside a sandbox | `http://openshell.local/mcp` | The sandbox. The supervisor serves `openshell.local` in every sandbox and adds the sandbox's token and the calling program (`x-openshell-caller-program`); the gateway refuses programs other than the grant's with `403 PROGRAM_NOT_ALLOWED`. The caller sends no credential. |
 | Agent or code on the host | the gateway URL plus `/mcp`, e.g. `http://127.0.0.1:18080/mcp` | The user, from the gateway login (OIDC bearer or mTLS; the dev gateway accepts a local user) |
 
 An unauthenticated request gets `401`.
@@ -37,16 +37,17 @@ An unauthenticated request gets `401`.
 
 ## Tools per caller
 
-The list is computed on every `tools/list` from the caller's grant:
+The list depends only on the kind of caller, never on the grant, so a cached
+list never goes out of date:
 
 | Caller | Tools |
 |---|---|
 | User (host) | `create_sandbox`, `grant_list`, `grant_update` |
-| Sandbox with a grant and budget left | `create_sandbox`, `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits` |
-| Sandbox without a grant, at its maximum depth, or out of budget | the same without `create_sandbox` |
+| Sandbox | `create_sandbox`, `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits` |
 
-A call to a tool that is not in the caller's list is refused with `NOT_ALLOWED`
-before it reaches the backend, and the backend refuses it again.
+Whether a call is allowed is decided when it is made: a sandbox without a grant,
+at its maximum depth or out of budget gets `NOT_ALLOWED` or `LIMIT_REACHED`.
+`get_limits` says what the caller may do right now.
 
 | Tool | Arguments | Returns |
 |---|---|---|
@@ -352,10 +353,12 @@ HTTP 200 application/json
 HTTP 405
 ```
 
-### Inside sdk-lead, through the door: curl is refused
+### Inside sdk-lead, through the door: curl is refused by the gateway
+
+The door is open, but the grant names `/usr/local/bin/node`:
 
 ```http
-{"error":"door_denied","detail":"binary '/usr/bin/curl' not allowed in policy 'openshell_gateway_mcp' (ancestors: [], cmdline: []). SYMLINK HINT: the binary path is the kernel-resolved target from /proc/<pid>/exe, not the symlink. If your policy specifies a symlink (e.g., /usr/bin/python3) but the actual binary is /usr/bin/python3.11, either: (1) use the canonical path in your policy (run 'readlink -f /usr/bin/python3' inside the sandbox), or (2) ensure symlink resolution is working (check sandbox logs for 'Cannot access container filesystem')"}
+PROGRAM_NOT_ALLOWED: calls from '/usr/bin/curl' are not allowed; this tree's grant allows '/usr/local/bin/node'
 HTTP 403
 ```
 
