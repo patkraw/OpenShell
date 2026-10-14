@@ -733,6 +733,13 @@ impl OpenShell for OpenShellService {
         crate::children::grpc_surface::list_grants(&self.state, request).await
     }
 
+    async fn create_sandbox_grant(
+        &self,
+        request: Request<openshell_core::proto::CreateSandboxGrantRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateSandboxGrantResponse>, Status> {
+        crate::children::grpc_surface::create_grant(&self.state, request).await
+    }
+
     async fn update_sandbox_grant(
         &self,
         request: Request<openshell_core::proto::UpdateSandboxGrantRequest>,

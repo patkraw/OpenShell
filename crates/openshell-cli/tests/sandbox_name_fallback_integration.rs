@@ -119,6 +119,14 @@ impl OpenShell for TestOpenShell {
         Err(tonic::Status::unimplemented("not used in this test"))
     }
 
+    async fn create_sandbox_grant(
+        &self,
+        _: tonic::Request<openshell_core::proto::CreateSandboxGrantRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::CreateSandboxGrantResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
     async fn revoke_sandbox_grant(
         &self,
         _: tonic::Request<openshell_core::proto::RevokeSandboxGrantRequest>,

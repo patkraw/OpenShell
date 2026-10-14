@@ -878,6 +878,15 @@ service OpenShell {
     };
   }
 
+  // Attach a grant to a running top-level sandbox that has none.
+  rpc CreateSandboxGrant(CreateSandboxGrantRequest) returns (CreateSandboxGrantResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Widen or shrink a grant. Only the user who set it; new creates only.
   rpc UpdateSandboxGrant(UpdateSandboxGrantRequest) returns (UpdateSandboxGrantResponse) {
     option (openshell.options.v1.authorization) = {
@@ -4053,6 +4062,25 @@ message ListSandboxGrantsRequest {}
 
 message ListSandboxGrantsResponse {
   repeated SandboxGrant grants = 1;
+}
+
+message CreateSandboxGrantRequest {
+  // Name of the running top-level sandbox that becomes the holder.
+  string sandbox = 1;
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  uint32 max_depth = 3;
+  uint32 max_breadth = 4;
+  uint32 max_total = 5;
+  // Grant lifetime, e.g. "4h". Empty: the default (4h).
+  string expires = 6;
+  // Absolute path of the program allowed to call the gateway MCP.
+  string program = 7;
+  // "narrow" (default) or "inherit".
+  string child_policy = 8;
+}
+
+message CreateSandboxGrantResponse {
+  SandboxGrant grant = 1;
 }
 
 message UpdateSandboxGrantRequest {

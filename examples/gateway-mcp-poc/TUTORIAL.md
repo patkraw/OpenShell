@@ -128,12 +128,17 @@ only the user can change a grant, and changes apply to new creates only):
 
 ```shell
 target/debug/openshell -g docker-dev grant list
+target/debug/openshell -g docker-dev grant create <sandbox> --program /usr/local/bin/node --max-depth 1
 target/debug/openshell -g docker-dev grant update <grant-id> --max-breadth 3 --max-total 4
 target/debug/openshell -g docker-dev grant revoke <grant-id>
 target/debug/openshell -g docker-dev sandbox children lead
 ```
 
 The same through MCP: `user-mcp.py grant_update grant_id=<id> max_breadth=3 max_total=4`.
+
+`grant create` gives a running top-level sandbox that has no grant one, so it
+can create children from then on; its current policy bounds them. A sandbox that
+already holds a grant, or is itself a child, is refused.
 
 To use it from an agent on your machine, add the URL to that agent's MCP
 configuration, for example for Pi (`~/.pi/agent/mcp.json`):
@@ -159,7 +164,7 @@ uv run --with "mcp==2.3.0" python examples/gateway-mcp-poc/sdk/host_create.py
 ```
 
 ```text
-tools: ['create_sandbox', 'grant_list', 'grant_update']
+tools: ['create_sandbox', 'grant_list', 'grant_create', 'grant_update']
 create_sandbox: ok {"handle": "sdk-lead", "has_grant": true}
 grant_list: {"grants": [{"grant_id": "gr-...", "holder": "sdk-lead", "max_breadth": 2, "max_depth": 1, "max_total": 3, ...}]}
 ```

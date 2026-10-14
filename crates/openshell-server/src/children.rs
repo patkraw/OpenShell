@@ -320,9 +320,9 @@ pub fn register_granted_sandbox(
     principal: &Principal,
     sandbox: &Sandbox,
     grant: GrantSpec,
-) {
+) -> Option<String> {
     let Principal::User(user) = principal else {
-        return;
+        return None;
     };
     let grant_id = format!("gr-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let expires_ms = i64::try_from(grant.expires.as_millis()).unwrap_or(i64::MAX);
@@ -360,6 +360,53 @@ pub fn register_granted_sandbox(
         },
     );
     info!(grant_id = %grant_id, holder = %sandbox.object_name(), "mcp: grant registered");
+    Some(grant_id)
+}
+
+/// A user attaches a grant to a running top-level sandbox that has none. The
+/// sandbox becomes the holder; its current policy bounds its children.
+async fn grant_create(
+    state: &Arc<ServerState>,
+    user: &UserPrincipal,
+    workspace: &str,
+    sandbox_name: &str,
+    spec: &str,
+) -> Result<Value, ToolError> {
+    let sandbox = state
+        .store
+        .get_message_by_name::<Sandbox>(workspace, sandbox_name)
+        .await
+        .map_err(|e| terr("INTERNAL", e.to_string()))?
+        .ok_or_else(|| terr("NOT_FOUND", format!("sandbox '{sandbox_name}' not found")))?;
+    if let Some(l) = state.children.lineage(sandbox.object_id()) {
+        return Err(if l.parent_id.is_some() {
+            terr(
+                "NOT_ALLOWED",
+                format!(
+                    "'{sandbox_name}' is a child in a tree; its tree's grant already covers it"
+                ),
+            )
+        } else {
+            terr(
+                "ALREADY_EXISTS",
+                format!("'{sandbox_name}' already holds grant {}", l.grant_id),
+            )
+        });
+    }
+    let grant = parse_grant_spec(spec).map_err(|e| terr("INVALID_ARGUMENT", e))?;
+    let principal = Principal::User(user.clone());
+    let grant_id = register_granted_sandbox(state, &principal, &sandbox, grant)
+        .ok_or_else(|| terr("INTERNAL", "grant not registered"))?;
+    info!(grant_id = %grant_id, holder = %sandbox_name, user = %user.identity.subject, "mcp: grant attached to a running sandbox");
+    grant_list(state)
+        .get("grants")
+        .and_then(Value::as_array)
+        .and_then(|gs| {
+            gs.iter()
+                .find(|g| g["grant_id"] == grant_id.as_str())
+                .cloned()
+        })
+        .ok_or_else(|| terr("INTERNAL", "grant not found after registration"))
 }
 
 /// Stop a sandbox's children, deepest first, before the sandbox itself.
@@ -557,8 +604,11 @@ impl SandboxApi for GatewaySandboxApi {
             }
             (Principal::Sandbox(s), Operation::GetLimits) => Ok(get_limits(state, &s.sandbox_id)),
             (Principal::User(_), Operation::GrantList) => Ok(grant_list(state)),
+            (Principal::User(u), Operation::GrantCreate(a)) => {
+                grant_create(state, u, "default", &a.sandbox, &a.grant).await
+            }
             (Principal::User(u), Operation::GrantUpdate(a)) => grant_update(state, u, &val(&a)),
-            (_, Operation::GrantList | Operation::GrantUpdate(_)) => {
+            (_, Operation::GrantList | Operation::GrantCreate(_) | Operation::GrantUpdate(_)) => {
                 Err(terr("NOT_ALLOWED", "only the user can change grants"))
             }
             _ => Err(terr("NOT_ALLOWED", "not available to this caller")),
@@ -1278,6 +1328,7 @@ pub(crate) mod grpc_surface {
                 Status::invalid_argument(msg)
             }
             "NOT_FOUND" => Status::not_found(msg),
+            "ALREADY_EXISTS" => Status::already_exists(msg),
             "UNAUTHENTICATED" => Status::unauthenticated(msg),
             "PROVER_INCONCLUSIVE" => Status::failed_precondition(msg),
             _ => Status::internal(msg),
@@ -1557,6 +1608,57 @@ pub(crate) mod grpc_surface {
             max_depth: n(&v, "max_depth"),
             max_breadth: n(&v, "max_breadth"),
             max_total: n(&v, "max_total"),
+        }))
+    }
+
+    pub(crate) async fn create_grant(
+        state: &Arc<ServerState>,
+        req: Request<pb::CreateSandboxGrantRequest>,
+    ) -> Result<Response<pb::CreateSandboxGrantResponse>, Status> {
+        let principal = crate::grpc::extract_principal(&req)?;
+        let Principal::User(user) = &principal else {
+            return Err(Status::permission_denied(
+                "NOT_ALLOWED: only the user can set a grant",
+            ));
+        };
+        let r = req.get_ref();
+        if r.sandbox.trim().is_empty() {
+            return Err(Status::invalid_argument("sandbox is required"));
+        }
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            selected_workspace_name(r.workspace_scope.as_ref())?,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        let mut parts = vec![
+            format!("max_depth={}", r.max_depth),
+            format!("max_breadth={}", r.max_breadth),
+            format!("max_total={}", r.max_total),
+            format!("program={}", r.program),
+        ];
+        if !r.expires.trim().is_empty() {
+            parts.push(format!("expires={}", r.expires.trim()));
+        }
+        if !r.child_policy.trim().is_empty() {
+            parts.push(format!("child_policy={}", r.child_policy.trim()));
+        }
+        let v = super::grant_create(state, user, &authz.workspace, &r.sandbox, &parts.join(","))
+            .await
+            .map_err(|e| status_of(ApiError::from(e)))?;
+        Ok(Response::new(pb::CreateSandboxGrantResponse {
+            grant: Some(pb::SandboxGrant {
+                grant_id: s(&v, "grant_id"),
+                holder: s(&v, "holder"),
+                max_depth: n(&v, "max_depth"),
+                max_breadth: n(&v, "max_breadth"),
+                max_total: n(&v, "max_total"),
+                total: n(&v, "total"),
+                program: s(&v, "program"),
+                user: s(&v, "user"),
+            }),
         }))
     }
 

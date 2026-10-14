@@ -42,7 +42,7 @@ list never goes out of date:
 
 | Caller | Tools |
 |---|---|
-| User (host) | `create_sandbox`, `grant_list`, `grant_update` |
+| User (host) | `create_sandbox`, `grant_list`, `grant_create`, `grant_update` |
 | Sandbox | `create_sandbox`, `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits` |
 
 Whether a call is allowed is decided when it is made: a sandbox without a grant,
@@ -60,6 +60,7 @@ at its maximum depth or out of budget gets `NOT_ALLOWED` or `LIMIT_REACHED`.
 | `list_children` | none | children |
 | `get_limits` | none | depth, children and total, used and allowed |
 | `grant_list` | none | grants |
+| `grant_create` | `sandbox`, `grant` (same form as `create_sandbox`'s `grant`) | the new grant; refused with `ALREADY_EXISTS` if the sandbox holds one, `NOT_ALLOWED` if it is a child |
 | `grant_update` | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits |
 
 Unknown arguments are rejected (`INVALID_ARGUMENT`), so a typo never turns into
