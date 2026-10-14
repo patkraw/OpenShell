@@ -16,7 +16,7 @@ an agent on the host can create sandboxes as the user. Design:
 | Part | Path | What it does |
 |------|------|--------------|
 | MCP surface | `crates/openshell-gateway-mcp/` | MCP protocol only: handshake, tool list, argument parsing, errors. Talks to OpenShell through the `SandboxApi` trait; tested on its own with a fake backend. |
-| Gateway rules | `crates/openshell-server/src/children.rs` | Implements `SandboxApi`: grants, lineage, the prover check against the ceiling, limits, retries, tool sandboxes, cascade stop. |
+| Gateway rules | `crates/openshell-server/src/children.rs` | Implements `SandboxApi`: grants, lineage, the prover check against the parent's policy, limits, retries, tool sandboxes, cascade stop. |
 | Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in each sandbox; checks the calling program against the door rule and forwards with the sandbox's token. |
 | gRPC API | `proto/openshell.proto` (`CreateChildSandbox`, `ListSandboxGrants`, ...) | The same operations as the MCP tools, for the SDKs and the CLI. Handlers in `children.rs` (`grpc_surface`) call the same rules as MCP. |
 | CLI | `openshell sandbox create --grant ...`, `openshell grant list/update/revoke`, `openshell sandbox children` | Start a tree, manage grants, see children. |
@@ -86,9 +86,9 @@ see the script header).
 | `max_total` | Sandboxes in the tree, including this one. |
 | `expires` | e.g. `4h`. |
 | `program` | Executable allowed to use the door, e.g. `/usr/local/bin/node` for Pi. |
-| `child_policy` | `narrow` (default): agents write their children's network rules within the ceiling. `inherit`: every child gets this sandbox's policy unchanged. |
+| `child_policy` | `narrow` (default): agents write their children's network rules within their own policy. `inherit`: every child gets this sandbox's policy unchanged. |
 
-The sandbox's policy (`--policy`) becomes the tree's ceiling. Without one, the
+The sandbox's policy (`--policy`) is the ceiling for its children, and each child's policy is the ceiling for its own children, so each level can only narrow. Without one, the
 restrictive default policy is used; a tree never relies on an image's own policy.
 
 ## Known limits of the proof of concept

@@ -3946,7 +3946,7 @@ message CreateChildSandboxRequest {
   // Task text, passed to the child as OPENSHELL_TASK.
   string task = 5;
   // The child's network rules as policy JSON or YAML, e.g.
-  // {"network_policies": {...}}. Must fit inside the tree's ceiling.
+  // {"network_policies": {...}}. Must fit inside the parent's policy.
   string policy = 6;
   // Providers for the child; a subset of the parent's. Empty: the parent's.
   repeated string providers = 7;

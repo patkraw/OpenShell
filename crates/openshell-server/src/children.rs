@@ -14,7 +14,7 @@
 //!
 //! - a sandbox may create children only if its tree has a **grant**, set by the
 //!   user when starting the tree's first sandbox (`sandbox create --grant ...`);
-//! - every child policy is proved to fit inside the grant's **ceiling**;
+//! - every child policy is proved to fit inside its **parent's policy**;
 //! - depth, breadth and total limits are counted per tree;
 //! - `create_sandbox` is hidden from callers that cannot use it;
 //! - a repeated `request_id` returns the first result;
@@ -82,12 +82,10 @@ pub struct Grant {
     pub max_breadth: u32,
     /// Sandboxes in the whole tree, including the holder.
     pub max_total: u32,
-    /// Children get their parent's ceiling unchanged; agents may not write child policies.
+    /// Children get their parent's policy unchanged; agents may not write child policies.
     pub inherit_child_policy: bool,
     /// Program allowed to use the door, e.g. `/usr/local/bin/node`.
     pub program: String,
-    /// The holder's policy at start, before the door rule. Children must fit inside.
-    pub ceiling: SandboxPolicy,
     pub expires_at_ms: i64,
     pub total: u32,
     /// request_id -> child sandbox name (first result).
@@ -197,7 +195,7 @@ pub struct GrantSpec {
     pub max_total: u32,
     pub expires: Duration,
     pub program: String,
-    /// `child_policy=inherit`: every child gets its parent's ceiling unchanged.
+    /// `child_policy=inherit`: every child gets its parent's policy unchanged.
     pub inherit_child_policy: bool,
 }
 
@@ -273,14 +271,13 @@ pub fn door_rule(program: &str) -> Result<openshell_core::proto::NetworkPolicyRu
 // Hooks called from CreateSandbox / DeleteSandbox
 // ---------------------------------------------------------------------------
 
-/// Before a user's create: if it carries a grant, remember the ceiling and add
-/// the door rule. Returns the parsed grant spec and ceiling to register after
-/// the sandbox exists.
+/// Before a user's create: if it carries a grant, add the door rule. Returns
+/// the parsed grant spec to register after the sandbox exists.
 pub fn prepare_granted_create(
     principal: &Principal,
     annotations: &HashMap<String, String>,
     spec: &mut SandboxSpec,
-) -> Result<Option<(GrantSpec, SandboxPolicy)>, tonic::Status> {
+) -> Result<Option<GrantSpec>, tonic::Status> {
     let Some(raw) = annotations.get(GRANT_ANNOTATION) else {
         return Ok(None);
     };
@@ -291,18 +288,17 @@ pub fn prepare_granted_create(
     }
     let grant = parse_grant_spec(raw).map_err(tonic::Status::invalid_argument)?;
     // A tree always has an explicit policy: without one, the restrictive
-    // default (what a supervisor would fall back to) becomes the ceiling.
+    // default (what a supervisor would fall back to) bounds its children.
     let policy = spec
         .policy
         .get_or_insert_with(openshell_policy::restrictive_default_policy);
-    let ceiling = policy.clone();
     if grant.max_depth > 0 {
         let rule = door_rule(&grant.program).map_err(tonic::Status::internal)?;
         policy
             .network_policies
             .insert(DOOR_RULE_KEY.to_string(), rule);
     }
-    Ok(Some((grant, ceiling)))
+    Ok(Some(grant))
 }
 
 pub fn register_granted_sandbox(
@@ -310,7 +306,6 @@ pub fn register_granted_sandbox(
     principal: &Principal,
     sandbox: &Sandbox,
     grant: GrantSpec,
-    ceiling: SandboxPolicy,
 ) {
     let Principal::User(user) = principal else {
         return;
@@ -329,7 +324,6 @@ pub fn register_granted_sandbox(
             max_total: grant.max_total,
             program: grant.program,
             inherit_child_policy: grant.inherit_child_policy,
-            ceiling,
             expires_at_ms: now_ms().saturating_add(expires_ms),
             total: 1,
             request_ids: HashMap::new(),
@@ -632,7 +626,7 @@ async fn prove(ceiling: &SandboxPolicy, candidate: &SandboxPolicy) -> Result<(),
         CheckResult::Exceeds(ev) => Err(terr(
             "EXCEEDS_CEILING",
             format!(
-                "child policy exceeds the ceiling; counterexample: {:?}",
+                "child policy exceeds the parent's policy; counterexample: {:?}",
                 ev.counterexample()
             ),
         )),
@@ -681,18 +675,24 @@ async fn create_child(
         .ok_or_else(|| terr("NOT_FOUND", "caller sandbox not found"))?;
     let parent_spec = parent.spec.clone().unwrap_or_default();
 
-    // 4. Child policy = ceiling's non-network parts + the agent's network rules.
-    let mut candidate = grant.ceiling.clone();
+    // 4. The child's ceiling is its parent's current policy, without the door
+    //    rule, so each level can only narrow. Child policy = the ceiling's
+    //    non-network parts + the agent's network rules.
+    let mut ceiling = crate::grpc::policy::current_base_policy_for_sandbox(&state.store, &parent)
+        .await
+        .map_err(|s| terr("INTERNAL", s.message()))?;
+    ceiling.network_policies.remove(DOOR_RULE_KEY);
+    let mut candidate = ceiling.clone();
     candidate.network_policies.clear();
     let wants_policy = args.get("policy").is_some_and(|p| !p.is_null());
     if grant.inherit_child_policy {
         if wants_policy {
             return Err(terr(
                 "INVALID_ARGUMENT",
-                "this tree's grant gives every child its parent's ceiling; omit policy",
+                "this tree's grant gives every child its parent's policy; omit policy",
             ));
         }
-        candidate.network_policies = grant.ceiling.network_policies.clone();
+        candidate.network_policies = ceiling.network_policies.clone();
     }
     if let Some(p) = args.get("policy").filter(|p| !p.is_null()) {
         let mut p = p.clone();
@@ -709,8 +709,8 @@ async fn create_child(
             "the door rule is written by the gateway",
         ));
     }
-    // 5. Prove against the ceiling (not the parent's current policy).
-    prove(&grant.ceiling, &candidate).await?;
+    // 5. Prove against the parent's policy.
+    prove(&ceiling, &candidate).await?;
 
     // 6. Providers must be a subset of the parent's.
     let providers: Vec<String> = match args.get("providers").and_then(Value::as_array) {

@@ -46,8 +46,10 @@ target/debug/openshell -g docker-dev sandbox create --name lead --from pi-agent:
 | `program` | `/usr/local/bin/node` | only Node may use the door (Pi runs on Node) |
 | `child_policy` | (default `narrow`) | agents write their children's network rules; `inherit` gives every child the lead's policy |
 
-`lead.yaml` becomes the tree's **ceiling**: no child may ever get more. The
-gateway also adds the **door rule** to the lead's policy. See it:
+`lead.yaml` becomes the **ceiling** for the lead's children: no child may get
+more. Each child's policy is in turn the ceiling for its own children, so each
+level can only narrow. The gateway also adds the **door rule** to the lead's
+policy. See it:
 
 ```shell
 target/debug/openshell -g docker-dev sandbox get lead --policy-only
