@@ -17,7 +17,7 @@ an agent on the host can create sandboxes as the user. Design:
 |------|------|--------------|
 | MCP surface | `crates/openshell-gateway-mcp/` | MCP protocol only: handshake, tool list, argument parsing, errors. Talks to OpenShell through the `SandboxApi` trait; tested on its own with a fake backend. |
 | Gateway rules | `crates/openshell-server/src/children.rs` | Implements `SandboxApi`: grants, lineage, the prover check against the parent's policy, limits, retries, tool sandboxes, cascade stop. |
-| Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in each sandbox; checks the calling program against the door rule and forwards with the sandbox's token. |
+| Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in every sandbox; forwards with the sandbox's token and the calling program's path. The gateway decides every call. |
 | gRPC API | `proto/openshell.proto` (`CreateChildSandbox`, `ListSandboxGrants`, ...) | The same operations as the MCP tools, for the SDKs and the CLI. Handlers in `children.rs` (`grpc_surface`) call the same rules as MCP. |
 | CLI | `openshell sandbox create --grant ...`, `openshell grant list/update/revoke`, `openshell sandbox children` | Start a tree, manage grants, see children. |
 | Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
@@ -85,7 +85,7 @@ see the script header).
 | `max_breadth` | Children per parent. |
 | `max_total` | Sandboxes in the tree, including this one. |
 | `expires` | e.g. `4h`. |
-| `program` | Executable allowed to use the door, e.g. `/usr/local/bin/node` for Pi. |
+| `program` | Executable allowed to call the gateway MCP from this tree, e.g. `/usr/local/bin/node` for Pi; the gateway refuses other programs with `PROGRAM_NOT_ALLOWED`. |
 | `child_policy` | `narrow` (default): agents write their children's network rules within their own policy. `inherit`: every child gets this sandbox's policy unchanged. |
 
 The sandbox's policy (`--policy`) is the ceiling for its children, and each child's policy is the ceiling for its own children, so each level can only narrow. Without one, the

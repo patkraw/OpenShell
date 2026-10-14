@@ -1083,21 +1083,15 @@ fn pinned_transparent_plan(
     build_pinned_validation_plan(addresses).map_err(|_| MappingLookupError::InvalidMapping)
 }
 
-/// Gateway MCP door: is the calling program allowed by the door rule
-/// (a network policy entry for `openshell.local:80`)?
-fn door_program_allowed(
-    engine: &OpaEngine,
-    identity_cache: &BinaryIdentityCache,
+/// Gateway MCP door: the calling program's kernel-resolved path. The door is
+/// open in every sandbox; the gateway checks this path against the grant.
+fn door_caller_program(
     identity: Option<&Result<ContractBinaryIdentity, ResolveError>>,
-) -> std::result::Result<(), String> {
-    let Some(identity) = identity else {
-        return Err("no verified workload identity".to_string());
-    };
-    let intent = EgressIntent::forward_http(crate::gateway_mcp_door::DOOR_HOST.to_string(), 80);
-    let decision = authorize_supplied_identity(engine, identity_cache, intent, identity);
-    match decision.action {
-        NetworkAction::Allow { .. } => Ok(()),
-        NetworkAction::Deny { reason } => Err(reason),
+) -> std::result::Result<String, String> {
+    match identity {
+        Some(Ok(identity)) => Ok(identity.executable.path.display().to_string()),
+        Some(Err(e)) => Err(format!("calling program could not be identified: {e}")),
+        None => Err("no verified workload identity".to_string()),
     }
 }
 
@@ -2715,8 +2709,7 @@ async fn handle_mediated_connection(
         let ctx = policy_local_ctx
             .as_ref()
             .ok_or_else(|| miette::miette!("sandbox-local policy context is unavailable"))?;
-        let allowed =
-            door_program_allowed(&opa_engine, &identity_cache, supplied_identity.as_ref());
+        let allowed = door_caller_program(supplied_identity.as_ref());
         return crate::gateway_mcp_door::handle(
             ctx,
             allowed,
@@ -5556,7 +5549,7 @@ async fn handle_forward_proxy(
 
     if host_lc == crate::gateway_mcp_door::DOOR_HOST {
         let allowed = if scheme == "http" && port == 80 {
-            door_program_allowed(&opa_engine, &identity_cache, supplied_identity)
+            door_caller_program(supplied_identity)
         } else {
             Err("use http://openshell.local/mcp".to_string())
         };
