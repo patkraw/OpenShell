@@ -60,12 +60,14 @@ examples/gateway-mcp-poc/user-mcp.py grant_list
 {"isError": false, "grants": [{"grant_id": "gr-ecfd434f", "holder": "hostlead", "max_breadth": 2, "max_depth": 1, "max_total": 3, "program": "/usr/local/bin/node", "total": 1, "user": "unauthenticated-local-dev"}]}
 ```
 
-Attach a grant to a sandbox that has none, and widen another:
+Attach a grant to a sandbox that has none, and widen another. Use the
+`grant_id` that `grant_list` printed for `hostlead` (yours differs):
 
 ```shell
+GRANT_ID=$(examples/gateway-mcp-poc/user-mcp.py grant_list | python3 -c 'import json,sys; print(next(g["grant_id"] for g in json.load(sys.stdin)["grants"] if g["holder"]=="hostlead"))')
 examples/gateway-mcp-poc/user-mcp.py create_sandbox name=box2 image=pi-agent:local 'command=["sleep","3600"]'
 examples/gateway-mcp-poc/user-mcp.py grant_create sandbox=box2 grant=max_depth=1,max_breadth=1,max_total=2,expires=1h,program=/usr/local/bin/node
-examples/gateway-mcp-poc/user-mcp.py grant_update grant_id=gr-ecfd434f max_total=5
+examples/gateway-mcp-poc/user-mcp.py grant_update grant_id="$GRANT_ID" max_total=5
 ```
 
 ```text

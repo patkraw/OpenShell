@@ -31,5 +31,5 @@ mcp() { openshell sandbox exec "$1" -- node /usr/local/lib/gateway-mcp/mcp-clien
 - `mcp <sandbox> <tool> '<json>'` runs a tiny MCP client **inside** that
   sandbox, the way an agent would call the gateway.
 
-The design is in the RFC (`rfc/NNNN-gateway-mcp-sandbox-creation`); the wire
+The design is in the [RFC](https://github.com/patkraw/OpenShell/blob/docs/gateway-mcp-rfc/patkraw/rfc/NNNN-gateway-mcp-sandbox-creation/README.md); the wire
 format is in [PROTOCOL.md](../PROTOCOL.md).

@@ -54,18 +54,26 @@ mcp lead create_sandbox "$WRITER"
 ```shell
 PROPOSAL='{"intent_summary":"Let a child sandbox open GitHub pull requests.","operations":[{"addRule":{"ruleName":"github_write","rule":{"name":"github_write","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"POST","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}]}'
 openshell sandbox exec lead -- curl -s -X POST http://policy.local/v1/proposals \
-  -H 'content-type: application/json' -d "$PROPOSAL"
+  -H 'content-type: application/json' -d "$PROPOSAL" | tee /tmp/proposal.json
 ```
 
 ```text
 {"status":"submitted","accepted_chunks":1,"rejected_chunks":0,"rejection_reasons":[],"accepted_chunk_ids":["ad53c838-4f33-40f2-9f88-68c3a2bf2dc1"]}
 ```
 
+Keep the chunk id from `accepted_chunk_ids` for the next steps (yours differs
+from the one shown):
+
+```shell
+CHUNK_ID=$(python3 -c 'import json; print(json.load(open("/tmp/proposal.json"))["accepted_chunk_ids"][0])')
+echo "$CHUNK_ID"
+```
+
 ## 3. You review and approve
 
 ```shell
 openshell rule get lead
-openshell rule approve lead --chunk-id ad53c838-4f33-40f2-9f88-68c3a2bf2dc1
+openshell rule approve lead --chunk-id "$CHUNK_ID"
 ```
 
 ```text
@@ -82,7 +90,7 @@ OK Chunk approved. Policy version: 2, hash: 4b58be6fb98e
 
 ```shell
 openshell sandbox exec lead -- curl -s \
-  'http://policy.local/v1/proposals/ad53c838-4f33-40f2-9f88-68c3a2bf2dc1/wait?timeout=60'
+  "http://policy.local/v1/proposals/$CHUNK_ID/wait?timeout=60"
 ```
 
 ```text

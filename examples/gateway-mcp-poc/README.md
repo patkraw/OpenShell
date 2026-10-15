@@ -3,8 +3,15 @@
 Agents create sandboxes through OpenShell. A sandbox started with a grant can
 create child sandboxes, within limits, through an MCP endpoint in the gateway;
 an agent on the host can create sandboxes as the user. Design:
-[RFC draft](../../rfc/NNNN-gateway-mcp-sandbox-creation/README.md) (on branch
-`docs/gateway-mcp-rfc/patkraw`).
+[RFC draft](https://github.com/patkraw/OpenShell/blob/docs/gateway-mcp-rfc/patkraw/rfc/NNNN-gateway-mcp-sandbox-creation/README.md) (on branch
+`docs/gateway-mcp-rfc/patkraw`). Issue:
+[NVIDIA/OpenShell#4574](https://github.com/NVIDIA/OpenShell/issues/4574).
+
+Get the code:
+
+```shell
+git clone https://github.com/patkraw/OpenShell.git && cd OpenShell && git checkout gateway-mcp-poc
+```
 
 - **[tutorials/](tutorials/README.md)**: run it yourself, one feature at a time:
   setup, the CLI, MCP inside a sandbox, child policies, asking for more, MCP
@@ -47,7 +54,7 @@ Docker running):
 mise run gateway:docker                     # builds the gateway and supervisor image, serves on :18080
 docker build -t pi-agent:local -f examples/gateway-mcp-poc/Dockerfile.pi examples/gateway-mcp-poc
 cargo build -p openshell-cli
-examples/gateway-mcp-poc/run-checks.sh      # 37 checks: grants, door, refusals, retries, tool sandboxes, host user, cascade stop
+examples/gateway-mcp-poc/run-checks.sh      # end-to-end checks; see Results below
 ```
 
 Try it by hand:
@@ -101,6 +108,22 @@ The sandbox's policy (`--policy`) is the ceiling for its children, and each chil
 restrictive default policy is used; a tree never relies on an image's own policy.
 
 Later changes to a child's policy are held to the same rule: a user `policy set`, a supervisor sync, or an approved (or auto-approved) proposal that would take a child beyond its parent's current policy is refused with `EXCEEDS_CEILING`.
+
+Grants belong to the user who set them. Only that user, or a Workspace Admin of
+the holder's workspace, sees a grant in `grant list`/`grant get` and can update,
+revoke or replace it. To change `expires`, `program` or `child_policy`, revoke
+the grant and run `grant create` on the same sandbox: the new grant covers the
+running tree, and its running sandboxes count toward the new total.
+
+Limits and retries hold under concurrency: depth, breadth and total are checked
+and charged in one step when a child slot is reserved, and a `request_id` is
+scoped to the parent and reserved before the child launches, so a concurrent
+duplicate gets `IN_PROGRESS` (or, later, the first child's handle) and never a
+second child.
+
+## Results
+
+Run `examples/gateway-mcp-poc/run-checks.sh` against a dev gateway (see Test it).
 
 ## Known limits of the proof of concept
 

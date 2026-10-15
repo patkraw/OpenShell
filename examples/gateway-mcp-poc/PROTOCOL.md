@@ -59,9 +59,9 @@ at its maximum depth or out of budget gets `NOT_ALLOWED` or `LIMIT_REACHED`.
 | `stop_sandbox` | `handle` | `stopped` (its children are stopped first) |
 | `list_children` | none | children |
 | `get_limits` | none | depth, children and total, used and allowed |
-| `grant_list` | none | grants |
-| `grant_create` | `sandbox`, `grant` (same form as `create_sandbox`'s `grant`) | the new grant; refused with `ALREADY_EXISTS` if the sandbox holds one, `NOT_ALLOWED` if it is a child |
-| `grant_update` | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits |
+| `grant_list` | none | the grants the caller set, or administers |
+| `grant_create` | `sandbox`, `grant` (same form as `create_sandbox`'s `grant`) | the new grant; replaces a revoked or expired grant for the running tree; refused with `ALREADY_EXISTS` while the sandbox holds an active grant, `NOT_ALLOWED` if it is a child |
+| `grant_update` | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits; `NOT_ALLOWED` unless the caller set the grant or is a Workspace Admin |
 
 Unknown arguments are rejected (`INVALID_ARGUMENT`), so a typo never turns into
 a silently ignored field.
@@ -90,13 +90,17 @@ On failure `isError` is `true` and `structuredContent` is
 | `GLOBAL_POLICY_ACTIVE` | a gateway-global policy would replace the child's policy |
 | `INVALID_ARGUMENT`, `INVALID_POLICY` | bad arguments or policy |
 | `NOT_YOUR_CHILD` | the handle is not one of the caller's descendants |
+| `IN_PROGRESS` | a `create_sandbox` with the same `request_id` from the same parent is still launching; retry shortly |
 | `WRONG_KIND` | `exec` on an agent child |
 | `CREATE_FAILED`, `EXEC_FAILED`, `FILE_ERROR` | the underlying OpenShell operation failed |
 
 ## Retries
 
-Send a `request_id` with `create_sandbox`. A repeat with the same id returns the
-first result (`"repeated_request": true`) and is counted once against the grant.
+Send a `request_id` with `create_sandbox`. A repeat with the same id **from the
+same parent** returns the first result (`"repeated_request": true`) and is
+counted once against the grant. A repeat that arrives while the first is still
+launching gets `IN_PROGRESS`; it never creates a second child. Ids are scoped to
+the parent, so siblings may use the same id without colliding.
 
 ## Real exchanges
 
