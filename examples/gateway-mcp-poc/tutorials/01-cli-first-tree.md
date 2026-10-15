@@ -144,14 +144,14 @@ Grant:       gr-f76157c2
 Holder:      lead
 Max depth:   1
 Max breadth: 4
-Total:       3/5
+Total:       4/5
 Program:     /usr/local/bin/node
 User:        unauthenticated-local-dev
 {"isError":false,"can_create_children":false,"depth":1,"handle":"w3","kind":"agent",...}
 ```
 
-- **The running children count** toward the new grant (`3/5`: lead and two
-  children).
+- **The running children count** toward the new grant (`4/5`: the lead and
+  its three children `w1`, `t1` and `w2`).
 - Replacing works only after a **revoke** or once the grant has **expired**.
   While a grant is active, `grant create` says `ALREADY_EXISTS: 'lead' already
   holds grant ...; revoke it first to replace it`.

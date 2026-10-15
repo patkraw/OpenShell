@@ -29,14 +29,18 @@ openshell sandbox create --name lead --from pi-agent:local \
 
 ```shell
 mcp lead create_sandbox '{"name":"build","kind":"tool"}'
+mcp lead wait '{"handle":"build","timeout_s":60}'
 mcp lead exec '{"handle":"build","command":["sh","-c","echo compiling; ls /usr/local/bin | head -3; exit 2"]}'
 ```
 
 ```text
 {"isError":false,"can_create_children":false,"depth":1,"handle":"build","idle_timeout_s":600,"kind":"tool",...}
+{"isError":false,"exit_code":null,"handle":"build","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":false,"exit_code":2,"handle":"build","stderr":"","stdout":"compiling\ncorepack\ndocker-entrypoint.sh\nfd\n"}
 ```
 
+- **`wait` first:** a new sandbox takes a few seconds to start, and `exec`
+  before that gives `sandbox is not ready`.
 - You get **stdout, stderr and the exit code** back right away.
 
 ## 2. Idle stop
@@ -62,16 +66,21 @@ build  2026-10-14 22:48:18  Ready
 
 ```shell
 mcp lead create_sandbox '{"name":"w1","command":["sleep","600"]}'
+mcp lead wait '{"handle":"w1","timeout_s":60}'
 mcp w1 get_limits
 mcp w1 create_sandbox '{"name":"w1-agent","command":["true"]}'
 mcp w1 create_sandbox '{"name":"w1-tool","kind":"tool"}'
+mcp w1 wait '{"handle":"w1-tool","timeout_s":60}'
 mcp w1 exec '{"handle":"w1-tool","command":["echo","leaf ran this"]}'
 ```
 
 ```text
+{"isError":false,"can_create_children":false,"depth":1,"handle":"w1","kind":"agent",...}
+{"isError":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":false,"can_create_children":false,"can_create_tools":true,"depth":1,...}
 {"isError":true,"error":"LIMIT_REACHED","message":"depth: 1 of 1"}
 {"isError":false,"can_create_children":false,"depth":2,"handle":"w1-tool","idle_timeout_s":600,"kind":"tool",...}
+{"isError":false,"exit_code":null,"handle":"w1-tool","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":false,"exit_code":0,"handle":"w1-tool","stderr":"","stdout":"leaf ran this\n"}
 ```
 

@@ -21,6 +21,7 @@ Setup: [00](00-setup.md), plus the shell setup from the [index](README.md).
 ```shell
 curl -s http://127.0.0.1:18080/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+echo
 ```
 
 ```text
@@ -37,11 +38,13 @@ curl -s http://127.0.0.1:18080/mcp -H 'content-type: application/json' \
 ['create_sandbox', 'grant_list', 'grant_create', 'grant_update']
 ```
 
-Create a sandbox **with a grant**:
+Create a sandbox **with a grant** (over MCP the grant is one string of
+`key=value` pairs; the CLI uses `--grant-*` flags instead):
 
 ```shell
 curl -s http://127.0.0.1:18080/mcp -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_sandbox","arguments":{"name":"hostlead","image":"pi-agent:local","command":["sleep","3600"],"grant":"max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node"}}}'
+echo
 ```
 
 ```text
@@ -57,7 +60,7 @@ examples/gateway-mcp-poc/user-mcp.py grant_list
 ```
 
 ```text
-{"isError": false, "grants": [{"grant_id": "gr-ecfd434f", "holder": "hostlead", "max_breadth": 2, "max_depth": 1, "max_total": 3, "program": "/usr/local/bin/node", "total": 1, "user": "unauthenticated-local-dev"}]}
+{"isError": false, "grants": [{"grant_id": "gr-ecfd434f", "holder": "hostlead", "max_breadth": 2, "max_depth": 1, "max_total": 3, "program": "/usr/local/bin/node", "total": 1, "user": "unauthenticated-local-dev", "workspace": "default"}]}
 ```
 
 Attach a grant to a sandbox that has none, and widen another. Use the
@@ -122,6 +125,6 @@ These configurations are shown, not run, in this tutorial.
 
 - On the host, **`/mcp` acts as you**: create top-level sandboxes and manage
   grants, no grant needed.
-- It is **plain MCP over HTTP**: curl, a 15-line script or any MCP client
-  works.
+- It is **MCP's Streamable HTTP transport with JSON responses**: curl, a
+  15-line script or any MCP client works.
 - One config line connects **Claude Code, Pi or Codex**.

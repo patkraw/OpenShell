@@ -69,7 +69,11 @@ grant_list: {"grants": [{"grant_id": "gr-cbbb9b35", "holder": "sdk-lead", "max_b
 `@modelcontextprotocol/sdk` (installed in the image). It runs in the sandbox
 the previous step created, creates a tool sandbox, runs a command and stops it:
 
+`sdk-lead` takes a few seconds to start; wait until it is ready, then run the
+script in it:
+
 ```shell
+until openshell sandbox get sdk-lead 2>/dev/null | grep -q 'Phase: Ready'; do sleep 2; done
 openshell sandbox exec sdk-lead -- node /usr/local/lib/gateway-mcp/sandbox_child.mjs
 ```
 
@@ -90,6 +94,6 @@ Clean up: `openshell sandbox delete sdk-lead`.
 ## What you learned
 
 - **Host code** can use OpenShell's **Python SDK** for grants and children.
-- The endpoint is **plain MCP**: the official SDKs work **unchanged**, on the
-  host and in a sandbox.
+- The endpoint is **standard MCP** (Streamable HTTP, JSON responses): the
+  official SDKs work **unchanged**, on the host and in a sandbox.
 - Inside a sandbox, use **MCP**; gRPC through the door comes later.

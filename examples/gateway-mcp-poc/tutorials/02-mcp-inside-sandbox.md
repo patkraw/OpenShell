@@ -18,7 +18,7 @@ Start a lead:
 openshell sandbox create --name lead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
   --grant-program /usr/local/bin/node \
-  --grant-max-depth 1 --grant-max-breadth 4 --grant-max-total 5 --grant-expires 1h \
+  --grant-max-depth 1 --grant-max-breadth 4 --grant-max-total 6 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 ```
 
@@ -31,7 +31,7 @@ mcp lead get_limits
 
 ```text
 ["create_sandbox","wait","exec","get_file","get_output","stop_sandbox","list_children","get_limits"]
-{"isError":false,"can_create_children":true,"can_create_tools":true,"children_created":0,"depth":0,"grant_id":"gr-1ffdaff2","has_grant":true,"max_breadth":4,"max_depth":1,"max_total":5,"total":1}
+{"isError":false,"can_create_children":true,"can_create_tools":true,"children_created":0,"depth":0,"grant_id":"gr-1ffdaff2","has_grant":true,"max_breadth":4,"max_depth":1,"max_total":6,"total":1}
 ```
 
 - **Tools are always listed.** Whether a call is allowed is decided when you
@@ -54,6 +54,19 @@ mcp lead create_sandbox '{"name":"t1","kind":"tool"}'
 - Both run the **lead's image**, CPU and memory, with no GPU.
 
 ## 3. Use them
+
+A new child takes a few seconds to start. `wait` returns once it is ready
+(calling `exec` or `get_file` earlier gives `sandbox is not ready`):
+
+```shell
+mcp lead wait '{"handle":"t1","timeout_s":60}'
+mcp lead wait '{"handle":"w1","timeout_s":60}'
+```
+
+```text
+{"isError":false,"exit_code":null,"handle":"t1","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","timed_out":false}
+```
 
 Run a command in the tool sandbox, and read a file from the agent child:
 
@@ -136,10 +149,10 @@ mcp lead stop_sandbox '{"handle":"rev"}'
 | `curl` instead of Node | `PROGRAM_NOT_ALLOWED` | the grant names `/usr/local/bin/node` |
 | `w1` creates an agent | `LIMIT_REACHED` | `w1` is at `max_depth` |
 | `exec` on an agent | `WRONG_KIND` | `exec` is for tool sandboxes |
-| `get_file` on your own parent | `NOT_YOUR_CHILD` | you act only on your descendants |
+| `get_file` on a sandbox that is not your child (here: the lead itself) | `NOT_YOUR_CHILD` | you act only on your descendants |
 
 ```shell
-openshell sandbox exec lead -- curl -s -X POST http://openshell.local/mcp -d '{}'
+openshell sandbox exec lead -- curl -s -X POST http://openshell.local/mcp -d '{}'; echo
 mcp w1 create_sandbox '{"name":"g1","command":["true"]}'
 mcp lead exec '{"handle":"w1","command":["id"]}'
 mcp lead get_file '{"handle":"lead","path":"/etc/hostname"}'

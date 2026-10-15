@@ -44,10 +44,12 @@ gateway.
 In a second terminal, from the repository root:
 
 ```shell
-cargo build -p openshell-cli
+mise exec -- cargo build -p openshell-cli
 docker build -t pi-agent:local -f examples/gateway-mcp-poc/Dockerfile.pi examples/gateway-mcp-poc
 ```
 
+- `mise exec --` runs `cargo` with the repository's toolchain, so it works even
+  if your shell does not activate mise.
 - `pi-agent:local` is Pi's image plus two MCP clients: a tiny one
   (`mcp-client.mjs`) and the official TypeScript MCP SDK.
 

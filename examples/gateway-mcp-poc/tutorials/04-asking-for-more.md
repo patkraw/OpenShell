@@ -28,13 +28,12 @@ openshell sandbox create --name lead --from pi-agent:local \
   --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 openshell settings set lead --key agent_policy_proposals_enabled --value true
+sleep 15   # the sandbox picks up settings on its next poll
 ```
 
 ```text
 ✓ Set sandbox setting agent_policy_proposals_enabled=true for lead (revision 1)
 ```
-
-Wait about **15 seconds**; the sandbox picks up settings on its next poll.
 
 ## 1. Refused
 
@@ -55,6 +54,7 @@ mcp lead create_sandbox "$WRITER"
 PROPOSAL='{"intent_summary":"Let a child sandbox open GitHub pull requests.","operations":[{"addRule":{"ruleName":"github_write","rule":{"name":"github_write","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"POST","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}]}'
 openshell sandbox exec lead -- curl -s -X POST http://policy.local/v1/proposals \
   -H 'content-type: application/json' -d "$PROPOSAL" | tee /tmp/proposal.json
+echo
 ```
 
 ```text
@@ -91,6 +91,7 @@ OK Chunk approved. Policy version: 2, hash: 4b58be6fb98e
 ```shell
 openshell sandbox exec lead -- curl -s \
   "http://policy.local/v1/proposals/$CHUNK_ID/wait?timeout=60"
+echo
 ```
 
 ```text
@@ -117,11 +118,14 @@ The child `writer` asks for `api.openai.com`, which the lead doesn't have:
 
 ```shell
 openshell settings set writer --key agent_policy_proposals_enabled --value true
-# wait ~15 seconds
+sleep 15   # the sandbox picks up settings on its next poll
 openshell sandbox exec writer -- curl -s -X POST http://policy.local/v1/proposals \
   -H 'content-type: application/json' \
-  -d '{"intent_summary":"reach openai","operations":[{"addRule":{"ruleName":"openai","rule":{"name":"openai","endpoints":[{"host":"api.openai.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}]}'
-openshell rule approve writer --chunk-id <chunk-id-from-the-response>
+  -d '{"intent_summary":"reach openai","operations":[{"addRule":{"ruleName":"openai","rule":{"name":"openai","endpoints":[{"host":"api.openai.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}]}' \
+  | tee /tmp/proposal-writer.json
+echo
+CHUNK_ID=$(python3 -c 'import json; print(json.load(open("/tmp/proposal-writer.json"))["accepted_chunk_ids"][0])')
+openshell rule approve writer --chunk-id "$CHUNK_ID"
 ```
 
 ```text
