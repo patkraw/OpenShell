@@ -123,10 +123,12 @@ second child.
 
 ## Results
 
-**70/70 end-to-end checks pass at commit `db248c836`** (dev gateway, Docker
-driver, macOS arm64, 2026-10-15). Unit tests at the same commit: 2,046
+**74/74 end-to-end checks pass at commit `a1b94e583`** (dev gateway, Docker
+driver, macOS arm64, 2026-10-15). Unit tests at the same commit: 2,049
 `openshell-server`, all `openshell-gateway-mcp` and `openshell-cli`, and 190
-Python.
+Python. One `openshell-supervisor-network` proxy test
+(`mediated_connect_keeps_workload_bytes_read_with_the_synthesized_header`)
+fails on this machine with and without the proof of concept's changes.
 
 Run `examples/gateway-mcp-poc/run-checks.sh` against a dev gateway (see Test it)
 to reproduce.
