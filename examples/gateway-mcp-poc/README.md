@@ -32,7 +32,7 @@ git clone https://github.com/patkraw/OpenShell.git && cd OpenShell && git checko
 | Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `create_grant`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
 
 The MCP endpoint is on by default. It is **startup configuration**: turn it off
-with `sandbox_mcp_enabled = false` in the gateway's `[openshell.gateway]` TOML
+with `enabled = false` in the gateway's `[openshell.gateway.sandbox_mcp]` TOML
 section, `OPENSHELL_GATEWAY_MCP_ENABLED=false`, or `--sandbox-mcp-enabled=false`
 (flag and environment override the file), then **restart the gateway**. Grants
 and the CLI keep working while it is off.

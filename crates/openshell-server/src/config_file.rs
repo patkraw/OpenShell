@@ -82,6 +82,15 @@ pub struct OpenShellRoot {
 /// in the file (`Some`) or not (`None` — value is taken from CLI/env/default).
 /// Driver-specific settings belong exclusively in
 /// `[openshell.drivers.<name>]` tables.
+/// `[openshell.gateway.sandbox_mcp]`: the gateway MCP endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxMcpFileSection {
+    /// Serve `/mcp` and the in-sandbox door. Default `true`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayFileSection {
@@ -138,9 +147,10 @@ pub struct GatewayFileSection {
     /// Enable the WebSocket tunnel for an authenticated edge proxy.
     #[serde(default)]
     pub enable_websocket_tunnel: Option<bool>,
-    /// Serve the gateway MCP endpoint (`/mcp`). Read at startup only.
+    /// Gateway MCP endpoint (`[openshell.gateway.sandbox_mcp]`). Read at
+    /// startup only.
     #[serde(default)]
-    pub sandbox_mcp_enabled: Option<bool>,
+    pub sandbox_mcp: Option<SandboxMcpFileSection>,
 
     // ── Sandbox client TLS ───────────────────────────────────────────────
     #[serde(default)]

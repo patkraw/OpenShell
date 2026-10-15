@@ -35,7 +35,7 @@ WARN openshell_server::cli: TLS disabled — listening on plaintext HTTP
 ```
 
 The gateway MCP endpoint is on by default. It is read **at startup**: to turn it
-off, set `sandbox_mcp_enabled = false` under `[openshell.gateway]` in the
+off, set `enabled = false` under `[openshell.gateway.sandbox_mcp]` in the
 gateway's TOML config (or `OPENSHELL_GATEWAY_MCP_ENABLED=false`) and restart the
 gateway.
 

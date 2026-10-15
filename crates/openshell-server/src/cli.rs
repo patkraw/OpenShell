@@ -1186,7 +1186,7 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.enable_websocket_tunnel = enabled;
     }
-    if let Some(enabled) = file.sandbox_mcp_enabled
+    if let Some(enabled) = file.sandbox_mcp.as_ref().and_then(|s| s.enabled)
         && arg_defaulted(matches, "sandbox_mcp_enabled")
     {
         args.sandbox_mcp_enabled = enabled;
@@ -1568,7 +1568,7 @@ mod tests {
             parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
         assert!(args.sandbox_mcp_enabled);
 
-        let file = config_file_from_toml("[openshell.gateway]\nsandbox_mcp_enabled = false\n");
+        let file = config_file_from_toml("[openshell.gateway.sandbox_mcp]\nenabled = false\n");
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
         assert!(!args.sandbox_mcp_enabled);
 
