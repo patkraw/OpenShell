@@ -123,7 +123,13 @@ second child.
 
 ## Results
 
-Run `examples/gateway-mcp-poc/run-checks.sh` against a dev gateway (see Test it).
+**70/70 end-to-end checks pass at commit `db248c836`** (dev gateway, Docker
+driver, macOS arm64, 2026-10-15). Unit tests at the same commit: 2,046
+`openshell-server`, all `openshell-gateway-mcp` and `openshell-cli`, and 190
+Python.
+
+Run `examples/gateway-mcp-poc/run-checks.sh` against a dev gateway (see Test it)
+to reproduce.
 
 ## Known limits of the proof of concept
 
