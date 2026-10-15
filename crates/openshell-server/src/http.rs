@@ -177,22 +177,13 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResp
     handle.render()
 }
 
-/// The gateway MCP endpoint is on unless `OPENSHELL_GATEWAY_MCP_ENABLED` is
-/// `0`, `false` or `off`. Turning it off leaves grants and the CLI working.
-fn gateway_mcp_enabled() -> bool {
-    !matches!(
-        std::env::var("OPENSHELL_GATEWAY_MCP_ENABLED")
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Ok("0" | "false" | "off")
-    )
-}
-
 /// Create the HTTP router served on the multiplexed gateway port.
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
     let mut router = crate::auth::router(state.clone());
-    if gateway_mcp_enabled() {
+    // `sandbox_mcp_enabled` (TOML `[openshell.gateway]`, env
+    // `OPENSHELL_GATEWAY_MCP_ENABLED`) is read at startup. Turning it off
+    // leaves grants and the CLI working.
+    if state.config.sandbox_mcp_enabled {
         router = router.merge(openshell_gateway_mcp::router(Arc::new(
             crate::children::GatewaySandboxApi::new(state.clone()),
         )));

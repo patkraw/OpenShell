@@ -17,7 +17,8 @@ Start a lead:
 ```shell
 openshell sandbox create --name lead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=1,max_breadth=4,max_total=5,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 4 --grant-max-total 5 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 ```
 

@@ -1448,6 +1448,12 @@ enum GrantCommands {
     /// List grants.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List,
+    /// Show one grant.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Grant id (see `openshell grant list`).
+        grant_id: String,
+    },
     /// Attach a grant to a running top-level sandbox that has none.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
@@ -1595,11 +1601,33 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
-        /// Let this sandbox's tree create child sandboxes through the gateway MCP
-        /// (proof of concept). Example:
-        /// `max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node`.
+        /// Give this sandbox a grant so its tree can create child sandboxes
+        /// through the gateway MCP (proof of concept). Required with any other
+        /// `--grant-*` flag: absolute path of the program allowed to call the
+        /// gateway MCP, e.g. /usr/local/bin/node.
         #[arg(long)]
-        grant: Option<String>,
+        grant_program: Option<String>,
+
+        /// Grant: levels of agents below this sandbox [default: 1].
+        #[arg(long, requires = "grant_program")]
+        grant_max_depth: Option<u32>,
+
+        /// Grant: children per parent [default: 2].
+        #[arg(long, requires = "grant_program")]
+        grant_max_breadth: Option<u32>,
+
+        /// Grant: sandboxes in the whole tree, including this one [default: 3].
+        #[arg(long, requires = "grant_program")]
+        grant_max_total: Option<u32>,
+
+        /// Grant lifetime, e.g. 4h [default: 4h].
+        #[arg(long, requires = "grant_program")]
+        grant_expires: Option<String>,
+
+        /// Grant: `narrow` (agents write their children's policies) or
+        /// `inherit` [default: narrow].
+        #[arg(long, requires = "grant_program")]
+        grant_child_policy: Option<String>,
 
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
@@ -3145,6 +3173,9 @@ async fn run_async() -> Result<()> {
                 GrantCommands::List => {
                     openshell_cli::grant::grant_list(&ctx.endpoint, &tls).await?
                 }
+                GrantCommands::Get { grant_id } => {
+                    openshell_cli::grant::grant_get(&ctx.endpoint, &grant_id, &tls).await?
+                }
                 GrantCommands::Create {
                     sandbox,
                     max_depth,
@@ -3531,7 +3562,12 @@ async fn run_async() -> Result<()> {
                     driver_config_json,
                     providers,
                     policy,
-                    grant,
+                    grant_program,
+                    grant_max_depth,
+                    grant_max_breadth,
+                    grant_max_total,
+                    grant_expires,
+                    grant_child_policy,
                     forward,
                     expose,
                     expose_authorization_mode,
@@ -3550,6 +3586,18 @@ async fn run_async() -> Result<()> {
                     output,
                     command,
                 } => {
+                    // Typed `--grant-*` flags become the grant spec the gateway
+                    // reads at create time.
+                    let grant = grant_program.map(|program| {
+                        format!(
+                            "max_depth={},max_breadth={},max_total={},expires={},program={program},child_policy={}",
+                            grant_max_depth.unwrap_or(1),
+                            grant_max_breadth.unwrap_or(2),
+                            grant_max_total.unwrap_or(3),
+                            grant_expires.as_deref().unwrap_or("4h"),
+                            grant_child_policy.as_deref().unwrap_or("narrow"),
+                        )
+                    });
                     // Resolve --tty / --no-tty into an Option<bool> override.
                     let tty_override = if no_tty {
                         Some(false)

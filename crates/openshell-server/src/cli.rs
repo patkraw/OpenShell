@@ -313,6 +313,17 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_websocket_tunnel: bool,
+
+    /// Serve the gateway MCP endpoint (`/mcp`, proof of concept). Read at
+    /// startup; changing it requires a gateway restart.
+    #[arg(
+        long,
+        env = "OPENSHELL_GATEWAY_MCP_ENABLED",
+        default_value_t = true,
+        action = ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    sandbox_mcp_enabled: bool,
 }
 
 pub fn command() -> Command {
@@ -589,7 +600,8 @@ fn prepare_server_config_with_drivers(
         .with_server_sans(args.server_sans.clone())
         .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
         .with_loopback_service_http(args.enable_loopback_service_http)
-        .with_websocket_tunnel(args.enable_websocket_tunnel);
+        .with_websocket_tunnel(args.enable_websocket_tunnel)
+        .with_sandbox_mcp(args.sandbox_mcp_enabled);
     config
         .service_routing
         .validate(&config.name)
@@ -1379,6 +1391,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.enable_websocket_tunnel = enabled;
     }
+    if let Some(enabled) = file.sandbox_mcp_enabled
+        && arg_defaulted(matches, "sandbox_mcp_enabled")
+    {
+        args.sandbox_mcp_enabled = enabled;
+    }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
     {
@@ -1869,6 +1886,30 @@ mod tests {
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
                 assert!(!args.enable_websocket_tunnel, "CLI flag must override file");
             });
+    }
+
+    #[test]
+    fn sandbox_mcp_is_enabled_by_default_and_can_be_disabled_from_file_or_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_GATEWAY_MCP_ENABLED");
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        assert!(args.sandbox_mcp_enabled);
+
+        let file = config_file_from_toml("[openshell.gateway]\nsandbox_mcp_enabled = false\n");
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(!args.sandbox_mcp_enabled);
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--sandbox-mcp-enabled=on",
+        ]);
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(args.sandbox_mcp_enabled, "CLI flag must override file");
     }
 
     #[test]

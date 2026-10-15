@@ -21,11 +21,14 @@ an agent on the host can create sandboxes as the user. Design:
 | Gateway rules | `crates/openshell-server/src/children.rs` | Implements `SandboxApi`: grants, lineage, the prover check against the parent's policy, limits, retries, tool sandboxes, cascade stop. |
 | Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in every sandbox; forwards with the sandbox's token and the calling program's path. The gateway decides every call. |
 | gRPC API | `proto/openshell.proto` (`CreateChildSandbox`, `ListSandboxGrants`, ...) | The same operations as the MCP tools, for the SDKs and the CLI. Handlers in `children.rs` (`grpc_surface`) call the same rules as MCP. |
-| CLI | `openshell sandbox create --grant ...`, `openshell grant create/list/update/revoke`, `openshell sandbox children` | Start a tree, add a grant to a running sandbox, manage grants, see children. |
+| CLI | `openshell sandbox create --grant-program ... --grant-max-depth ...`, `openshell grant create/get/list/update/revoke`, `openshell sandbox children` | Start a tree, add a grant to a running sandbox, manage grants, see children. |
 | Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `create_grant`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
 
-The MCP endpoint is on by default. Set `OPENSHELL_GATEWAY_MCP_ENABLED=false`
-on the gateway to turn it off; grants and the CLI keep working.
+The MCP endpoint is on by default. It is **startup configuration**: turn it off
+with `sandbox_mcp_enabled = false` in the gateway's `[openshell.gateway]` TOML
+section, `OPENSHELL_GATEWAY_MCP_ENABLED=false`, or `--sandbox-mcp-enabled=false`
+(flag and environment override the file), then **restart the gateway**. Grants
+and the CLI keep working while it is off.
 
 ## Test it
 
@@ -53,7 +56,8 @@ Try it by hand:
 # Start a lead that may create two workers
 target/debug/openshell -g docker-dev sandbox create --name lead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 
 # From inside the lead, through the door (no credential)
@@ -79,16 +83,19 @@ see the script header).
 
 ## Grant options
 
-`--grant` takes comma-separated `key=value` pairs:
+`openshell sandbox create` takes typed `--grant-*` flags, the same options as
+`openshell grant create` (which uses them without the `grant-` prefix).
+`--grant-program` is required as soon as any grant flag is given; the others
+default to `1`, `2`, `3`, `4h` and `narrow`.
 
-| Key | Meaning |
+| Flag | Meaning |
 |-----|---------|
-| `max_depth` | Levels of agents below this sandbox. `1`: its children cannot create agents. Tool sandboxes ignore depth and count only toward breadth and total. |
-| `max_breadth` | Children per parent. |
-| `max_total` | Sandboxes in the tree, including this one. |
-| `expires` | e.g. `4h`. |
-| `program` | Executable allowed to call the gateway MCP from this tree, e.g. `/usr/local/bin/node` for Pi; the gateway refuses other programs with `PROGRAM_NOT_ALLOWED`. |
-| `child_policy` | `narrow` (default): agents write their children's policies (network, filesystem, process, Landlock) within their own policy. `inherit`: every child gets this sandbox's policy unchanged. |
+| `--grant-max-depth` | Levels of agents below this sandbox. `1`: its children cannot create agents. Tool sandboxes ignore depth and count only toward breadth and total. |
+| `--grant-max-breadth` | Children per parent. |
+| `--grant-max-total` | Sandboxes in the tree, including this one. |
+| `--grant-expires` | e.g. `4h`. |
+| `--grant-program` | Executable allowed to call the gateway MCP from this tree, e.g. `/usr/local/bin/node` for Pi; the gateway refuses other programs with `PROGRAM_NOT_ALLOWED`. |
+| `--grant-child-policy` | `narrow` (default): agents write their children's policies (network, filesystem, process, Landlock) within their own policy. `inherit`: every child gets this sandbox's policy unchanged. |
 
 The sandbox's policy (`--policy`) is the ceiling for its children, and each child's policy is the ceiling for its own children, so each level can only narrow. Without one, the
 restrictive default policy is used; a tree never relies on an image's own policy.

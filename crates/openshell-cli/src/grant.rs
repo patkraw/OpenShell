@@ -9,10 +9,11 @@ use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::proto::{
     CreateSandboxGrantRequest, ListChildSandboxesRequest, ListSandboxGrantsRequest,
-    RevokeSandboxGrantRequest, UpdateSandboxGrantRequest, workspace_selector,
+    RevokeSandboxGrantRequest, SandboxGrant, UpdateSandboxGrantRequest, workspace_selector,
 };
 
-pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
+/// Every grant the caller may see, across all pages.
+async fn fetch_grants(server: &str, tls: &TlsOptions) -> Result<Vec<SandboxGrant>> {
     let mut client = grpc_client(server, tls).await?;
     let mut grants = Vec::new();
     let mut page_token = String::new();
@@ -31,6 +32,11 @@ pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
         }
         page_token = page.next_page_token;
     }
+    Ok(grants)
+}
+
+pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
+    let grants = fetch_grants(server, tls).await?;
     if grants.is_empty() {
         println!("No grants found.");
         return Ok(());
@@ -51,6 +57,23 @@ pub async fn grant_list(server: &str, tls: &TlsOptions) -> Result<()> {
             g.user
         );
     }
+    Ok(())
+}
+
+/// Show one grant. Proof of concept: filters `ListSandboxGrants`.
+pub async fn grant_get(server: &str, grant_id: &str, tls: &TlsOptions) -> Result<()> {
+    let grant = fetch_grants(server, tls)
+        .await?
+        .into_iter()
+        .find(|g| g.grant_id == grant_id)
+        .ok_or_else(|| miette::miette!("NOT_FOUND: no grant '{grant_id}'"))?;
+    println!("Grant:       {}", grant.grant_id);
+    println!("Holder:      {}", grant.holder);
+    println!("Max depth:   {}", grant.max_depth);
+    println!("Max breadth: {}", grant.max_breadth);
+    println!("Total:       {}/{}", grant.total, grant.max_total);
+    println!("Program:     {}", grant.program);
+    println!("User:        {}", grant.user);
     Ok(())
 }
 
