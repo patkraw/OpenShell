@@ -25,7 +25,8 @@ Start a lead (its policy, `lead.yaml`, allows GitHub `GET /repos/**` and
 ```shell
 openshell sandbox create --name lead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=1,max_breadth=5,max_total=6,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 5 --grant-max-total 6 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 ```
 
@@ -104,7 +105,8 @@ mcp lead create_sandbox '{"name":"fsrw","command":["sleep","600"],"policy":{"fil
 ```shell
 openshell sandbox create --name ilead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node,child_policy=inherit \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h --grant-child-policy inherit \
   --no-tty --detach -- sleep 3600
 mcp ilead create_sandbox '{"name":"ic1","command":["sleep","600"],"policy":{}}'
 mcp ilead create_sandbox '{"name":"ic1","command":["sleep","600"]}'
@@ -123,7 +125,8 @@ server (`get_issue`) plus `example.com`. The prover cannot check MCP rules, so:
 ```shell
 openshell sandbox create --name mlead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/tutorials/lead-with-mcp.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 mcp mlead create_sandbox '{"name":"mc1","command":["sleep","600"],"policy":{"network_policies":{"example":{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
 mcp mlead create_sandbox '{"name":"mc2","command":["sleep","600"],"policy":{"network_policies":{"github_mcp":{"name":"github_mcp","endpoints":[{"host":"api.githubcopilot.com","port":443,"path":"/mcp","protocol":"mcp","enforcement":"enforce","rules":[{"allow":{"method":"tools/call","tool":"get_issue"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
@@ -144,7 +147,8 @@ mcp mlead create_sandbox '{"name":"mc2","command":["sleep","600"],"policy":{"net
 ```shell
 openshell sandbox create --name dlead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=2,max_breadth=2,max_total=4,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 2 --grant-max-breadth 2 --grant-max-total 4 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 mcp dlead create_sandbox '{"name":"mid","command":["sleep","600"],"policy":{"network_policies":{"github_read":{"name":"github_read","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"GET","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
 mcp mid create_sandbox '{"name":"leaf","command":["true"],"policy":{"network_policies":{"example":{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'

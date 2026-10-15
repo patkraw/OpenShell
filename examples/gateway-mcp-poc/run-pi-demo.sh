@@ -13,7 +13,8 @@ wait_gone() { for _ in $(seq 1 60); do $OS sandbox list 2>/dev/null | grep -q "^
 $OS sandbox delete lead >/dev/null 2>&1; wait_gone lead
 echo "== Starting the lead (one approval: the grant)"
 $OS sandbox create --name lead --from pi-agent:local --policy lead.yaml --provider pi-nvidia \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
   --no-tty --detach -- sleep 3600 >/dev/null
 wait_ready lead || { echo "lead not ready"; exit 1; }
 

@@ -138,6 +138,9 @@ pub struct GatewayFileSection {
     /// Enable the WebSocket tunnel for an authenticated edge proxy.
     #[serde(default)]
     pub enable_websocket_tunnel: Option<bool>,
+    /// Serve the gateway MCP endpoint (`/mcp`). Read at startup only.
+    #[serde(default)]
+    pub sandbox_mcp_enabled: Option<bool>,
 
     // ── Sandbox client TLS ───────────────────────────────────────────────
     #[serde(default)]

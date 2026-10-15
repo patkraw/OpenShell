@@ -34,20 +34,21 @@ The image is Pi's tutorial image plus two MCP clients used below: a small one
 ```shell
 target/debug/openshell -g docker-dev sandbox create --name lead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 ```
 
-`--grant` is the only approval. It means:
+The `--grant-*` flags are the only approval. They mean:
 
-| Key | Here | Meaning |
+| Flag | Here | Meaning |
 |---|---|---|
-| `max_depth` | `1` | the lead's children cannot create agents (tool sandboxes still allowed) |
-| `max_breadth` | `2` | at most two children per parent |
-| `max_total` | `3` | at most three sandboxes in the tree, including the lead |
-| `expires` | `1h` | the grant ends after an hour |
-| `program` | `/usr/local/bin/node` | only Node may call the gateway MCP (Pi runs on Node) |
-| `child_policy` | (default `narrow`) | agents write their children's network rules; `inherit` gives every child the lead's policy |
+| `--grant-max-depth` | `1` | the lead's children cannot create agents (tool sandboxes still allowed) |
+| `--grant-max-breadth` | `2` | at most two children per parent |
+| `--grant-max-total` | `3` | at most three sandboxes in the tree, including the lead |
+| `--grant-expires` | `1h` | the grant ends after an hour |
+| `--grant-program` | `/usr/local/bin/node` | only Node may call the gateway MCP (Pi runs on Node) |
+| `--grant-child-policy` | (default `narrow`) | agents write their children's policies; `inherit` gives every child the lead's policy |
 
 `lead.yaml` becomes the **ceiling** for the lead's children: no child may get
 more. Each child's policy is in turn the ceiling for its own children, so each

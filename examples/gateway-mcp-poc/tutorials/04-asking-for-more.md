@@ -24,7 +24,8 @@ Agent proposals are **off by default**:
 ```shell
 openshell sandbox create --name lead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 openshell settings set lead --key agent_policy_proposals_enabled --value true
 ```

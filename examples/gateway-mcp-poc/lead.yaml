@@ -1,4 +1,4 @@
-# The lead's policy. With --grant it is also the ceiling for the lead's children: no child may get more.
+# The lead's policy. With --grant-program it is also the ceiling for the lead's children: no child may get more.
 version: 1
 filesystem_policy:
   include_workdir: true

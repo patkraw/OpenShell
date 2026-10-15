@@ -1,4 +1,4 @@
-// Inside a sandbox started with --grant: create a tool sandbox through the
+// Inside a sandbox started with a grant: create a tool sandbox through the
 // supervisor door with the official MCP TypeScript SDK, run a command in it,
 // read the result and stop it. No credential: the door adds the sandbox's token.
 //

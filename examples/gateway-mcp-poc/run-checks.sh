@@ -15,7 +15,8 @@ wait_ready() { for _ in $(seq 1 60); do $OS sandbox get "$1" 2>/dev/null | grep 
 wait_gone() { for _ in $(seq 1 60); do $OS sandbox list 2>/dev/null | grep -q "^$1 " || return 0; sleep 2; done; }
 $OS sandbox delete lead >/dev/null 2>&1; wait_gone lead
 $OS sandbox create --name lead --from pi-agent:local --policy lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 4h \
   --no-tty --detach -- sleep 3600 >/dev/null 2>&1
 wait_ready lead || { echo "lead did not become ready"; exit 1; }
 
@@ -54,6 +55,8 @@ if [[ "$out" == *NOT_ALLOWED* || "$out" == *LIMIT_REACHED* ]]; then check "third
 echo "== Grant changes"
 check "a sandbox cannot change grants" "$(mcp lead grant_update '{"grant_id":"x","max_total":9}')" "NOT_ALLOWED"
 gid=$(mcp lead get_limits | python3 -c 'import json,sys; print(json.load(sys.stdin)["grant_id"])')
+check "grant get shows the lead's grant" "$($OS grant get "$gid" 2>&1)" "Holder:      lead"
+check "grant get on an unknown id is NOT_FOUND" "$($OS grant get gr-nope 2>&1)" "NOT_FOUND"
 check "the user widens the grant (depth 2, breadth 9, total 10)" "$(user_mcp grant_update grant_id="$gid" max_depth=2 max_breadth=9 max_total=10)" '"max_depth": 2'
 check "lead can create again after widening" "$(mcp lead create_sandbox '{"name":"w3","command":["sh","-c","echo result-from-w3; exit 0"],"lifetime":"until_exit"}')" '"handle":"w3"'
 check "w1, a leaf before, creates a child at once (no policy change)" "$(mcp w1 create_sandbox '{"name":"g1","command":["sleep","60"]}')" '"handle":"g1"'
@@ -97,7 +100,8 @@ $OS sandbox delete hostlead >/dev/null 2>&1
 echo "== Each level can only narrow (child proved against its parent's policy)"
 $OS sandbox delete deeplead >/dev/null 2>&1; wait_gone deeplead
 $OS sandbox create --name deeplead --from pi-agent:local --policy lead.yaml \
-  --grant max_depth=2,max_breadth=2,max_total=5,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 2 --grant-max-breadth 2 --grant-max-total 5 --grant-expires 1h \
   --no-tty --detach -- sleep 3600 >/dev/null 2>&1
 wait_ready deeplead || echo "deeplead did not become ready"
 GH_ONLY='{"name":"mid","command":["sleep","3600"],"policy":{"network_policies":{"github_read":{"name":"github_read","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"GET","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'

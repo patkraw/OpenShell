@@ -1,7 +1,8 @@
 # 01 · CLI: your first tree
 
 **Goal:** start a sandbox that may create children, then manage its **grant**
-with the CLI: list, widen, revoke, attach one later, and delete a whole tree.
+with the CLI: list, show, widen, revoke, attach one later, and delete a whole
+tree.
 
 Setup: [00](00-setup.md), plus the shell setup from the [index](README.md).
 
@@ -10,7 +11,8 @@ Setup: [00](00-setup.md), plus the shell setup from the [index](README.md).
 ```shell
 openshell sandbox create --name lead --from pi-agent:local \
   --policy examples/gateway-mcp-poc/lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=1h,program=/usr/local/bin/node \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 ```
 
@@ -20,10 +22,10 @@ Created sandbox: lead
 
 The **grant** is the only approval:
 
-- **`max_depth=1`**: the lead's children cannot create agents.
-- **`max_breadth=2`**: at most two children per parent.
-- **`max_total=3`**: at most three sandboxes in the tree, the lead included.
-- **`program`**: only Node (Pi runs on Node) may call the gateway MCP.
+- **`--grant-max-depth 1`**: the lead's children cannot create agents.
+- **`--grant-max-breadth 2`**: at most two children per parent.
+- **`--grant-max-total 3`**: at most three sandboxes in the tree, the lead included.
+- **`--grant-program`** (required): only Node (Pi runs on Node) may call the gateway MCP.
 - **`lead.yaml`** is the most any child of the lead can get.
 
 ```shell
@@ -34,6 +36,24 @@ openshell grant list
 GRANT          HOLDER           DEPTH BREADTH     TOTAL PROGRAM                USER
 gr-f362e047    lead                 1       2       1/3 /usr/local/bin/node    unauthenticated-local-dev
 ```
+
+Show one grant in detail:
+
+```shell
+openshell grant get gr-f362e047
+```
+
+```text
+Grant:       gr-f362e047
+Holder:      lead
+Max depth:   1
+Max breadth: 2
+Total:       1/3
+Program:     /usr/local/bin/node
+User:        unauthenticated-local-dev
+```
+
+An unknown id gives `NOT_FOUND: no grant '<id>'`.
 
 ## 2. Let the lead create children
 
@@ -147,7 +167,7 @@ Clean up: `openshell sandbox delete plain`.
 
 ## What you learned
 
-- A **grant** is set at create (`--grant`) or attached later (`grant create`),
+- A **grant** is set at create (`--grant-*` flags) or attached later (`grant create`),
   and only the user can change it.
 - **`grant update`** and **`revoke`** take effect on the tree's next call.
 - **Deleting a parent** deletes its whole subtree.

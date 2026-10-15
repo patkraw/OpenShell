@@ -222,6 +222,10 @@ pub struct Config {
     /// Disabled for local gateways by default.
     pub enable_websocket_tunnel: bool,
 
+    /// Serve the gateway MCP endpoint (`/mcp`, proof of concept). Read at
+    /// startup; changing it requires a gateway restart.
+    pub sandbox_mcp_enabled: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -883,6 +887,7 @@ impl Config {
             oidc: None,
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
+            sandbox_mcp_enabled: true,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
@@ -1061,6 +1066,13 @@ impl Config {
     #[must_use]
     pub const fn with_websocket_tunnel(mut self, enabled: bool) -> Self {
         self.enable_websocket_tunnel = enabled;
+        self
+    }
+
+    /// Serve the gateway MCP endpoint.
+    #[must_use]
+    pub const fn with_sandbox_mcp(mut self, enabled: bool) -> Self {
+        self.sandbox_mcp_enabled = enabled;
         self
     }
 }
