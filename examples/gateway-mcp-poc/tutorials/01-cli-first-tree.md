@@ -34,17 +34,25 @@ openshell grant list
 
 ```text
 GRANT          HOLDER           DEPTH BREADTH     TOTAL PROGRAM                USER
-gr-f362e047    lead                 1       2       1/3 /usr/local/bin/node    unauthenticated-local-dev
+gr-2762cacc    lead                 1       2       1/3 /usr/local/bin/node    unauthenticated-local-dev
+```
+
+Your grant id differs from the one shown. Keep it in a variable for the next
+steps (the name `GID` is taken in zsh, so use `GRANT_ID`):
+
+```shell
+GRANT_ID=$(openshell grant list | awk '$2=="lead"{print $1}')
+echo "$GRANT_ID"
 ```
 
 Show one grant in detail:
 
 ```shell
-openshell grant get gr-f362e047
+openshell grant get "$GRANT_ID"
 ```
 
 ```text
-Grant:       gr-f362e047
+Grant:       gr-2762cacc
 Holder:      lead
 Max depth:   1
 Max breadth: 2
@@ -84,30 +92,61 @@ mcp lead create_sandbox '{"name":"w2","command":["sleep","600"]}'
 ## 3. Widen the grant
 
 ```shell
-openshell grant update gr-f362e047 --max-breadth 3 --max-total 4
+openshell grant update "$GRANT_ID" --max-breadth 3 --max-total 4
 mcp lead create_sandbox '{"name":"w2","command":["sleep","600"]}'
 ```
 
 ```text
-✓ Grant gr-f362e047 updated: max_depth=1 max_breadth=3 max_total=4 (applies from the next call)
+✓ Grant gr-2762cacc updated: max_depth=1 max_breadth=3 max_total=4 (applies from the next call)
 {"isError":false,"can_create_children":false,"depth":1,"handle":"w2","kind":"agent",...}
 ```
 
 - **Applies on the next call.** No restart, no policy change.
 - `update` changes only depth, breadth and total. For `expires`, `program` or
-  `child_policy`, revoke and create a new grant.
+  `child_policy`, revoke the grant and create a new one (step 4).
 
-## 4. Revoke it
+## 4. Revoke it, then replace it
 
 ```shell
-openshell grant revoke gr-f362e047
+openshell grant revoke "$GRANT_ID"
 mcp lead create_sandbox '{"name":"w3","command":["sleep","600"]}'
 ```
 
 ```text
-✓ Grant gr-f362e047 revoked: its tree can create no more children
+✓ Grant gr-2762cacc revoked: its tree can create no more children
 {"isError":true,"error":"NOT_ALLOWED","message":"grant revoked"}
 ```
+
+The tree keeps running. Give it a **new** grant, for example with a different
+budget or program:
+
+```shell
+openshell grant create lead --program /usr/local/bin/node \
+  --max-depth 1 --max-breadth 4 --max-total 5 --expires 1h
+GRANT_ID=$(openshell grant list | awk '$2=="lead"{print $1}')
+openshell grant get "$GRANT_ID"
+mcp lead create_sandbox '{"name":"w3","command":["sleep","600"]}'
+```
+
+```text
+✓ Grant gr-f76157c2 attached to lead: max_depth=1 max_breadth=4 max_total=5 program=/usr/local/bin/node
+Grant:       gr-f76157c2
+Holder:      lead
+Max depth:   1
+Max breadth: 4
+Total:       3/5
+Program:     /usr/local/bin/node
+User:        unauthenticated-local-dev
+{"isError":false,"can_create_children":false,"depth":1,"handle":"w3","kind":"agent",...}
+```
+
+- **The running children count** toward the new grant (`3/5`: lead and two
+  children).
+- Replacing works only after a **revoke** or once the grant has **expired**.
+  While a grant is active, `grant create` says `ALREADY_EXISTS: 'lead' already
+  holds grant ...; revoke it first to replace it`.
+- Only the user who set a grant (or a Workspace Admin) can see, change, revoke
+  or replace it.
 
 ## 5. Attach a grant to a running sandbox
 
@@ -136,7 +175,8 @@ mcp plain create_sandbox '{"name":"p1","command":["sleep","600"]}'
 {"isError":false,"can_create_children":false,"depth":1,"handle":"p1","kind":"agent",...}
 ```
 
-- Only **top-level** sandboxes **without** a grant can get one this way.
+- Only **top-level** sandboxes can get one this way: a child is covered by its
+  tree's grant.
 
 ## 6. Delete a tree
 
@@ -152,6 +192,7 @@ lead   2026-10-14 22:43:03  Ready
 w1     2026-10-14 22:43:04  Ready
 t1     2026-10-14 22:43:05  Ready
 w2     2026-10-14 22:43:05  Ready
+w3     2026-10-14 22:43:05  Ready
 plain  2026-10-14 22:43:06  Ready
 p1     2026-10-14 22:43:07  Ready
 
@@ -162,7 +203,7 @@ plain  2026-10-14 22:43:06  Ready
 p1     2026-10-14 22:43:07  Ready
 ```
 
-**Deleting a parent stops its children first** (`w1`, `t1`, `w2` are gone).
+**Deleting a parent stops its children first** (`w1`, `t1`, `w2`, `w3` are gone).
 Clean up: `openshell sandbox delete plain`.
 
 ## What you learned

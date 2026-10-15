@@ -109,7 +109,9 @@ target/debug/openshell -g docker-dev sandbox exec lead -- \
 ### Getting results
 
 `wait` reports when a child is ready or has exited; `get_file` reads a file from
-a running child:
+a running child. READY does not mean an agent child has finished: have it write
+its result to a temporary file and rename it into place, then poll `get_file`
+until the file exists ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)):
 
 ```shell
 target/debug/openshell -g docker-dev sandbox exec lead -- \
@@ -239,5 +241,7 @@ target/debug/openshell -g docker-dev sandbox delete sdk-lead
 examples/gateway-mcp-poc/run-checks.sh
 ```
 
-37 checks: grants, the door, refusals, retries, tool sandboxes, the user on the
-host, `child_policy=inherit`, and cascade stop.
+It checks grants (including revoke and replace), the program check, refusals,
+retries and concurrent duplicates, tool sandboxes, child policies, the proposal
+flow, the user on the host, and cascade stop. The current result is in the
+[README](README.md#results).

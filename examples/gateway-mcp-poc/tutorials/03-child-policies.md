@@ -138,9 +138,45 @@ mcp mlead create_sandbox '{"name":"mc2","command":["sleep","600"],"policy":{"net
 ```
 
 - The parent can still create children for **everything else**.
-- It **cannot pass on** its MCP rule. To give a child a whole MCP server, write
-  it as a REST rule on the server's `/mcp` path (see the RFC, "Other MCP
-  servers").
+- It **cannot pass on** its MCP rule in `narrow` mode.
+- **Rewriting the child's rule as REST does not help on its own.** A REST rule
+  on the server's `/mcp` path is checked like any rule, against the parent's
+  policy, and this parent allows that server only through the MCP rule the
+  prover cannot see:
+
+```shell
+mcp mlead create_sandbox '{"name":"mc3","command":["sleep","600"],"policy":{"network_policies":{"github_mcp":{"name":"github_mcp","endpoints":[{"host":"api.githubcopilot.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"POST","path":"/mcp"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
+```
+
+```text
+{"isError":true,"error":"EXCEEDS_CEILING","message":"child policy exceeds the parent's policy; counterexample: Network { ... host: \"api.githubcopilot.com\", ... method: Some(\"POST\"), path: Some(\"/mcp\") }. ..."}
+```
+
+  For a child to get a whole MCP server as REST, the **parent** must also allow
+  that REST access (`POST` on `/mcp`, and `GET`/`DELETE` if the child gets them),
+  for example by holding the server as a REST rule itself:
+
+```yaml
+  github_mcp_rest:
+    name: github_mcp_rest
+    endpoints:
+      - host: api.githubcopilot.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {method: POST, path: /mcp}
+          - allow: {method: GET, path: /mcp}
+    binaries:
+      - path: /usr/local/bin/node
+```
+
+- **`inherit` does pass MCP rules down.** With `--grant-child-policy inherit`
+  the child receives the parent's policy unchanged, MCP rules included; the
+  proof is skipped because the policy is the parent's own. Started from
+  `lead-with-mcp.yaml` with `inherit`, a child's policy (`openshell sandbox get
+  <child> --policy-only`) contains the same `github_mcp` rule with
+  `protocol: mcp` and `tool: get_issue`.
 
 ## 6. Grandchildren are bounded by their own parent
 
@@ -174,5 +210,6 @@ for s in lead ilead mlead dlead; do openshell sandbox delete $s; done
   can only narrow.
 - Agents may narrow **network, filesystem, process and Landlock**; refusals
   carry a **counterexample**.
-- **`inherit`** copies the parent's policy; **MCP rules** stay with the
-  parent.
+- **`inherit`** copies the parent's policy, MCP rules included. In `narrow`
+  mode MCP rules stay with the parent, and a REST rewrite only works if the
+  parent allows that REST access too.

@@ -9,7 +9,15 @@ other tutorials use.
 - The **Rust toolchain** from `rust-toolchain.toml`, **mise**, and **uv**.
 - About 10 minutes for the first build.
 
-## 1. Start the dev gateway
+## 1. Get the code
+
+```shell
+git clone https://github.com/patkraw/OpenShell.git && cd OpenShell && git checkout gateway-mcp-poc
+```
+
+Every command in these tutorials runs from this repository root.
+
+## 2. Start the dev gateway
 
 In a terminal of its own, from the repository root:
 
@@ -31,7 +39,7 @@ off, set `sandbox_mcp_enabled = false` under `[openshell.gateway]` in the
 gateway's TOML config (or `OPENSHELL_GATEWAY_MCP_ENABLED=false`) and restart the
 gateway.
 
-## 2. Build the CLI and the agent image
+## 3. Build the CLI and the agent image
 
 In a second terminal, from the repository root:
 
@@ -43,7 +51,7 @@ docker build -t pi-agent:local -f examples/gateway-mcp-poc/Dockerfile.pi example
 - `pi-agent:local` is Pi's image plus two MCP clients: a tiny one
   (`mcp-client.mjs`) and the official TypeScript MCP SDK.
 
-## 3. Set up your shell
+## 4. Set up your shell
 
 ```shell
 export PATH="$PWD/target/debug:$PATH" OPENSHELL_GATEWAY=docker-dev
@@ -78,9 +86,11 @@ No sandboxes found.
 - **`docker-dev` missing from `gateway list`:** register it by hand:
   `openshell gateway add http://127.0.0.1:18080 --name docker-dev`.
 - **Sandbox stuck in `Provisioning`, or "image not found":** build
-  `pi-agent:local` (step 2) and check `docker images pi-agent:local`.
+  `pi-agent:local` (step 3) and check `docker images pi-agent:local`.
 - **The first sandbox takes a minute:** the supervisor image is still being
   prepared. Later sandboxes start in seconds.
+- **Grants are gone after a gateway restart:** the proof of concept keeps
+  grants and lineage in memory. Delete old sandboxes and start again.
 
 ## Clean up
 

@@ -93,6 +93,42 @@ mcp lead stop_sandbox '{"handle":"t1"}'
 - A child that has **exited** leaves only its **exit code**; read files
   while it runs. A results channel is future work.
 
+### Collect an agent child's result
+
+**`wait` reporting READY does not mean the result exists.** READY means the
+child's sandbox is up; its agent may still be working. Use an explicit "done"
+signal: the child writes its result to a temporary file and **renames** it into
+place (a rename is atomic, so the parent never reads half a file), and keeps
+running. The parent polls `get_file` until the file is there:
+
+```shell
+mcp lead create_sandbox '{"name":"rev","command":["sh","-c","sleep 20; echo \"review: LGTM, 2 nits\" > /tmp/result.tmp && mv /tmp/result.tmp /tmp/result.txt; sleep 600"]}'
+mcp lead wait '{"handle":"rev","timeout_s":60}'
+mcp lead get_file '{"handle":"rev","path":"/tmp/result.txt"}'
+```
+
+```text
+{"isError":false,...,"handle":"rev","kind":"agent","lifetime":"until_stopped"}
+{"isError":false,"exit_code":null,"handle":"rev","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":true,"error":"FILE_ERROR","message":"cat: /tmp/result.txt: No such file or directory"}
+```
+
+Not there yet. Poll until it is, then stop the child:
+
+```shell
+until mcp lead get_file '{"handle":"rev","path":"/tmp/result.txt"}' | grep -q '"isError":false'; do sleep 2; done
+mcp lead get_file '{"handle":"rev","path":"/tmp/result.txt"}'
+mcp lead stop_sandbox '{"handle":"rev"}'
+```
+
+```text
+{"isError":false,"content":"review: LGTM, 2 nits\n","handle":"rev","path":"/tmp/result.txt"}
+{"isError":false,"handle":"rev","stopped":true}
+```
+
+- **Don't use `lifetime: until_exit` for results you still need to read:** the
+  files go away when the child exits.
+
 ## 4. Refusals, and why
 
 | You try | You get | Why |
