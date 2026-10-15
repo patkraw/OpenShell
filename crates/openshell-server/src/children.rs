@@ -92,8 +92,8 @@ pub struct Grant {
     pub program: String,
     pub expires_at_ms: i64,
     pub total: u32,
-    /// request_id -> child sandbox name (first result).
-    pub request_ids: HashMap<String, String>,
+    /// Workspace of the holder; Workspace Admins of it may manage the grant.
+    pub workspace: String,
 }
 
 /// Who created whom. Separate from the sandbox record (no owner field).
@@ -113,10 +113,156 @@ pub struct Lineage {
     pub last_used_ms: i64,
 }
 
+/// A retried `create_sandbox` by `request_id`, scoped to the parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestState {
+    /// The first request is still launching the child.
+    InFlight,
+    /// The first request created this child (sandbox name).
+    Done(String),
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     grants: HashMap<String, Grant>,
     lineage: HashMap<String, Lineage>,
+    /// (parent sandbox id, request_id) -> state of the first request.
+    requests: HashMap<(String, String), RequestState>,
+}
+
+/// The outcome of reserving a child slot under the grant.
+#[derive(Debug)]
+enum Reservation {
+    /// A slot is reserved; counters are already charged.
+    Reserved { depth: u32, grant: Grant },
+    /// The same parent already created a child for this `request_id`.
+    Repeated(String),
+}
+
+/// Why a sandbox in a tree may not create a child of `kind` now.
+fn check_limits(
+    lineage: &Lineage,
+    grant: Option<&Grant>,
+    kind: &str,
+    now: i64,
+) -> Result<Grant, ToolError> {
+    if lineage.kind == KIND_TOOL {
+        return Err(terr("NOT_ALLOWED", "tool sandboxes cannot create children"));
+    }
+    let grant = grant.ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
+    if now > grant.expires_at_ms {
+        return Err(terr("NOT_ALLOWED", "grant expired"));
+    }
+    if kind == KIND_AGENT && lineage.depth >= grant.max_depth {
+        return Err(terr(
+            "LIMIT_REACHED",
+            format!("depth: {} of {}", lineage.depth, grant.max_depth),
+        ));
+    }
+    if lineage.children_created >= grant.max_breadth {
+        return Err(terr(
+            "LIMIT_REACHED",
+            format!(
+                "breadth: {} of {}",
+                lineage.children_created, grant.max_breadth
+            ),
+        ));
+    }
+    if grant.total >= grant.max_total {
+        return Err(terr(
+            "LIMIT_REACHED",
+            format!("total: {} of {}", grant.total, grant.max_total),
+        ));
+    }
+    Ok(grant.clone())
+}
+
+impl Inner {
+    /// Check every limit and charge the counters in one step, under the lock,
+    /// so concurrent creates cannot both take the last slot. A `request_id`
+    /// is marked in flight here, before the child is launched, so a duplicate
+    /// either gets the first child's handle or `IN_PROGRESS`, never a second
+    /// child.
+    fn reserve(
+        &mut self,
+        parent_id: &str,
+        kind: &str,
+        request_id: Option<&str>,
+        now: i64,
+    ) -> Result<Reservation, ToolError> {
+        if let Some(rid) = request_id {
+            match self.requests.get(&(parent_id.to_string(), rid.to_string())) {
+                Some(RequestState::Done(handle)) => {
+                    return Ok(Reservation::Repeated(handle.clone()));
+                }
+                Some(RequestState::InFlight) => {
+                    return Err(terr(
+                        "IN_PROGRESS",
+                        format!("request_id '{rid}' is still being created; retry shortly"),
+                    ));
+                }
+                None => {}
+            }
+        }
+        let lineage = self
+            .lineage
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| terr("NOT_ALLOWED", "this sandbox has no grant"))?;
+        let grant = check_limits(&lineage, self.grants.get(&lineage.grant_id), kind, now)?;
+        if let Some(g) = self.grants.get_mut(&grant.id) {
+            g.total += 1;
+        }
+        if let Some(l) = self.lineage.get_mut(parent_id) {
+            l.children_created += 1;
+        }
+        if let Some(rid) = request_id {
+            self.requests.insert(
+                (parent_id.to_string(), rid.to_string()),
+                RequestState::InFlight,
+            );
+        }
+        Ok(Reservation::Reserved {
+            depth: lineage.depth + 1,
+            grant,
+        })
+    }
+
+    /// Undo a reservation whose child was not created.
+    fn release(&mut self, parent_id: &str, grant_id: &str, request_id: Option<&str>) {
+        if let Some(g) = self.grants.get_mut(grant_id) {
+            g.total = g.total.saturating_sub(1);
+        }
+        if let Some(l) = self.lineage.get_mut(parent_id) {
+            l.children_created = l.children_created.saturating_sub(1);
+        }
+        if let Some(rid) = request_id {
+            self.requests
+                .remove(&(parent_id.to_string(), rid.to_string()));
+        }
+    }
+
+    /// Record the child a reserved `request_id` created.
+    fn complete(&mut self, parent_id: &str, request_id: Option<&str>, handle: &str) {
+        if let Some(rid) = request_id {
+            self.requests.insert(
+                (parent_id.to_string(), rid.to_string()),
+                RequestState::Done(handle.to_string()),
+            );
+        }
+    }
+
+    /// The grant as returned to users.
+    fn grant_json(&self, g: &Grant) -> Value {
+        let holder = self
+            .lineage
+            .get(&g.holder_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        json!({"grant_id": g.id, "holder": holder, "max_depth": g.max_depth,
+               "max_breadth": g.max_breadth, "max_total": g.max_total, "total": g.total,
+               "program": g.program, "user": g.user.subject, "workspace": g.workspace})
+    }
 }
 
 #[derive(Debug, Default)]
@@ -178,6 +324,7 @@ impl ChildrenState {
         let mut inner = self.lock();
         inner.lineage.remove(sandbox_id);
         inner.grants.retain(|_, g| g.holder_id != sandbox_id);
+        inner.requests.retain(|(parent, _), _| parent != sandbox_id);
     }
 }
 
@@ -319,6 +466,46 @@ pub fn prepare_granted_create(
     Ok(Some(grant))
 }
 
+/// A new grant held by `holder`, with `total` sandboxes already in its tree.
+fn new_grant(user: &UserPrincipal, holder: &Sandbox, spec: GrantSpec, total: u32) -> Grant {
+    let expires_ms = i64::try_from(spec.expires.as_millis()).unwrap_or(i64::MAX);
+    Grant {
+        id: format!("gr-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        user: user.identity.clone(),
+        holder_id: holder.object_id().to_string(),
+        max_depth: spec.max_depth,
+        max_breadth: spec.max_breadth,
+        max_total: spec.max_total,
+        program: spec.program,
+        inherit_child_policy: spec.inherit_child_policy,
+        expires_at_ms: now_ms().saturating_add(expires_ms),
+        total,
+        workspace: holder.object_workspace().to_string(),
+    }
+}
+
+/// Whether `principal` may see and manage `grant`: the user who set it, or a
+/// Workspace Admin of the holder's workspace.
+async fn may_manage_grant(
+    state: &ServerState,
+    principal: &Principal,
+    user: &UserPrincipal,
+    grant: &Grant,
+) -> bool {
+    if grant.user.subject == user.identity.subject {
+        return true;
+    }
+    crate::auth::workspace_authz::authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        principal,
+        &grant.workspace,
+        crate::auth::workspace_authz::MinWorkspaceRole::Admin,
+    )
+    .await
+    .is_ok()
+}
+
 pub fn register_granted_sandbox(
     state: &ServerState,
     principal: &Principal,
@@ -328,25 +515,10 @@ pub fn register_granted_sandbox(
     let Principal::User(user) = principal else {
         return None;
     };
-    let grant_id = format!("gr-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let expires_ms = i64::try_from(grant.expires.as_millis()).unwrap_or(i64::MAX);
+    let new = new_grant(user, sandbox, grant, 1);
+    let grant_id = new.id.clone();
     let mut inner = state.children.lock();
-    inner.grants.insert(
-        grant_id.clone(),
-        Grant {
-            id: grant_id.clone(),
-            user: user.identity.clone(),
-            holder_id: sandbox.object_id().to_string(),
-            max_depth: grant.max_depth,
-            max_breadth: grant.max_breadth,
-            max_total: grant.max_total,
-            program: grant.program,
-            inherit_child_policy: grant.inherit_child_policy,
-            expires_at_ms: now_ms().saturating_add(expires_ms),
-            total: 1,
-            request_ids: HashMap::new(),
-        },
-    );
+    inner.grants.insert(grant_id.clone(), new);
     inner.lineage.insert(
         sandbox.object_id().to_string(),
         Lineage {
@@ -367,8 +539,10 @@ pub fn register_granted_sandbox(
     Some(grant_id)
 }
 
-/// A user attaches a grant to a running top-level sandbox that has none. The
-/// sandbox becomes the holder; its current policy bounds its children.
+/// A user attaches a grant to a running top-level sandbox. The sandbox becomes
+/// the holder; its current policy bounds its children. If the sandbox already
+/// holds a grant that was revoked or has expired, the new grant replaces it
+/// for the whole tree: running children stay, and count toward the new total.
 async fn grant_create(
     state: &Arc<ServerState>,
     user: &UserPrincipal,
@@ -382,35 +556,70 @@ async fn grant_create(
         .await
         .map_err(|e| terr("INTERNAL", e.to_string()))?
         .ok_or_else(|| terr("NOT_FOUND", format!("sandbox '{sandbox_name}' not found")))?;
-    if let Some(l) = state.children.lineage(sandbox.object_id()) {
-        return Err(if l.parent_id.is_some() {
-            terr(
-                "NOT_ALLOWED",
-                format!(
-                    "'{sandbox_name}' is a child in a tree; its tree's grant already covers it"
-                ),
-            )
-        } else {
-            terr(
-                "ALREADY_EXISTS",
-                format!("'{sandbox_name}' already holds grant {}", l.grant_id),
-            )
-        });
-    }
     let grant = parse_grant_spec(spec).map_err(|e| terr("INVALID_ARGUMENT", e))?;
     let principal = Principal::User(user.clone());
-    let grant_id = register_granted_sandbox(state, &principal, &sandbox, grant)
-        .ok_or_else(|| terr("INTERNAL", "grant not registered"))?;
-    info!(grant_id = %grant_id, holder = %sandbox_name, user = %user.identity.subject, "mcp: grant attached to a running sandbox");
-    grant_list(state)
-        .get("grants")
-        .and_then(Value::as_array)
-        .and_then(|gs| {
-            gs.iter()
-                .find(|g| g["grant_id"] == grant_id.as_str())
-                .cloned()
-        })
-        .ok_or_else(|| terr("INTERNAL", "grant not found after registration"))
+    let Some(holder) = state.children.lineage(sandbox.object_id()) else {
+        let grant_id = register_granted_sandbox(state, &principal, &sandbox, grant)
+            .ok_or_else(|| terr("INTERNAL", "grant not registered"))?;
+        info!(grant_id = %grant_id, holder = %sandbox_name, user = %user.identity.subject, "mcp: grant attached to a running sandbox");
+        return grant_by_id(state, &grant_id);
+    };
+    if holder.parent_id.is_some() {
+        return Err(terr(
+            "NOT_ALLOWED",
+            format!("'{sandbox_name}' is a child in a tree; its tree's grant already covers it"),
+        ));
+    }
+    // The tree's current grant: active means no replacement; an expired one
+    // may only be replaced by someone who may manage it.
+    if let Some(old) = state.children.grant(&holder.grant_id) {
+        if now_ms() <= old.expires_at_ms {
+            return Err(terr(
+                "ALREADY_EXISTS",
+                format!(
+                    "'{sandbox_name}' already holds grant {}; revoke it first to replace it",
+                    old.id
+                ),
+            ));
+        }
+        if !may_manage_grant(state, &principal, user, &old).await {
+            return Err(terr(
+                "NOT_ALLOWED",
+                "only the user who set the expired grant, or a Workspace Admin, can replace it",
+            ));
+        }
+    }
+    let grant_id = {
+        let mut inner = state.children.lock();
+        let old_id = holder.grant_id.clone();
+        let total = u32::try_from(
+            inner
+                .lineage
+                .values()
+                .filter(|l| l.grant_id == old_id)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let new = new_grant(user, &sandbox, grant, total);
+        let new_id = new.id.clone();
+        inner.grants.remove(&old_id);
+        inner.grants.insert(new_id.clone(), new);
+        for l in inner.lineage.values_mut().filter(|l| l.grant_id == old_id) {
+            l.grant_id = new_id.clone();
+        }
+        new_id
+    };
+    info!(grant_id = %grant_id, holder = %sandbox_name, user = %user.identity.subject, "mcp: grant replaced for an existing tree");
+    grant_by_id(state, &grant_id)
+}
+
+fn grant_by_id(state: &ServerState, grant_id: &str) -> Result<Value, ToolError> {
+    let inner = state.children.lock();
+    let g = inner
+        .grants
+        .get(grant_id)
+        .ok_or_else(|| terr("INTERNAL", "grant not found after registration"))?;
+    Ok(inner.grant_json(g))
 }
 
 /// Stop a sandbox's children, deepest first, before the sandbox itself.
@@ -474,50 +683,28 @@ fn terr(code: &'static str, message: impl Into<String>) -> ToolError {
     }
 }
 
-/// Why `sandbox_id` may not create a child, if it may not.
 /// Whether `sandbox_id` may create a child of `kind` now. Tool sandboxes
 /// ignore the depth limit, so a sandbox at the bottom of the tree can still
 /// run commands in its own tool sandboxes; they count toward breadth and total.
+/// Used for early refusals and `get_limits`; `Inner::reserve` repeats the
+/// checks under the lock when the slot is taken.
 fn can_create(
     state: &ServerState,
     sandbox_id: &str,
     kind: &str,
 ) -> Result<(Lineage, Grant), ToolError> {
-    let lineage = state
-        .children
-        .lineage(sandbox_id)
+    let inner = state.children.lock();
+    let lineage = inner
+        .lineage
+        .get(sandbox_id)
+        .cloned()
         .ok_or_else(|| terr("NOT_ALLOWED", "this sandbox has no grant"))?;
-    if lineage.kind == KIND_TOOL {
-        return Err(terr("NOT_ALLOWED", "tool sandboxes cannot create children"));
-    }
-    let grant = state
-        .children
-        .grant(&lineage.grant_id)
-        .ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
-    if now_ms() > grant.expires_at_ms {
-        return Err(terr("NOT_ALLOWED", "grant expired"));
-    }
-    if kind == KIND_AGENT && lineage.depth >= grant.max_depth {
-        return Err(terr(
-            "LIMIT_REACHED",
-            format!("depth: {} of {}", lineage.depth, grant.max_depth),
-        ));
-    }
-    if lineage.children_created >= grant.max_breadth {
-        return Err(terr(
-            "LIMIT_REACHED",
-            format!(
-                "breadth: {} of {}",
-                lineage.children_created, grant.max_breadth
-            ),
-        ));
-    }
-    if grant.total >= grant.max_total {
-        return Err(terr(
-            "LIMIT_REACHED",
-            format!("total: {} of {}", grant.total, grant.max_total),
-        ));
-    }
+    let grant = check_limits(
+        &lineage,
+        inner.grants.get(&lineage.grant_id),
+        kind,
+        now_ms(),
+    )?;
     Ok((lineage, grant))
 }
 
@@ -609,11 +796,13 @@ impl SandboxApi for GatewaySandboxApi {
                 Ok(list_children(state, &s.sandbox_id))
             }
             (Principal::Sandbox(s), Operation::GetLimits) => Ok(get_limits(state, &s.sandbox_id)),
-            (Principal::User(_), Operation::GrantList) => Ok(grant_list(state)),
+            (Principal::User(u), Operation::GrantList) => Ok(grant_list(state, caller, u).await),
             (Principal::User(u), Operation::GrantCreate(a)) => {
                 grant_create(state, u, "default", &a.sandbox, &a.grant).await
             }
-            (Principal::User(u), Operation::GrantUpdate(a)) => grant_update(state, u, &val(&a)),
+            (Principal::User(u), Operation::GrantUpdate(a)) => {
+                grant_update(state, caller, u, &val(&a)).await
+            }
             (_, Operation::GrantList | Operation::GrantCreate(_) | Operation::GrantUpdate(_)) => {
                 Err(terr("NOT_ALLOWED", "only the user can change grants"))
             }
@@ -810,13 +999,24 @@ async fn create_child(
     caller_id: &str,
     args: &Value,
 ) -> Result<Value, ToolError> {
-    // 1. Retry: same request_id returns the first result, counted once.
+    // 1. Retry: the same parent and request_id return the first result,
+    //    counted once. A duplicate that arrives while the first is still
+    //    launching gets IN_PROGRESS (checked again when the slot is reserved).
     let request_id = str_arg(args, "request_id").map(str::to_string);
-    if let (Some(rid), Some(l)) = (&request_id, state.children.lineage(caller_id))
-        && let Some(g) = state.children.grant(&l.grant_id)
-        && let Some(name) = g.request_ids.get(rid)
-    {
-        return Ok(json!({"handle": name, "repeated_request": true}));
+    if let Some(rid) = &request_id {
+        let inner = state.children.lock();
+        match inner.requests.get(&(caller_id.to_string(), rid.clone())) {
+            Some(RequestState::Done(name)) => {
+                return Ok(json!({"handle": name, "repeated_request": true}));
+            }
+            Some(RequestState::InFlight) => {
+                return Err(terr(
+                    "IN_PROGRESS",
+                    format!("request_id '{rid}' is still being created; retry shortly"),
+                ));
+            }
+            None => {}
+        }
     }
     // 2. Global policy active: the child's policy would be thrown away.
     if crate::grpc::policy::global_policy_active(state)
@@ -836,6 +1036,8 @@ async fn create_child(
             "kind must be \"agent\" or \"tool\"",
         ));
     }
+    // Early refusal before the proof; the limits are checked again, under the
+    // lock, when the slot is reserved in step 7.
     let (parent_lineage, grant) = can_create(state, caller_id, &kind)?;
     let parent = state
         .store
@@ -917,30 +1119,24 @@ async fn create_child(
         ));
     }
 
-    // 7. Reserve counters atomically.
-    let depth = parent_lineage.depth + 1;
-    {
-        let mut inner = state.children.lock();
-        let g = inner
-            .grants
-            .get_mut(&grant.id)
-            .ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
-        if g.total >= g.max_total {
-            return Err(terr("LIMIT_REACHED", "total"));
+    // 7. Reserve the slot: every limit is checked again and charged in one
+    //    step under the lock, and the request_id is marked in flight.
+    let reservation =
+        state
+            .children
+            .lock()
+            .reserve(caller_id, &kind, request_id.as_deref(), now_ms())?;
+    let (depth, grant) = match reservation {
+        Reservation::Repeated(name) => {
+            return Ok(json!({"handle": name, "repeated_request": true}));
         }
-        g.total += 1;
-        if let Some(l) = inner.lineage.get_mut(caller_id) {
-            l.children_created += 1;
-        }
-    }
+        Reservation::Reserved { depth, grant } => (depth, grant),
+    };
     let rollback = |state: &ServerState| {
-        let mut inner = state.children.lock();
-        if let Some(g) = inner.grants.get_mut(&grant.id) {
-            g.total = g.total.saturating_sub(1);
-        }
-        if let Some(l) = inner.lineage.get_mut(caller_id) {
-            l.children_created = l.children_created.saturating_sub(1);
-        }
+        state
+            .children
+            .lock()
+            .release(caller_id, &grant.id, request_id.as_deref());
     };
 
     let policy = candidate;
@@ -1040,9 +1236,7 @@ async fn create_child(
                 last_used_ms: now_ms(),
             },
         );
-        if let (Some(rid), Some(g)) = (request_id, inner.grants.get_mut(&grant.id)) {
-            g.request_ids.insert(rid, created.object_name().to_string());
-        }
+        inner.complete(caller_id, request_id.as_deref(), created.object_name());
     }
     if kind == KIND_TOOL {
         start_idle_reaper(state);
@@ -1328,32 +1522,45 @@ fn get_limits(state: &ServerState, caller_id: &str) -> Value {
     })
 }
 
-fn grant_list(state: &ServerState) -> Value {
+/// Grants the caller may see: those it set, and those in workspaces it
+/// administers.
+async fn grant_list(state: &ServerState, principal: &Principal, user: &UserPrincipal) -> Value {
+    let all: Vec<Grant> = state.children.lock().grants.values().cloned().collect();
+    let mut visible = Vec::new();
+    for g in all {
+        if may_manage_grant(state, principal, user, &g).await {
+            visible.push(g.id);
+        }
+    }
     let inner = state.children.lock();
-    let grants: Vec<Value> = inner
-        .grants
-        .values()
-        .map(|g| {
-            let holder = inner
-                .lineage
-                .get(&g.holder_id)
-                .map(|l| l.name.clone())
-                .unwrap_or_default();
-            json!({"grant_id": g.id, "holder": holder, "max_depth": g.max_depth,
-                   "max_breadth": g.max_breadth, "max_total": g.max_total, "total": g.total,
-                   "program": g.program, "user": g.user.subject})
-        })
+    let grants: Vec<Value> = visible
+        .iter()
+        .filter_map(|id| inner.grants.get(id))
+        .map(|g| inner.grant_json(g))
         .collect();
     json!({"grants": grants})
 }
 
-fn grant_update(
+/// Change or revoke a grant. Ownership is checked before anything changes;
+/// a grant the caller may not see is reported as not found.
+async fn grant_update(
     state: &ServerState,
+    principal: &Principal,
     user: &UserPrincipal,
     args: &Value,
 ) -> Result<Value, ToolError> {
     let id = str_arg(args, "grant_id")
         .ok_or_else(|| terr("INVALID_ARGUMENT", "grant_id is required"))?;
+    let grant = state
+        .children
+        .grant(id)
+        .ok_or_else(|| terr("NOT_FOUND", "no such grant"))?;
+    if !may_manage_grant(state, principal, user, &grant).await {
+        return Err(terr(
+            "NOT_ALLOWED",
+            "only the user who set the grant, or a Workspace Admin, can change it",
+        ));
+    }
     let mut inner = state.children.lock();
     if args.get("revoke").and_then(Value::as_bool) == Some(true) {
         inner
@@ -1367,12 +1574,6 @@ fn grant_update(
         .grants
         .get_mut(id)
         .ok_or_else(|| terr("NOT_FOUND", "no such grant"))?;
-    if g.user.subject != user.identity.subject {
-        return Err(terr(
-            "NOT_ALLOWED",
-            "only the user who set the grant can change it",
-        ));
-    }
     let set = |v: &mut u32, key: &str| {
         if let Some(n) = args.get(key).and_then(Value::as_u64) {
             *v = u32::try_from(n).unwrap_or(u32::MAX);
@@ -1425,6 +1626,7 @@ pub(crate) mod grpc_surface {
             "ALREADY_EXISTS" => Status::already_exists(msg),
             "UNAUTHENTICATED" => Status::unauthenticated(msg),
             "PROVER_INCONCLUSIVE" => Status::failed_precondition(msg),
+            "IN_PROGRESS" => Status::aborted(msg),
             _ => Status::internal(msg),
         }
     }
@@ -2010,6 +2212,208 @@ mod tests {
         assert!(!may_create_children(KIND_AGENT, 2, 2));
         assert!(!may_create_children(KIND_TOOL, 1, 2));
         assert!(!may_create_children(KIND_TOOL, 1, 9));
+    }
+
+    fn lineage(id: &str, parent: Option<&str>, depth: u32, grant: &str) -> Lineage {
+        Lineage {
+            sandbox_id: id.into(),
+            name: id.into(),
+            workspace: "default".into(),
+            parent_id: parent.map(str::to_string),
+            depth,
+            grant_id: grant.into(),
+            kind: KIND_AGENT.into(),
+            lifetime: "until_stopped".into(),
+            children_created: 0,
+            idle_timeout_ms: None,
+            last_used_ms: 0,
+        }
+    }
+
+    fn user(subject: &str, roles: &[&str]) -> UserPrincipal {
+        UserPrincipal {
+            identity: Identity {
+                subject: subject.into(),
+                display_name: None,
+                roles: roles.iter().map(|r| (*r).to_string()).collect(),
+                scopes: Vec::new(),
+                provider: crate::auth::identity::IdentityProvider::LocalDev,
+            },
+        }
+    }
+
+    fn grant(id: &str, holder: &str, owner: &str, breadth: u32, total: u32) -> Grant {
+        Grant {
+            id: id.into(),
+            user: user(owner, &[]).identity,
+            holder_id: holder.into(),
+            max_depth: 1,
+            max_breadth: breadth,
+            max_total: total,
+            inherit_child_policy: false,
+            program: "/usr/local/bin/node".into(),
+            expires_at_ms: i64::MAX,
+            total: 1,
+            workspace: "default".into(),
+        }
+    }
+
+    fn tree(breadth: u32, total: u32) -> Inner {
+        let mut inner = Inner::default();
+        inner
+            .grants
+            .insert("g".into(), grant("g", "lead", "alice", breadth, total));
+        inner
+            .lineage
+            .insert("lead".into(), lineage("lead", None, 0, "g"));
+        inner
+    }
+
+    #[test]
+    fn concurrent_creates_cannot_both_take_the_last_breadth_slot() {
+        // Two requests passed the early check; only one may reserve.
+        let mut inner = tree(1, 10);
+        assert!(matches!(
+            inner.reserve("lead", KIND_AGENT, None, 0),
+            Ok(Reservation::Reserved { depth: 1, .. })
+        ));
+        let err = inner.reserve("lead", KIND_TOOL, None, 0).unwrap_err();
+        assert_eq!(err.code, "LIMIT_REACHED");
+        assert!(err.message.starts_with("breadth"), "{}", err.message);
+        assert_eq!(inner.grants["g"].total, 2);
+        // A failed launch gives the slot back.
+        inner.release("lead", "g", None);
+        assert_eq!(inner.lineage["lead"].children_created, 0);
+        assert_eq!(inner.grants["g"].total, 1);
+        assert!(inner.reserve("lead", KIND_AGENT, None, 0).is_ok());
+    }
+
+    #[test]
+    fn concurrent_creates_cannot_exceed_the_total() {
+        let mut inner = tree(10, 2);
+        assert!(inner.reserve("lead", KIND_AGENT, None, 0).is_ok());
+        let err = inner.reserve("lead", KIND_AGENT, None, 0).unwrap_err();
+        assert!(err.message.starts_with("total"), "{}", err.message);
+    }
+
+    #[test]
+    fn duplicate_request_id_never_launches_a_second_child() {
+        let mut inner = tree(5, 10);
+        inner
+            .lineage
+            .insert("other".into(), lineage("other", Some("lead"), 1, "g"));
+        assert!(matches!(
+            inner.reserve("lead", KIND_TOOL, Some("r1"), 0),
+            Ok(Reservation::Reserved { .. })
+        ));
+        // A duplicate while the first is launching.
+        let err = inner.reserve("lead", KIND_TOOL, Some("r1"), 0).unwrap_err();
+        assert_eq!(err.code, "IN_PROGRESS");
+        // The same request_id from another parent is a different request.
+        assert!(matches!(
+            inner.reserve("other", KIND_TOOL, Some("r1"), 0),
+            Ok(Reservation::Reserved { .. })
+        ));
+        // After the first finishes, a retry gets its child, counted once.
+        inner.complete("lead", Some("r1"), "t1");
+        assert!(matches!(
+            inner.reserve("lead", KIND_TOOL, Some("r1"), 0),
+            Ok(Reservation::Repeated(h)) if h == "t1"
+        ));
+        assert_eq!(inner.lineage["lead"].children_created, 1);
+        // A failed launch frees the request_id for a real retry.
+        inner.release("other", "g", Some("r1"));
+        assert!(inner.reserve("other", KIND_TOOL, Some("r1"), 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_can_see_change_or_revoke_a_grant() {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        // With no admin role every user is a platform admin; name one.
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
+        state
+            .children
+            .lock()
+            .grants
+            .insert("g".into(), grant("g", "lead", "alice", 2, 3));
+        let alice = user("alice", &["openshell-user"]);
+        let mallory = user("mallory", &["openshell-user"]);
+        let as_principal = |u: &UserPrincipal| Principal::User(u.clone());
+
+        let listed = grant_list(&state, &as_principal(&mallory), &mallory).await;
+        assert_eq!(listed["grants"].as_array().unwrap().len(), 0);
+        for args in [
+            json!({"grant_id": "g", "revoke": true}),
+            json!({"grant_id": "g", "max_total": 99}),
+        ] {
+            let err = grant_update(&state, &as_principal(&mallory), &mallory, &args)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "NOT_ALLOWED");
+        }
+        let g = state.children.grant("g").expect("grant survives");
+        assert_eq!(g.max_total, 3);
+
+        let listed = grant_list(&state, &as_principal(&alice), &alice).await;
+        assert_eq!(listed["grants"].as_array().unwrap().len(), 1);
+        grant_update(
+            &state,
+            &as_principal(&alice),
+            &alice,
+            &json!({"grant_id": "g", "revoke": true}),
+        )
+        .await
+        .unwrap();
+        assert!(state.children.grant("g").is_none());
+
+        // A platform admin may manage any grant.
+        state
+            .children
+            .lock()
+            .grants
+            .insert("g2".into(), grant("g2", "lead", "alice", 2, 3));
+        let admin = user("root", &["openshell-admin"]);
+        let listed = grant_list(&state, &as_principal(&admin), &admin).await;
+        assert_eq!(listed["grants"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_grant_can_be_replaced_for_the_running_tree() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .store
+            .put_message(&stored_sandbox("lead", policy("version: 1\n"), None))
+            .await
+            .unwrap();
+        {
+            let mut inner = state.children.lock();
+            let mut g = grant("g", "lead", "alice", 2, 3);
+            g.total = 2;
+            inner.grants.insert("g".into(), g);
+            inner
+                .lineage
+                .insert("lead".into(), lineage("lead", None, 0, "g"));
+            inner
+                .lineage
+                .insert("w1".into(), lineage("w1", Some("lead"), 1, "g"));
+        }
+        let alice = user("alice", &["openshell-user"]);
+        let spec = "max_depth=2,max_breadth=2,max_total=5,program=/usr/local/bin/node";
+        let err = grant_create(&state, &alice, "default", "lead", spec)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "ALREADY_EXISTS");
+
+        state.children.lock().grants.remove("g");
+        let v = grant_create(&state, &alice, "default", "lead", spec)
+            .await
+            .unwrap();
+        let new_id = v["grant_id"].as_str().unwrap().to_string();
+        assert_ne!(new_id, "g");
+        assert_eq!(v["total"], 2, "running children count toward the new total");
+        assert_eq!(v["max_depth"], 2);
+        let inner = state.children.lock();
+        assert!(inner.lineage.values().all(|l| l.grant_id == new_id));
     }
 
     #[test]
