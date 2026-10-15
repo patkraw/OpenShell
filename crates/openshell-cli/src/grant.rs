@@ -8,8 +8,9 @@
 use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::proto::{
-    CreateSandboxGrantRequest, ListChildSandboxesRequest, ListSandboxGrantsRequest,
-    RevokeSandboxGrantRequest, SandboxGrant, UpdateSandboxGrantRequest, workspace_selector,
+    ChildSandbox, CreateSandboxGrantRequest, ListChildSandboxesRequest, ListSandboxGrantsRequest,
+    ListSandboxesRequest, RevokeSandboxGrantRequest, SandboxGrant, UpdateSandboxGrantRequest,
+    workspace_selector,
 };
 
 /// Every grant the caller may see, across all pages.
@@ -157,13 +158,12 @@ pub async fn grant_revoke(server: &str, grant_id: &str, tls: &TlsOptions) -> Res
     Ok(())
 }
 
-pub async fn sandbox_children(
-    server: &str,
+/// Every page of a sandbox's direct children.
+async fn fetch_children(
+    client: &mut crate::tls::GrpcClient,
     parent: &str,
     workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
+) -> Result<Vec<ChildSandbox>> {
     let mut children = Vec::new();
     let mut page_token = String::new();
     loop {
@@ -179,10 +179,20 @@ pub async fn sandbox_children(
             .into_inner();
         children.extend(page.children);
         if page.next_page_token.is_empty() {
-            break;
+            return Ok(children);
         }
         page_token = page.next_page_token;
     }
+}
+
+pub async fn sandbox_children(
+    server: &str,
+    parent: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let children = fetch_children(&mut client, parent, workspace).await?;
     if children.is_empty() {
         println!("{parent} has no children.");
         return Ok(());
@@ -193,6 +203,81 @@ pub async fn sandbox_children(
             "{:<20} {:<6} {:<14} {}",
             c.handle, c.kind, c.lifetime, c.depth
         );
+    }
+    Ok(())
+}
+
+/// `openshell sandbox list --tree`: every sandbox in the workspace, with the
+/// children each created through the gateway shown beneath it.
+pub async fn sandbox_tree(server: &str, workspace: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let mut names = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let page = client
+            .list_sandboxes(ListSandboxesRequest {
+                page_size: 1000,
+                page_token,
+                label_selector: String::new(),
+                workspace_scope: Some(workspace_selector(workspace)),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        names.extend(page.sandboxes.iter().map(|s| {
+            s.metadata
+                .as_ref()
+                .map(|m| m.name.clone())
+                .unwrap_or_default()
+        }));
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        page_token = page.next_page_token;
+    }
+    if names.is_empty() {
+        println!("No sandboxes found.");
+        return Ok(());
+    }
+    let mut children = std::collections::BTreeMap::new();
+    for name in &names {
+        let kids = fetch_children(&mut client, name, workspace).await?;
+        children.insert(name.clone(), kids);
+    }
+    let is_child: std::collections::BTreeSet<&str> = children
+        .values()
+        .flatten()
+        .map(|c| c.handle.as_str())
+        .collect();
+    // `line` prefixes this sandbox's line; `indent` prefixes its children's.
+    fn print(
+        name: &str,
+        label: &str,
+        line: &str,
+        indent: &str,
+        children: &std::collections::BTreeMap<String, Vec<ChildSandbox>>,
+    ) {
+        println!("{line}{name}{label}");
+        let kids = children.get(name).map(Vec::as_slice).unwrap_or_default();
+        for (i, c) in kids.iter().enumerate() {
+            let last = i + 1 == kids.len();
+            let (branch, next) = if last {
+                ("└─ ", "   ")
+            } else {
+                ("├─ ", "│  ")
+            };
+            print(
+                &c.handle,
+                &format!("  ({}, depth {})", c.kind, c.depth),
+                &format!("{indent}{branch}"),
+                &format!("{indent}{next}"),
+                children,
+            );
+        }
+    }
+    names.sort();
+    for name in names.iter().filter(|n| !is_child.contains(n.as_str())) {
+        print(name, "", "", "", &children);
     }
     Ok(())
 }

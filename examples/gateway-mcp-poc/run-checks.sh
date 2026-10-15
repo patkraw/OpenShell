@@ -161,19 +161,26 @@ check "grant create on a child is refused" "$($OS grant create pc1 --program /us
 echo "== Revoke and replace a grant for a running tree"
 pgid=$($OS grant list 2>&1 | awk '$2=="plain"{print $1}')
 check "the user revokes plain's grant" "$($OS grant revoke "$pgid" 2>&1)" "revoked"
+check "after revoke, plain cannot create" "$(mcp plain create_sandbox '{"name":"pcx","command":["sleep","60"]}')" "grant revoked"
+wait_ready pc1 || echo "pc1 did not become ready"
+check "after revoke, plain still reads from its existing child" "$(mcp plain get_file '{"handle":"pc1","path":"/etc/hostname"}')" '"content":'
 check "a new grant replaces it (grant create after revoke)" "$($OS grant create plain --program /usr/local/bin/node --max-depth 1 --max-breadth 4 --max-total 5 2>&1)" "attached to plain"
 npgid=$($OS grant list 2>&1 | awk '$2=="plain"{print $1}')
 check "the running child counts toward the new grant (total 2/5)" "$($OS grant get "$npgid" 2>&1)" "2/5"
 check "plain creates children again under the new grant" "$(mcp plain create_sandbox '{"name":"pc2","command":["sleep","60"]}')" '"handle":"pc2"'
+tree_out=$($OS sandbox list --tree 2>&1)
+check "sandbox list --tree shows plain's children beneath it" "$tree_out" "pc2  (agent, depth 1)"
 
 echo "== Concurrent duplicates of one request_id launch one child"
-mcp plain create_sandbox '{"name":"dupa","command":["sleep","60"],"request_id":"same"}' > /tmp/gwmcp-dup-a.$$ 2>&1 &
-mcp plain create_sandbox '{"name":"dupb","command":["sleep","60"],"request_id":"same"}' > /tmp/gwmcp-dup-b.$$ 2>&1 &
+DUP='{"name":"dup","command":["sleep","60"],"request_id":"same"}'
+mcp plain create_sandbox "$DUP" > /tmp/gwmcp-dup-a.$$ 2>&1 &
+mcp plain create_sandbox "$DUP" > /tmp/gwmcp-dup-b.$$ 2>&1 &
 wait
-dups=$($OS sandbox list 2>&1 | grep -cE '^dup[ab] ' || true)
+dups=$($OS sandbox list 2>&1 | grep -cE '^dup ' || true)
 check "only one of two concurrent duplicates created a sandbox" "$dups" "1"
 check "the grant was charged once (total 4/5)" "$($OS grant get "$npgid" 2>&1)" "4/5"
-check "a later retry returns the first child" "$(mcp plain create_sandbox '{"name":"dupc","command":["sleep","60"],"request_id":"same"}')" '"repeated_request":true'
+check "a later retry returns the first child" "$(mcp plain create_sandbox "$DUP")" '"repeated_request":true'
+check "the same request_id with different arguments is refused" "$(mcp plain create_sandbox '{"name":"dupc","command":["sleep","60"],"request_id":"same"}')" "different arguments"
 rm -f /tmp/gwmcp-dup-a.$$ /tmp/gwmcp-dup-b.$$
 $OS sandbox delete plain >/dev/null 2>&1
 

@@ -106,7 +106,13 @@ pub struct Lineage {
     pub grant_id: String,
     pub kind: String,
     pub lifetime: String,
+    /// Children this sandbox has created under the grant, including ones that
+    /// have since stopped (breadth counts creations, not running children).
     pub children_created: u32,
+    /// The user the tree acts for. Kept on the lineage so that a parent can
+    /// still wait for, read from, run commands in and stop its existing
+    /// children after the grant is revoked or expires.
+    pub user: Identity,
     /// Tool sandboxes: stopped after this long without an `exec` / `get_file`.
     pub idle_timeout_ms: Option<i64>,
     pub last_used_ms: i64,
@@ -115,10 +121,42 @@ pub struct Lineage {
 /// A retried `create_sandbox` by `request_id`, scoped to the parent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestState {
-    /// The first request is still launching the child.
-    InFlight,
-    /// The first request created this child (sandbox name).
-    Done(String),
+    /// The first request is still launching the child. Holds the
+    /// fingerprint of its arguments.
+    InFlight(String),
+    /// The first request created this child: (sandbox name, fingerprint).
+    Done(String, String),
+}
+
+/// A `request_id` and the fingerprint of the arguments it was sent with.
+type RequestRef<'a> = (&'a str, &'a str);
+
+/// Fingerprint of a create request's arguments, without `request_id`, so a
+/// retry with the same arguments is recognised and one with different
+/// arguments is refused instead of silently returning the first child.
+fn request_fingerprint(args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), canonical(&map[k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+            other => other.clone(),
+        }
+    }
+    let mut args = args.clone();
+    if let Some(obj) = args.as_object_mut() {
+        obj.remove("request_id");
+    }
+    let text = canonical(&args).to_string();
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 #[derive(Debug, Default)]
@@ -177,6 +215,31 @@ fn check_limits(
 }
 
 impl Inner {
+    /// The outcome of an earlier request with the same parent and
+    /// `request_id`: its child's handle, `IN_PROGRESS`, or a refusal if the
+    /// arguments differ.
+    fn earlier_request(
+        &self,
+        parent_id: &str,
+        (rid, fingerprint): RequestRef<'_>,
+    ) -> Result<Option<String>, ToolError> {
+        let reused = || {
+            terr(
+                "INVALID_ARGUMENT",
+                format!("request_id '{rid}' was already used with different arguments"),
+            )
+        };
+        match self.requests.get(&(parent_id.to_string(), rid.to_string())) {
+            Some(RequestState::Done(handle, fp)) if fp == fingerprint => Ok(Some(handle.clone())),
+            Some(RequestState::InFlight(fp)) if fp == fingerprint => Err(terr(
+                "IN_PROGRESS",
+                format!("request_id '{rid}' is still being created; retry shortly"),
+            )),
+            Some(_) => Err(reused()),
+            None => Ok(None),
+        }
+    }
+
     /// Check every limit and charge the counters in one step, under the lock,
     /// so concurrent creates cannot both take the last slot. A `request_id`
     /// is marked in flight here, before the child is launched, so a duplicate
@@ -186,22 +249,13 @@ impl Inner {
         &mut self,
         parent_id: &str,
         kind: &str,
-        request_id: Option<&str>,
+        request: Option<RequestRef<'_>>,
         now: i64,
     ) -> Result<Reservation, ToolError> {
-        if let Some(rid) = request_id {
-            match self.requests.get(&(parent_id.to_string(), rid.to_string())) {
-                Some(RequestState::Done(handle)) => {
-                    return Ok(Reservation::Repeated(handle.clone()));
-                }
-                Some(RequestState::InFlight) => {
-                    return Err(terr(
-                        "IN_PROGRESS",
-                        format!("request_id '{rid}' is still being created; retry shortly"),
-                    ));
-                }
-                None => {}
-            }
+        if let Some(req) = request
+            && let Some(handle) = self.earlier_request(parent_id, req)?
+        {
+            return Ok(Reservation::Repeated(handle));
         }
         let lineage = self
             .lineage
@@ -215,10 +269,10 @@ impl Inner {
         if let Some(l) = self.lineage.get_mut(parent_id) {
             l.children_created += 1;
         }
-        if let Some(rid) = request_id {
+        if let Some((rid, fingerprint)) = request {
             self.requests.insert(
                 (parent_id.to_string(), rid.to_string()),
-                RequestState::InFlight,
+                RequestState::InFlight(fingerprint.to_string()),
             );
         }
         Ok(Reservation::Reserved {
@@ -242,11 +296,11 @@ impl Inner {
     }
 
     /// Record the child a reserved `request_id` created.
-    fn complete(&mut self, parent_id: &str, request_id: Option<&str>, handle: &str) {
-        if let Some(rid) = request_id {
+    fn complete(&mut self, parent_id: &str, request: Option<RequestRef<'_>>, handle: &str) {
+        if let Some((rid, fingerprint)) = request {
             self.requests.insert(
                 (parent_id.to_string(), rid.to_string()),
-                RequestState::Done(handle.to_string()),
+                RequestState::Done(handle.to_string(), fingerprint.to_string()),
             );
         }
     }
@@ -530,6 +584,7 @@ pub fn register_granted_sandbox(
             kind: KIND_AGENT.into(),
             lifetime: "until_stopped".into(),
             children_created: 0,
+            user: user.identity.clone(),
             idle_timeout_ms: None,
             last_used_ms: now_ms(),
         },
@@ -999,21 +1054,14 @@ async fn create_child(
     // 1. Retry: the same parent and request_id return the first result,
     //    counted once. A duplicate that arrives while the first is still
     //    launching gets IN_PROGRESS (checked again when the slot is reserved).
+    //    The same request_id with different arguments is refused.
     let request_id = str_arg(args, "request_id").map(str::to_string);
-    if let Some(rid) = &request_id {
-        let inner = state.children.lock();
-        match inner.requests.get(&(caller_id.to_string(), rid.clone())) {
-            Some(RequestState::Done(name)) => {
-                return Ok(json!({"handle": name, "repeated_request": true}));
-            }
-            Some(RequestState::InFlight) => {
-                return Err(terr(
-                    "IN_PROGRESS",
-                    format!("request_id '{rid}' is still being created; retry shortly"),
-                ));
-            }
-            None => {}
-        }
+    let fingerprint = request_fingerprint(args);
+    let request = request_id.as_deref().map(|rid| (rid, fingerprint.as_str()));
+    if let Some(req) = request
+        && let Some(name) = state.children.lock().earlier_request(caller_id, req)?
+    {
+        return Ok(json!({"handle": name, "repeated_request": true}));
     }
     // 2. Global policy active: the child's policy would be thrown away.
     if crate::grpc::policy::global_policy_active(state)
@@ -1116,13 +1164,15 @@ async fn create_child(
         ));
     }
 
+    let proved_grant_id = grant.id.clone();
+    let proved_inherit = grant.inherit_child_policy;
+
     // 7. Reserve the slot: every limit is checked again and charged in one
     //    step under the lock, and the request_id is marked in flight.
-    let reservation =
-        state
-            .children
-            .lock()
-            .reserve(caller_id, &kind, request_id.as_deref(), now_ms())?;
+    let reservation = state
+        .children
+        .lock()
+        .reserve(caller_id, &kind, request, now_ms())?;
     let (depth, grant) = match reservation {
         Reservation::Repeated(name) => {
             return Ok(json!({"handle": name, "repeated_request": true}));
@@ -1135,6 +1185,30 @@ async fn create_child(
             .lock()
             .release(caller_id, &grant.id, request_id.as_deref());
     };
+
+    // 8. Stale admission: the proof used the grant and the parent's policy as
+    //    they were before the reservation. If either changed meanwhile (the
+    //    grant was replaced, or the parent's policy was narrowed), give the
+    //    slot back and let the caller retry against the new state.
+    let stale = if grant.id != proved_grant_id || grant.inherit_child_policy != proved_inherit {
+        Some("the tree's grant changed")
+    } else {
+        match crate::grpc::policy::current_base_policy_for_sandbox(&state.store, &parent).await {
+            Ok(now) if now == ceiling => None,
+            Ok(_) => Some("the parent's policy changed"),
+            Err(s) => {
+                rollback(state);
+                return Err(terr("INTERNAL", s.message()));
+            }
+        }
+    };
+    if let Some(why) = stale {
+        rollback(state);
+        return Err(terr(
+            "STALE_ADMISSION",
+            format!("{why} while this child was being admitted; retry create_sandbox"),
+        ));
+    }
 
     let policy = candidate;
 
@@ -1229,11 +1303,12 @@ async fn create_child(
                 kind: kind.clone(),
                 lifetime: lifetime.clone(),
                 children_created: 0,
+                user: grant.user.clone(),
                 idle_timeout_ms,
                 last_used_ms: now_ms(),
             },
         );
-        inner.complete(caller_id, request_id.as_deref(), created.object_name());
+        inner.complete(caller_id, request, created.object_name());
     }
     if kind == KIND_TOOL {
         start_idle_reaper(state);
@@ -1309,10 +1384,6 @@ async fn child_output(
     args: &Value,
 ) -> Result<Value, ToolError> {
     let child = own_child(state, caller_id, args)?;
-    let grant = state
-        .children
-        .grant(&child.grant_id)
-        .ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
     let mut req = tonic::Request::new(GetSandboxLogsRequest {
         workspace_scope: Some(workspace_selector(child.workspace.clone())),
         sandbox: child.name.clone(),
@@ -1320,7 +1391,7 @@ async fn child_output(
         ..Default::default()
     });
     req.extensions_mut().insert(Principal::User(UserPrincipal {
-        identity: grant.user.clone(),
+        identity: child.user.clone(),
     }));
     let logs = crate::grpc::policy::handle_get_sandbox_logs(state, req)
         .await
@@ -1345,10 +1416,6 @@ async fn run_in_child(
 ) -> Result<(Vec<u8>, Vec<u8>, i32), ToolError> {
     use openshell_core::proto::{ExecSandboxRequest, exec_sandbox_event::Payload};
     use tokio_stream::StreamExt;
-    let grant = state
-        .children
-        .grant(&child.grant_id)
-        .ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
     let mut req = tonic::Request::new(ExecSandboxRequest {
         workspace_scope: Some(workspace_selector(child.workspace.clone())),
         sandbox: child.name.clone(),
@@ -1358,7 +1425,7 @@ async fn run_in_child(
         ..Default::default()
     });
     req.extensions_mut().insert(Principal::User(UserPrincipal {
-        identity: grant.user.clone(),
+        identity: child.user.clone(),
     }));
     let mut stream = crate::grpc::sandbox::handle_exec_sandbox(state, req)
         .await
@@ -1623,7 +1690,7 @@ pub(crate) mod grpc_surface {
             "ALREADY_EXISTS" => Status::already_exists(msg),
             "UNAUTHENTICATED" => Status::unauthenticated(msg),
             "PROVER_INCONCLUSIVE" => Status::failed_precondition(msg),
-            "IN_PROGRESS" => Status::aborted(msg),
+            "IN_PROGRESS" | "STALE_ADMISSION" => Status::aborted(msg),
             _ => Status::internal(msg),
         }
     }
@@ -2222,6 +2289,7 @@ mod tests {
             kind: KIND_AGENT.into(),
             lifetime: "until_stopped".into(),
             children_created: 0,
+            user: user("alice", &[]).identity,
             idle_timeout_ms: None,
             last_used_ms: 0,
         }
@@ -2300,27 +2368,74 @@ mod tests {
             .lineage
             .insert("other".into(), lineage("other", Some("lead"), 1, "g"));
         assert!(matches!(
-            inner.reserve("lead", KIND_TOOL, Some("r1"), 0),
+            inner.reserve("lead", KIND_TOOL, Some(("r1", "fp")), 0),
             Ok(Reservation::Reserved { .. })
         ));
         // A duplicate while the first is launching.
-        let err = inner.reserve("lead", KIND_TOOL, Some("r1"), 0).unwrap_err();
+        let err = inner
+            .reserve("lead", KIND_TOOL, Some(("r1", "fp")), 0)
+            .unwrap_err();
         assert_eq!(err.code, "IN_PROGRESS");
         // The same request_id from another parent is a different request.
         assert!(matches!(
-            inner.reserve("other", KIND_TOOL, Some("r1"), 0),
+            inner.reserve("other", KIND_TOOL, Some(("r1", "fp")), 0),
             Ok(Reservation::Reserved { .. })
         ));
         // After the first finishes, a retry gets its child, counted once.
-        inner.complete("lead", Some("r1"), "t1");
+        inner.complete("lead", Some(("r1", "fp")), "t1");
         assert!(matches!(
-            inner.reserve("lead", KIND_TOOL, Some("r1"), 0),
+            inner.reserve("lead", KIND_TOOL, Some(("r1", "fp")), 0),
             Ok(Reservation::Repeated(h)) if h == "t1"
         ));
         assert_eq!(inner.lineage["lead"].children_created, 1);
         // A failed launch frees the request_id for a real retry.
         inner.release("other", "g", Some("r1"));
-        assert!(inner.reserve("other", KIND_TOOL, Some("r1"), 0).is_ok());
+        assert!(
+            inner
+                .reserve("other", KIND_TOOL, Some(("r1", "fp")), 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_id_reused_with_different_arguments_is_refused() {
+        let mut inner = tree(5, 10);
+        assert!(
+            inner
+                .reserve("lead", KIND_TOOL, Some(("r1", "fp-a")), 0)
+                .is_ok()
+        );
+        let err = inner
+            .reserve("lead", KIND_TOOL, Some(("r1", "fp-b")), 0)
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_ARGUMENT", "{}", err.message);
+        inner.complete("lead", Some(("r1", "fp-a")), "t1");
+        let err = inner
+            .reserve("lead", KIND_TOOL, Some(("r1", "fp-b")), 0)
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_ARGUMENT");
+        assert_eq!(inner.lineage["lead"].children_created, 1);
+    }
+
+    #[test]
+    fn fingerprint_ignores_request_id_and_key_order() {
+        let a = json!({"name": "w", "command": ["true"], "request_id": "r1"});
+        let b = json!({"command": ["true"], "request_id": "r2", "name": "w"});
+        assert_eq!(request_fingerprint(&a), request_fingerprint(&b));
+        let c = json!({"name": "w", "command": ["false"], "request_id": "r1"});
+        assert_ne!(request_fingerprint(&a), request_fingerprint(&c));
+    }
+
+    #[test]
+    fn reservation_rechecks_a_revoked_or_expired_grant() {
+        let mut inner = tree(5, 10);
+        inner.grants.get_mut("g").unwrap().expires_at_ms = 10;
+        let err = inner.reserve("lead", KIND_AGENT, None, 11).unwrap_err();
+        assert_eq!(err.message, "grant expired");
+        inner.grants.remove("g");
+        let err = inner.reserve("lead", KIND_AGENT, None, 0).unwrap_err();
+        assert_eq!(err.message, "grant revoked");
+        assert_eq!(inner.lineage["lead"].children_created, 0);
     }
 
     #[tokio::test]
@@ -2426,6 +2541,7 @@ mod tests {
             kind: "agent".into(),
             lifetime: "until_stopped".into(),
             children_created: 0,
+            user: user("alice", &[]).identity,
             idle_timeout_ms: None,
             last_used_ms: 0,
         };

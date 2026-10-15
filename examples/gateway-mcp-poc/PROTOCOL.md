@@ -13,7 +13,8 @@ made behind the `SandboxApi` trait in `crates/openshell-server/src/children.rs`.
 | Transport | MCP streamable HTTP, **sessionless**: one `POST /mcp` carries one JSON-RPC message and gets one `application/json` response |
 | `GET /mcp` | `405`: the server opens no server-sent events stream |
 | Notifications | a message without `id` gets `202` and no body |
-| MCP revision | the server echoes the client's `protocolVersion`; default `2025-11-25` |
+| MCP revision | supported: `2025-11-25`, `2025-06-18`. `initialize` echoes a supported `protocolVersion`, otherwise answers `2025-11-25`; an unsupported `MCP-Protocol-Version` header gets `400` |
+| Origin | a request with an `Origin` header that is not local (`localhost`, `127.0.0.1`, `[::1]`, `openshell.local`) gets `403` |
 | Session id | none; any gateway replica can serve any request |
 
 ## Where to connect, and who you are
@@ -55,7 +56,7 @@ at its maximum depth or out of budget gets `NOT_ALLOWED` or `LIMIT_REACHED`.
 | `wait` | `handle`, `timeout_s` | `phase`, `exit_code` |
 | `exec` | `handle`, `command`, `timeout_s` (tool children only) | `stdout`, `stderr`, `exit_code` |
 | `get_file` | `handle`, `path` | `content` (max 256 KiB) |
-| `get_output` | `handle` | recent log lines |
+| `get_output` | `handle` | recent log lines of the child (not a durable result; the child's own standard output is not included) |
 | `stop_sandbox` | `handle` | `stopped` (its children are stopped first) |
 | `list_children` | none | children |
 | `get_limits` | none | depth, children and total, used and allowed |
@@ -88,7 +89,8 @@ On failure `isError` is `true` and `structuredContent` is
 | `EXCEEDS_CEILING` | the child policy is wider than the parent's policy (the ceiling); includes the prover's counterexample |
 | `UNSUPPORTED_RULES` | the child policy has rules the prover cannot check (e.g. `protocol: mcp`) |
 | `GLOBAL_POLICY_ACTIVE` | a gateway-global policy would replace the child's policy |
-| `INVALID_ARGUMENT`, `INVALID_POLICY` | bad arguments or policy |
+| `INVALID_ARGUMENT`, `INVALID_POLICY` | bad arguments or policy, or a `request_id` reused with different arguments |
+| `STALE_ADMISSION` | the grant or the parent's policy changed while the child was being admitted; retry |
 | `NOT_YOUR_CHILD` | the handle is not one of the caller's descendants |
 | `IN_PROGRESS` | a `create_sandbox` with the same `request_id` from the same parent is still launching; retry shortly |
 | `WRONG_KIND` | `exec` on an agent child |

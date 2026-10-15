@@ -71,13 +71,21 @@ Here we play the lead's agent with the `mcp` helper (tutorial 02 goes deeper):
 mcp lead create_sandbox '{"name":"w1","command":["sleep","600"]}'
 mcp lead create_sandbox '{"name":"t1","kind":"tool"}'
 openshell sandbox children lead
+openshell sandbox list --tree
 ```
 
 ```text
 NAME                 KIND   LIFETIME       DEPTH
 w1                   agent  until_stopped  1
 t1                   tool   until_stopped  1
+
+lead
+├─ t1  (tool, depth 1)
+└─ w1  (agent, depth 1)
 ```
+
+- `sandbox children` shows one sandbox's direct children; `sandbox list --tree`
+  shows every tree in the workspace.
 
 A third child goes over **`max_breadth`**:
 
@@ -117,8 +125,10 @@ mcp lead create_sandbox '{"name":"w3","command":["sleep","600"]}'
 {"isError":true,"error":"NOT_ALLOWED","message":"grant revoked"}
 ```
 
-The tree keeps running. Give it a **new** grant, for example with a different
-budget or program:
+The tree keeps running, and the lead can still use the children it has:
+`wait`, `get_file`, `exec` on tool children and `stop_sandbox` keep working.
+Only new creates are refused. Give it a **new** grant, for example with a
+different budget or program:
 
 ```shell
 openshell grant create lead --program /usr/local/bin/node \

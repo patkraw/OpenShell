@@ -26,8 +26,41 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tracing::info;
 
-/// MCP revision used when the client does not name one.
+/// MCP revision used when the client does not name one, and offered when it
+/// names one this server does not support.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// MCP revisions this server speaks (Streamable HTTP, JSON responses only).
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+
+/// Version negotiation (MCP lifecycle): echo a supported version, otherwise
+/// answer with the latest one this server supports and let the client decide.
+fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|v| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|s| **s == v))
+        .copied()
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION)
+}
+
+/// Browsers attach `Origin`; MCP servers must reject foreign origins to stop
+/// DNS-rebinding attacks. Requests without `Origin` (agents, the sandbox door)
+/// and local origins are accepted.
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin") else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let host = origin
+        .split_once("://")
+        .map_or(origin, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default();
+    matches!(host, "localhost" | "127.0.0.1" | "openshell.local")
+        || origin.starts_with("http://[::1]")
+}
 
 // ---------------------------------------------------------------------------
 // The contract with the backend
@@ -396,6 +429,18 @@ async fn handle<A: SandboxApi>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !origin_allowed(&headers) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    // After initialize, clients send the negotiated version in this header;
+    // an unsupported one is a client error (MCP Streamable HTTP transport).
+    if let Some(v) = headers.get("mcp-protocol-version")
+        && !v
+            .to_str()
+            .is_ok_and(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(&v))
+    {
+        return (StatusCode::BAD_REQUEST, "unsupported MCP-Protocol-Version").into_response();
+    }
     let caller = match api.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) if e.code == "UNAUTHENTICATED" => {
@@ -419,10 +464,8 @@ async fn handle<A: SandboxApi>(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     match method {
         "initialize" => {
-            let version = params
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+            let version =
+                negotiate_protocol_version(params.get("protocolVersion").and_then(Value::as_str));
             rpc_ok(
                 id,
                 json!({
@@ -593,6 +636,52 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(v["result"]["serverInfo"]["name"], "openshell-gateway");
+    }
+
+    #[tokio::test]
+    async fn initialize_offers_latest_for_unknown_version() {
+        let app = router(Arc::new(Fake::default()));
+        let (s, v) = rpc(&app, Some("lead"), json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2099-01-01"}})).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["result"]["protocolVersion"], DEFAULT_PROTOCOL_VERSION);
+    }
+
+    async fn send(app: &Router, header: (&str, &str)) -> StatusCode {
+        let req = Request::post("/mcp")
+            .header("content-type", "application/json")
+            .header("x-caller", "lead")
+            .header(header.0, header.1)
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}).to_string(),
+            ))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_header_is_400() {
+        let app = router(Arc::new(Fake::default()));
+        assert_eq!(
+            send(&app, ("mcp-protocol-version", "2099-01-01")).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(&app, ("mcp-protocol-version", "2025-06-18")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_origin_is_403() {
+        let app = router(Arc::new(Fake::default()));
+        assert_eq!(
+            send(&app, ("origin", "https://evil.example")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&app, ("origin", "http://localhost:3000")).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
