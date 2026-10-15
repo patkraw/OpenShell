@@ -187,14 +187,18 @@ openshell sandbox create --name dlead --from pi-agent:local \
   --grant-max-depth 2 --grant-max-breadth 2 --grant-max-total 4 --grant-expires 1h \
   --no-tty --detach -- sleep 3600
 mcp dlead create_sandbox '{"name":"mid","command":["sleep","600"],"policy":{"network_policies":{"github_read":{"name":"github_read","endpoints":[{"host":"api.github.com","port":443,"protocol":"rest","enforcement":"enforce","rules":[{"allow":{"method":"GET","path":"/repos/**"}}]}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
+mcp dlead wait '{"handle":"mid","timeout_s":60}'
 mcp mid create_sandbox '{"name":"leaf","command":["true"],"policy":{"network_policies":{"example":{"name":"example","endpoints":[{"host":"example.com","port":443}],"binaries":[{"path":"/usr/local/bin/node"}]}}}}'
 ```
 
 ```text
 {"isError":false,"can_create_children":true,"depth":1,"handle":"mid",...}
+{"isError":false,"exit_code":null,"handle":"mid","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":true,"error":"EXCEEDS_CEILING","message":"... counterexample: Network { host: \"example.com\", port: 443, protocol: L4, ... }. ..."}
 ```
 
+- `mid` must be **ready** before its agent can call the gateway, hence the
+  `wait`.
 - `dlead` has `example.com`, but **`mid` doesn't**, so `mid` can't give it to
   `leaf`. Each level can only narrow.
 
