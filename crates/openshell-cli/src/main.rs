@@ -1785,6 +1785,11 @@ enum SandboxCommands {
         /// List sandboxes across all workspaces (overrides --workspace).
         #[arg(long)]
         all_workspaces: bool,
+
+        /// Show sandboxes as trees: each sandbox with the children it created
+        /// through the gateway beneath it.
+        #[arg(long, conflicts_with_all = ["ids", "names", "output", "all_workspaces", "selector"])]
+        tree: bool,
     },
 
     /// Delete a sandbox by name.
@@ -3779,20 +3784,26 @@ async fn run_async() -> Result<()> {
                             selector,
                             output,
                             all_workspaces,
+                            tree,
                         } => {
-                            run::sandbox_list(
-                                endpoint,
-                                page_size,
-                                &page_token,
-                                ids,
-                                names,
-                                selector.as_deref(),
-                                output.as_str(),
-                                &cli.workspace,
-                                all_workspaces,
-                                &tls,
-                            )
-                            .await?;
+                            if tree {
+                                openshell_cli::grant::sandbox_tree(endpoint, &cli.workspace, &tls)
+                                    .await?;
+                            } else {
+                                run::sandbox_list(
+                                    endpoint,
+                                    page_size,
+                                    &page_token,
+                                    ids,
+                                    names,
+                                    selector.as_deref(),
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    all_workspaces,
+                                    &tls,
+                                )
+                                .await?;
+                            }
                         }
                         SandboxCommands::Delete { names, all } => {
                             run::sandbox_delete(

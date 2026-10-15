@@ -92,6 +92,23 @@ where
             .await;
         }
     };
+    // A browser in the sandbox attaches Origin; only the door's own origin is
+    // accepted (DNS-rebinding protection). Agents send no Origin.
+    if let Some(origin) = header_value(initial_request, "origin")
+        && !matches!(
+            origin.trim_end_matches('/'),
+            "http://openshell.local" | "http://openshell.local:80"
+        )
+    {
+        return respond(
+            client,
+            403,
+            "Forbidden",
+            "text/plain",
+            b"origin not allowed",
+        )
+        .await;
+    }
     let path = target.split('?').next().unwrap_or(target);
     if path != DOOR_PATH {
         return respond(
@@ -142,8 +159,12 @@ where
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .body(body);
-    if let Some(v) = header_value(initial_request, "mcp-protocol-version") {
-        req = req.header("mcp-protocol-version", v);
+    // MCP headers pass through; identity headers (authorization, the caller
+    // program) are set above by the door and never copied from the workload.
+    for name in ["mcp-protocol-version", "mcp-method", "mcp-name"] {
+        if let Some(v) = header_value(initial_request, name) {
+            req = req.header(name, v);
+        }
     }
     let resp = match req.send().await {
         Ok(r) => r,

@@ -28,7 +28,7 @@ git clone https://github.com/patkraw/OpenShell.git && cd OpenShell && git checko
 | Gateway rules | `crates/openshell-server/src/children.rs` | Implements `SandboxApi`: grants, lineage, the prover check against the parent's policy, limits, retries, tool sandboxes, cascade stop. |
 | Supervisor door | `crates/openshell-supervisor-network/src/gateway_mcp_door.rs` | Serves `http://openshell.local/mcp` in every sandbox; forwards with the sandbox's token and the calling program's path. The gateway decides every call. |
 | gRPC API | `proto/openshell.proto` (`CreateChildSandbox`, `ListSandboxGrants`, ...) | The same operations as the MCP tools, for the SDKs and the CLI. Handlers in `children.rs` (`grpc_surface`) call the same rules as MCP. |
-| CLI | `openshell sandbox create --grant-program ... --grant-max-depth ...`, `openshell grant create/get/list/update/revoke`, `openshell sandbox children` | Start a tree, add a grant to a running sandbox, manage grants, see children. |
+| CLI | `openshell sandbox create --grant-program ... --grant-max-depth ...`, `openshell grant create/get/list/update/revoke`, `openshell sandbox list --tree`, `openshell sandbox children` | Start a tree, add a grant to a running sandbox, manage grants, see trees and children. |
 | Python SDK | `SandboxClient.create(grant=...)`, `list_grants`, `create_grant`, `update_grant`, `revoke_grant`, `list_children` | The same from code, over gRPC. |
 
 The MCP endpoint is on by default. It is **startup configuration**: turn it off
