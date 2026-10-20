@@ -1,0 +1,8 @@
+#!/bin/sh
+# Start Qwen Code with the seeded settings in a writable HOME. The built-in
+# `agent` subagent tool stays enabled, so the matrix sees which spawn path the
+# model picks.
+export HOME=/tmp/qwen-home
+mkdir -p "$HOME/.qwen"
+cp -n /usr/local/share/qwen-seed/settings.json "$HOME/.qwen/" 2>/dev/null
+exec qwen --yolo "$@"

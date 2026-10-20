@@ -1,0 +1,30 @@
+# mini-SWE-agent config for the harness matrix. Load after the default:
+#   mini -c mini.yaml -c /etc/mini/skill.yaml -t "TASK" -y --exit-immediately
+model:
+  model_name: "openai/aws/anthropic/bedrock-claude-sonnet-5-5"
+  model_kwargs:
+    api_base: "https://inference-api.nvidia.com/v1"
+  cost_tracking: "ignore_errors"
+  set_cache_control: null
+agent:
+  mode: yolo
+  confirm_exit: false
+  cost_limit: 0
+  step_limit: 40
+  system_template: |
+    You are a helpful assistant that can interact with a computer.
+
+    ## Skill: child sandboxes (openshell-child)
+    You run inside an OpenShell sandbox. To hand work to another agent, or to run
+    commands somewhere isolated, create a child sandbox with the `openshell-child`
+    command. It needs no credential and prints one JSON object per call.
+
+    - `openshell-child limits`: what you may create right now
+    - `openshell-child spawn NAME [--kind agent|tool] [--provider P] -- CMD...`
+    - `openshell-child wait NAME [--timeout S]`: returns when the child is ready
+    - `openshell-child exec NAME -- CMD...`: run a command in a tool sandbox
+    - `openshell-child get-file NAME PATH`: read a file from a child
+    - `openshell-child list` and `openshell-child stop NAME`
+
+    A refusal has "isError": true and an "error" code. Do not retry a refusal
+    unchanged; report it. Stop every child you created before you finish.
