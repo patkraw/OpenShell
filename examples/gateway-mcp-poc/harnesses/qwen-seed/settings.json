@@ -1,0 +1,26 @@
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "aws/anthropic/bedrock-claude-sonnet-5-5",
+        "name": "Claude Sonnet via NVIDIA inference",
+        "baseUrl": "https://inference-api.nvidia.com/v1",
+        "envKey": "OPENAI_API_KEY"
+      }
+    ]
+  },
+  "security": { "auth": { "selectedType": "openai" } },
+  "model": { "name": "aws/anthropic/bedrock-claude-sonnet-5-5" },
+  "mcpServers": {
+    "openshell": {
+      "httpUrl": "http://openshell.local/mcp",
+      "alwaysLoadTools": true,
+      "timeout": 600000,
+      "description": "OpenShell gateway: create and manage child sandboxes"
+    }
+  },
+  "privacy": { "usageStatisticsEnabled": false },
+  "telemetry": { "enabled": false },
+  "general": { "enableAutoUpdate": false },
+  "memory": { "enableManagedAutoMemory": false, "enableManagedAutoDream": false, "enableAutoSkill": false }
+}

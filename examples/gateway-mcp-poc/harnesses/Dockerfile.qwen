@@ -1,0 +1,21 @@
+# Qwen Code for the harness matrix: Node, MCP over Streamable HTTP, and its own
+# built-in `agent` subagent tool. Gemini CLI can't use a non-Google endpoint, so
+# Qwen Code (a Gemini CLI fork) stands in for it.
+FROM node:24-bookworm-slim
+
+ARG QWEN_CODE_VERSION=0.25.0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g --no-fund --no-audit "@qwen-code/qwen-code@${QWEN_CODE_VERSION}" \
+    && chmod +x /usr/local/lib/node_modules/@qwen-code/qwen-code/vendor/ripgrep/*-linux/rg \
+    && npm cache clean --force
+
+COPY qwen-seed/ /usr/local/share/qwen-seed/
+COPY --chmod=755 qwen-run /usr/local/bin/qwen-run
+
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+WORKDIR /workspace
+ENV QWEN_CODE_MODELS_DEV_REFRESH=off QWEN_CODE_SUPPRESS_YOLO_WARNING=1 \
+    QWEN_USAGE_STATISTICS_ENABLED=0 QWEN_CODE_NO_RELAUNCH=1
