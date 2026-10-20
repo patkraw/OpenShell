@@ -1,0 +1,19 @@
+# OpenCode for the harness matrix: a Bun-compiled native binary, MCP over
+# Streamable HTTP, and a built-in `task` subagent tool.
+FROM node:24-bookworm-slim
+
+ARG OPENCODE_VERSION=1.18.34
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git ripgrep procps \
+    && rm -rf /var/lib/apt/lists/*
+# No --ignore-scripts: the postinstall puts the real binary in place.
+RUN npm install -g --no-fund --no-audit "opencode-ai@${OPENCODE_VERSION}" && npm cache clean --force
+
+COPY opencode-seed/ /usr/local/share/opencode-seed/
+COPY --chmod=755 opencode-run /usr/local/bin/opencode-run
+
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+WORKDIR /workspace
+ENV OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 OPENCODE_DISABLE_SHARE=1 \
+    OPENCODE_DISABLE_LSP_DOWNLOAD=1

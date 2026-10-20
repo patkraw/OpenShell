@@ -1,0 +1,6 @@
+#!/bin/sh
+# Start `codex exec` with the seeded config in a writable CODEX_HOME.
+export CODEX_HOME=/tmp/codex-home
+mkdir -p "$CODEX_HOME"
+cp -n /usr/local/share/codex-seed/config.toml "$CODEX_HOME/" 2>/dev/null
+exec codex exec --skip-git-repo-check --ephemeral -C /workspace "$@" </dev/null

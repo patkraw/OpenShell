@@ -1,0 +1,6 @@
+#!/bin/sh
+# Start `opencode run` with the seeded config. The built-in `task` subagent tool
+# stays enabled, so the matrix sees which spawn path the model picks.
+export HOME=/tmp/opencode-home OPENCODE_CONFIG=/usr/local/share/opencode-seed/opencode.json
+mkdir -p "$HOME"
+exec opencode run --auto "$@"

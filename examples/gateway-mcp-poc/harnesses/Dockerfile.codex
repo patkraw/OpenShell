@@ -1,0 +1,17 @@
+# Codex CLI for the harness matrix: a native Rust binary (behind a Node shim),
+# MCP over Streamable HTTP, its own bubblewrap sandbox and a built-in
+# spawn_agent tool. Codex 0.95+ speaks only the Responses API.
+FROM node:24-bookworm-slim
+
+ARG CODEX_VERSION=0.160.1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" && npm cache clean --force
+
+COPY codex-seed/ /usr/local/share/codex-seed/
+COPY --chmod=755 codex-run /usr/local/bin/codex-run
+
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+WORKDIR /workspace
