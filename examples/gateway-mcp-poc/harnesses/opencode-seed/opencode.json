@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "nvidia/aws/anthropic/bedrock-claude-sonnet-5-5",
+  "small_model": "nvidia/aws/anthropic/bedrock-claude-sonnet-5-5",
+  "enabled_providers": ["nvidia"],
+  "autoupdate": false,
+  "share": "disabled",
+  "provider": {
+    "nvidia": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "NVIDIA Inference",
+      "options": { "baseURL": "https://inference-api.nvidia.com/v1", "apiKey": "{env:OPENAI_API_KEY}" },
+      "models": {
+        "aws/anthropic/bedrock-claude-sonnet-5-5": {
+          "name": "Claude Sonnet 5.5", "tool_call": true,
+          "limit": { "context": 200000, "output": 32000 }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "openshell": { "type": "remote", "url": "http://openshell.local/mcp", "enabled": true, "oauth": false, "timeout": 600000 }
+  }
+}

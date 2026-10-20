@@ -1,0 +1,32 @@
+# Codex for the harness matrix. The built-in multi_agent (spawn_agent) tool stays
+# on, so the matrix sees which spawn path the model picks.
+model = "aws/anthropic/bedrock-claude-sonnet-5-5"
+model_provider = "nvidia"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+check_for_update_on_startup = false
+web_search = "disabled"
+
+[model_providers.nvidia]
+name = "NVIDIA Inference"
+base_url = "https://inference-api.nvidia.com/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+
+[mcp_servers.openshell]
+url = "http://openshell.local/mcp"
+required = true
+startup_timeout_sec = 30
+tool_timeout_sec = 600
+
+[features]
+plugins = false
+
+[analytics]
+enabled = false
+[feedback]
+enabled = false
+[otel]
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
