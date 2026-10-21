@@ -44,7 +44,7 @@ list never goes out of date:
 | Caller | Tools |
 |---|---|
 | User (host) | `create_sandbox`, `grant_list`, `grant_create`, `grant_update` |
-| Sandbox | `create_sandbox`, `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`, `submit_result` |
+| Sandbox | `create_sandbox`, `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`, `mark_done` |
 
 Whether a call is allowed is decided when it is made: a sandbox without a grant,
 at its maximum depth or out of budget gets `NOT_ALLOWED` or `LIMIT_REACHED`.
@@ -53,14 +53,14 @@ at its maximum depth or out of budget gets `NOT_ALLOWED` or `LIMIT_REACHED`.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `create_sandbox` | `command`, `kind` (`agent`/`tool`), `lifetime`, `name`, `task`, `policy` (`{"network_policies": {...}}`), `providers`, `request_id`, `idle_timeout_s`; users only: `image`, `grant` | `handle` |
-| `wait` | `handle`, `timeout_s`, `for_result` (keep waiting past ready until the child submits or exits; direct children only) | `phase`, `exit_code`, `result` (the child's submitted result, direct parent only) |
+| `wait` | `handle`, `timeout_s`, `for_done` (keep waiting past ready until the child calls `mark_done` or exits) | `phase`, `exit_code`, `done` |
 | `exec` | `handle`, `command`, `timeout_s` (tool children only) | `stdout`, `stderr`, `exit_code` |
 | `get_file` | `handle`, `path` | `content` (max 256 KiB) |
 | `get_output` | `handle` | recent log lines of the child (not a durable result; the child's own standard output is not included) |
 | `stop_sandbox` | `handle` | `stopped` (its children are stopped first) |
 | `list_children` | none | children |
 | `get_limits` | none | depth, children and total, used and allowed |
-| `submit_result` | `result` (max 32 KiB) | `saved`, `repeated`; one final result per child, for its direct parent. `NOT_A_CHILD`, `TOO_LARGE`, `ALREADY_SUBMITTED` (different text) |
+| `mark_done` | none | `done`, `repeated`. The child says its result file is ready; the gateway keeps only the flag. `NOT_A_CHILD` |
 | `grant_list` | none | the grants the caller set, or administers |
 | `grant_create` | `sandbox`, `grant` (same form as `create_sandbox`'s `grant`) | the new grant; replaces a revoked or expired grant for the running tree; refused with `ALREADY_EXISTS` while the sandbox holds an active grant, `NOT_ALLOWED` if it is a child |
 | `grant_update` | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits; `NOT_ALLOWED` unless the caller set the grant or is a Workspace Admin |
@@ -374,5 +374,5 @@ HTTP 403
 
 ```http
 HTTP 200
-["create_sandbox","wait","exec","get_file","get_output","stop_sandbox","list_children","get_limits","submit_result"]
+["create_sandbox","wait","exec","get_file","get_output","stop_sandbox","list_children","get_limits","mark_done"]
 ```

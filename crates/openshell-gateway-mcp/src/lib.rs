@@ -79,7 +79,7 @@ pub struct Access {
     /// `create_sandbox`.
     pub create_sandbox: bool,
     /// `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`,
-    /// `submit_result`.
+    /// `mark_done`.
     pub manage_children: bool,
     /// `grant_list`, `grant_create`, `grant_update` (users only).
     pub grants: bool,
@@ -151,16 +151,9 @@ pub struct WaitArgs {
     pub handle: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
-    /// Keep waiting past READY until the child submits its result or exits.
+    /// Keep waiting past READY until the child marks itself done or exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_result: Option<bool>,
-}
-
-/// A child hands its final result to its parent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubmitResultArgs {
-    pub result: String,
+    pub for_done: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,7 +208,7 @@ pub enum Operation {
     Stop(HandleArgs),
     ListChildren,
     GetLimits,
-    SubmitResult(SubmitResultArgs),
+    MarkDone,
     GrantList,
     GrantCreate(GrantCreateArgs),
     GrantUpdate(GrantUpdateArgs),
@@ -284,9 +277,9 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "wait",
         group: Group::Manage,
-        description: "Wait until a child is ready, has submitted its result, or has exited. \
-            Returns the child's result once it has called submit_result.",
-        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "for_result": {"type": "boolean", "description": "Keep waiting past ready until the child submits its result or exits. Direct children only"}}, "required": ["handle"]}),
+        description: "Wait until a child is ready, is done, or has exited. Once \"done\" is \
+            true, read its result with get_file, then stop it.",
+        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "for_done": {"type": "boolean", "description": "Keep waiting past ready until the child calls mark_done or exits"}}, "required": ["handle"]}),
     },
     ToolDef {
         name: "exec",
@@ -326,12 +319,12 @@ const TOOLS: &[ToolDef] = &[
         schema: || json!({"type": "object", "additionalProperties": false, "properties": {}}),
     },
     ToolDef {
-        name: "submit_result",
+        name: "mark_done",
         group: Group::Manage,
-        description: "Hand your final result to the sandbox that created you; its `wait` returns \
-            it. Call once when your task is done, then you may exit. Max 32 KiB; leave \
-            larger output in a file for the parent to read with get_file.",
-        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"result": {"type": "string"}}, "required": ["result"]}),
+        description: "Tell the sandbox that created you that your task is done. Write your \
+            result to a file first; the parent reads it with get_file. Stay running after \
+            this: your files go when you exit, and the parent stops you once it has read them.",
+        schema: || json!({"type": "object", "additionalProperties": false, "properties": {}}),
     },
     ToolDef {
         name: "grant_list",
@@ -409,7 +402,7 @@ pub fn parse_operation(name: &str, arguments: Value) -> Result<Operation, ApiErr
         "stop_sandbox" => Operation::Stop(args(arguments)?),
         "list_children" => Operation::ListChildren,
         "get_limits" => Operation::GetLimits,
-        "submit_result" => Operation::SubmitResult(args(arguments)?),
+        "mark_done" => Operation::MarkDone,
         "grant_list" => Operation::GrantList,
         "grant_create" => Operation::GrantCreate(args(arguments)?),
         "grant_update" => Operation::GrantUpdate(args(arguments)?),
@@ -557,20 +550,17 @@ fn json_response(v: &Value) -> Response {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn parses_submit_result_and_wait_for_result() {
+    fn parses_mark_done_and_wait_for_done() {
         assert_eq!(
-            parse_operation("submit_result", json!({"result": "ok"})).unwrap(),
-            Operation::SubmitResult(SubmitResultArgs {
-                result: "ok".into()
-            })
+            parse_operation("mark_done", json!({})).unwrap(),
+            Operation::MarkDone
         );
-        assert!(parse_operation("submit_result", json!({})).is_err());
         assert_eq!(
-            parse_operation("wait", json!({"handle": "w1", "for_result": true})).unwrap(),
+            parse_operation("wait", json!({"handle": "w1", "for_done": true})).unwrap(),
             Operation::Wait(WaitArgs {
                 handle: "w1".into(),
                 timeout_s: None,
-                for_result: Some(true),
+                for_done: Some(true),
             })
         );
     }
