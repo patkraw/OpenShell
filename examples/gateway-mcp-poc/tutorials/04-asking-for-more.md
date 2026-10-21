@@ -77,11 +77,18 @@ openshell rule approve lead --chunk-id "$CHUNK_ID"
 ```
 
 ```text
+Network Rules:  (version 1, 1 chunk)
+
   Chunk: ad53c838-4f33-40f2-9f88-68c3a2bf2dc1
   Status: pending
   Rule: github_write
+  Binary: /usr/local/bin/node
+  Confidence: 75%
   Rationale: Let a child sandbox open GitHub pull requests.
+  Prover: prover: no new findings
+  Candidate: 4b58be6fb98e
   Endpoints: api.github.com:443 [L7 rest, allow POST /repos/**]
+  Binaries: /usr/local/bin/node
 
 OK Chunk approved. Policy version: 2, hash: 4b58be6fb98e
 ```

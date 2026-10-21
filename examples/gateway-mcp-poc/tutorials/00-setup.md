@@ -68,8 +68,11 @@ openshell gateway list
 
 ```text
   NAME        ENDPOINT                 TYPE   SOURCE  AUTH
-  docker-dev  http://127.0.0.1:18080   local  user    plaintext
+* docker-dev  http://127.0.0.1:18080   local  user    plaintext
 ```
+
+- The **`*`** marks the gateway the CLI uses (`OPENSHELL_GATEWAY`). Other
+  gateways you registered are listed too.
 
 ```shell
 openshell sandbox list

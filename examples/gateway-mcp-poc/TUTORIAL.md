@@ -22,7 +22,7 @@ mise run gateway:docker      # builds the gateway and supervisor image; serves o
 In a second terminal:
 
 ```shell
-cargo build -p openshell-cli
+mise exec -- cargo build -p openshell-cli
 docker build -t pi-agent:local -f examples/gateway-mcp-poc/Dockerfile.pi examples/gateway-mcp-poc
 ```
 
@@ -68,7 +68,11 @@ target/debug/openshell -g docker-dev sandbox exec lead -- \
   node /usr/local/lib/gateway-mcp/mcp-client.mjs get_limits
 target/debug/openshell -g docker-dev sandbox exec lead -- \
   node /usr/local/lib/gateway-mcp/mcp-client.mjs create_sandbox '{"name":"w1","command":["sleep","300"]}'
+target/debug/openshell -g docker-dev sandbox exec lead -- \
+  node /usr/local/lib/gateway-mcp/mcp-client.mjs wait '{"handle":"w1","timeout_s":60}'
 ```
+
+A new child takes a few seconds to start; `wait` returns once it is ready.
 
 The child `w1` runs the lead's template (same image, CPU and memory, no GPU). Its
 depth is 1, the maximum. It reaches the gateway MCP and sees the same tools, but
@@ -100,6 +104,8 @@ it is stopped after 10 idle minutes:
 ```shell
 target/debug/openshell -g docker-dev sandbox exec lead -- \
   node /usr/local/lib/gateway-mcp/mcp-client.mjs create_sandbox '{"name":"t1","kind":"tool"}'
+target/debug/openshell -g docker-dev sandbox exec lead -- \
+  node /usr/local/lib/gateway-mcp/mcp-client.mjs wait '{"handle":"t1","timeout_s":60}'
 target/debug/openshell -g docker-dev sandbox exec lead -- \
   node /usr/local/lib/gateway-mcp/mcp-client.mjs exec '{"handle":"t1","command":["uname","-a"]}'
 ```
@@ -180,17 +186,21 @@ grant_list: {"grants": [{"grant_id": "gr-...", "holder": "sdk-lead", "max_breadt
 
 [`sdk/sandbox_child.mjs`](sdk/sandbox_child.mjs) runs inside the sandbox the
 Python example created. With `@modelcontextprotocol/sdk` 1.31.0 (installed in the
-image) it creates a tool sandbox, runs a command in it and stops it:
+image) it creates a tool sandbox, runs a command in it and stops it. Wait until
+`sdk-lead` is ready first:
 
 ```shell
+until target/debug/openshell -g docker-dev sandbox get sdk-lead 2>/dev/null | grep -q 'Phase: Ready'; do sleep 2; done
 target/debug/openshell -g docker-dev sandbox exec sdk-lead -- \
   node /usr/local/lib/gateway-mcp/sandbox_child.mjs
 ```
 
 ```text
-create_sandbox: ok {"can_create_children":false,"depth":1,"handle":"sdk-tool","kind":"tool",...}
-wait: ok {"handle":"sdk-tool","phase":"SANDBOX_PHASE_READY",...}
-exec: ok {"exit_code":0,"stdout":"hello from 44774938feb6\n",...}
+tools: create_sandbox, wait, exec, get_file, get_output, stop_sandbox, list_children, get_limits, mark_done
+get_limits: ok {"can_create_children":true,"can_create_tools":true,"children_created":0,"depth":0,...}
+create_sandbox: ok {"can_create_children":false,"depth":1,"handle":"sdk-tool",...,"kind":"tool",...}
+wait: ok {"done":false,"exit_code":null,"handle":"sdk-tool","phase":"SANDBOX_PHASE_READY","timed_out":false}
+exec: ok {"exit_code":0,"handle":"sdk-tool","stderr":"","stdout":"hello from 44774938feb6\n"}
 stop_sandbox: ok {"handle":"sdk-tool","stopped":true}
 ```
 
@@ -232,8 +242,7 @@ crate's tests do exactly that with a fake backend.
 Deleting a sandbox stops its children first:
 
 ```shell
-target/debug/openshell -g docker-dev sandbox delete lead
-target/debug/openshell -g docker-dev sandbox delete sdk-lead
+for s in lead box1 sdk-lead grpc-lead; do target/debug/openshell -g docker-dev sandbox delete $s; done
 ```
 
 ## 6. Run all checks
