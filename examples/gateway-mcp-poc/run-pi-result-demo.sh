@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# A real Pi lead delegates to a real Pi worker. The worker hands its answer back
+# with submit_result and exits; the lead gets it from wait (for_result), with no
+# result file and no polling.
+# Needs: dev gateway (mise run gateway:docker), image pi-agent:local, and a
+# provider "harness-nvidia" with your key (see harnesses/provider-harness-nvidia.yaml).
+set -u
+cd "$(dirname "$0")"
+OS="${OPENSHELL_BIN:-../../target/debug/openshell} -g ${GATEWAY:-docker-dev}"
+PROVIDER="${PROVIDER:-harness-nvidia}"
+wait_ready() { for _ in $(seq 1 60); do $OS sandbox get "$1" 2>/dev/null | grep -q 'Phase: Ready' && return 0; sleep 2; done; return 1; }
+wait_gone() { for _ in $(seq 1 60); do $OS sandbox list 2>/dev/null | grep -q "^$1 " || return 0; sleep 2; done; }
+
+$OS sandbox delete lead >/dev/null 2>&1; wait_gone lead
+echo "== Starting the lead"
+$OS sandbox create --name lead --from pi-agent:local --policy lead.yaml --provider "$PROVIDER" \
+  --grant-program /usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 --grant-expires 1h \
+  --no-tty --detach -- sleep 3600 >/dev/null
+wait_ready lead || { echo "lead not ready"; exit 1; }
+
+WORKER_TASK='What is 17 * 23? Then write a two-line poem about sandboxes. When you are done, call the submit_result tool of the "openshell" MCP server with your full answer as result. Do not write any files.'
+IFS= read -r -d '' TASK <<PROMPT
+You are a lead agent running inside an OpenShell sandbox. You have MCP tools from the
+"openshell" server that create and manage child sandboxes. Do not answer the question yourself.
+
+1. Call create_sandbox with name "worker", providers ["$PROVIDER"], lifetime "until_exit",
+   request_id "result-demo-1", and command ["pi-run","-p","$WORKER_TASK"].
+2. Call wait with handle "worker", for_result true and timeout_s 300. Its "result" field is the
+   worker's answer. If it timed out, call wait again the same way (at most 3 times).
+3. Reply with: the worker's answer exactly as returned in "result", the worker's exit_code,
+   and one sentence on how you received the answer.
+PROMPT
+echo "== Running Pi in the lead"
+$OS sandbox exec lead -- pi-run -p "$TASK"
+echo
+echo "== Sandboxes now"
+$OS sandbox list
