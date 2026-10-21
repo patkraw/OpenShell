@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start Hermes as a one-shot (`hermes -z`: prompt in, final answer out) with the
+# seeded config in a writable HERMES_HOME. The built-in `delegate_task` subagent
+# tool stays enabled, so the matrix sees which spawn path the model picks.
+# `sandbox exec` does not pass the image's ENV, so set the defaults here too.
+export HOME=/tmp/hermes-home HERMES_HOME=/tmp/hermes-home HERMES_DISABLE_LAZY_INSTALLS=1 \
+    PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$HERMES_HOME"
+cp -n /usr/local/share/hermes-seed/config.yaml "$HERMES_HOME/" 2>/dev/null
+# As a sandbox's main command, stdin is open but never written, and `hermes -z`
+# would read it as part of the prompt. Close it unless it is a terminal.
+[ -t 0 ] || exec </dev/null
+exec hermes --yolo -z "$@"
