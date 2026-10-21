@@ -193,7 +193,7 @@ mcp mid create_sandbox '{"name":"leaf","command":["true"],"policy":{"network_pol
 
 ```text
 {"isError":false,"can_create_children":true,"depth":1,"handle":"mid",...}
-{"isError":false,"exit_code":null,"handle":"mid","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"handle":"mid","phase":"SANDBOX_PHASE_READY","result":null,"timed_out":false}
 {"isError":true,"error":"EXCEEDS_CEILING","message":"... counterexample: Network { host: \"example.com\", port: 443, protocol: L4, ... }. ..."}
 ```
 

@@ -108,10 +108,10 @@ target/debug/openshell -g docker-dev sandbox exec lead -- \
 
 ### Getting results
 
-`wait` reports when a child is ready or has exited; `get_file` reads a file from
-a running child. READY does not mean an agent child has finished: have it write
-its result to a temporary file and rename it into place, then poll `get_file`
-until the file exists ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)):
+A child hands its final result (at most 32 KiB) to its direct parent with
+`submit_result`; the parent's `wait` with `for_result: true` returns it, even
+after the child has exited ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)).
+`get_file` reads any other file from a running child:
 
 ```shell
 target/debug/openshell -g docker-dev sandbox exec lead -- \
