@@ -60,7 +60,7 @@ const PROPOSAL_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// latency but enough to cover the in-memory coverage check.
 const RELOAD_WAIT_MIN_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
-const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
 /// Hard ceiling on how long a single request body read can stall. Bounds a
 /// slowloris-style upload from an in-sandbox process; the proxy listener only
 /// accepts loopback connections, so practical impact is limited, but this is
@@ -1231,6 +1231,12 @@ fn network_endpoint_from_json(
         // policy.local proposals cannot reference a concrete sandbox provider.
         credential_binding: None,
     })
+}
+
+/// The request's declared body length, if its headers are complete and valid.
+pub(crate) fn declared_body_len(initial_request: &[u8]) -> Option<usize> {
+    let header_end = find_header_end(initial_request)?;
+    parse_content_length(&initial_request[..header_end]).ok()
 }
 
 pub(crate) async fn read_request_body<S>(initial_request: &[u8], client: &mut S) -> Result<Vec<u8>>

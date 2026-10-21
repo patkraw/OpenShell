@@ -286,7 +286,7 @@ const TOOLS: &[ToolDef] = &[
         group: Group::Manage,
         description: "Wait until a child is ready, has submitted its result, or has exited. \
             Returns the child's result once it has called submit_result.",
-        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "for_result": {"type": "boolean", "description": "Keep waiting past ready until the child submits its result or exits"}}, "required": ["handle"]}),
+        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "for_result": {"type": "boolean", "description": "Keep waiting past ready until the child submits its result or exits. Direct children only"}}, "required": ["handle"]}),
     },
     ToolDef {
         name: "exec",
@@ -329,7 +329,8 @@ const TOOLS: &[ToolDef] = &[
         name: "submit_result",
         group: Group::Manage,
         description: "Hand your final result to the sandbox that created you; its `wait` returns \
-            it. Call once when your task is done, then you may exit. Max 64 KiB.",
+            it. Call once when your task is done, then you may exit. Max 32 KiB; leave \
+            larger output in a file for the parent to read with get_file.",
         schema: || json!({"type": "object", "additionalProperties": false, "properties": {"result": {"type": "string"}}, "required": ["result"]}),
     },
     ToolDef {

@@ -48,7 +48,10 @@ mcp lead wait '{"handle":"w1","timeout_s":120}' >/dev/null
 out=$(mcp w1 create_sandbox "$(submits g1 3 from-g1 'sleep 600')")
 check "w1 may create g1 (depth 2)" "$out" '"handle":"g1"'
 check "w1 waits for g1's result" "$(mcp w1 wait '{"handle":"g1","timeout_s":120,"for_result":true}')" '"result":"from-g1"'
-echo "     lead waits for its grandchild g1: $(mcp lead wait '{"handle":"g1","timeout_s":10,"for_result":true}')"
+check "the lead may not wait for g1's result" \
+  "$(mcp lead wait '{"handle":"g1","timeout_s":10,"for_result":true}')" 'NOT_DIRECT_CHILD'
+check "a plain wait on g1 shows no result to the lead" \
+  "$(mcp lead wait '{"handle":"g1","timeout_s":10}')" '"result":null' 
 check "w1 has submitted nothing, so the lead sees no result" \
   "$(mcp lead wait '{"handle":"w1","timeout_s":3,"for_result":true}')" '"result":null'
 
@@ -67,14 +70,18 @@ check "curl in w1 is refused" "$out" 'PROGRAM_NOT_ALLOWED'
 check "w1 still has no result" "$(mcp lead wait '{"handle":"w1","timeout_s":3,"for_result":true}')" '"result":null'
 
 echo "5. Limits"
-out=$($OS sandbox exec w1 -- node -e "
-  const body = (id, m, p) => JSON.stringify({jsonrpc: '2.0', id, method: m, params: p});
-  const post = (b) => fetch('http://openshell.local/mcp', {method: 'POST', body: b,
-    headers: {'content-type': 'application/json', accept: 'application/json, text/event-stream'}}).then(r => r.text());
-  post(body(1, 'tools/call', {name: 'submit_result', arguments: {result: 'x'.repeat(64 * 1024 + 1)}}))
-    .then(console.log, (e) => console.log('connection closed: ' + (e.cause?.code ?? e.message)));")
-# The door's 64 KiB body limit is hit before the gateway's 64 KiB result limit.
-echo "     65 KiB submit: $out"
+# A JS one-liner in w1 (node, so the program check passes) that submits N bytes.
+submit_bytes() {
+  $OS sandbox exec w1 -- node -e "
+    const b = JSON.stringify({jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: {name: 'submit_result', arguments: {result: 'x'.repeat($1)}}});
+    fetch('http://openshell.local/mcp', {method: 'POST', body: b,
+      headers: {'content-type': 'application/json', accept: 'application/json, text/event-stream'}})
+      .then(async (r) => console.log(r.status, await r.text()),
+            (e) => console.log('connection closed: ' + (e.cause?.code ?? e.message)));"
+}
+check "33 KiB is refused by the gateway" "$(submit_bytes $((33 * 1024)))" 'TOO_LARGE'
+check "70 KiB is refused by the door, with a reason" "$(submit_bytes $((70 * 1024)))" 'request_too_large'
 check "w1 still has no result" "$(mcp lead wait '{"handle":"w1","timeout_s":3,"for_result":true}')" '"result":null'
 check "w1 submits" "$(mcp w1 submit_result '{"result":"first"}')" '"saved":true'
 check "same text again is a no-op" "$(mcp w1 submit_result '{"result":"first"}')" '"repeated":true'

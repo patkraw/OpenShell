@@ -1371,6 +1371,18 @@ async fn wait_child(
     args: &Value,
 ) -> Result<Value, ToolError> {
     let child = own_child(state, caller_id, args)?;
+    // A result goes to the direct parent only; it decides what to pass up.
+    let direct = child.parent_id.as_deref() == Some(caller_id);
+    let for_result = args.get("for_result").and_then(Value::as_bool) == Some(true);
+    if for_result && !direct {
+        return Err(terr(
+            "NOT_DIRECT_CHILD",
+            format!(
+                "'{}' is not your direct child; its result goes to its own parent",
+                child.name
+            ),
+        ));
+    }
     let timeout = args
         .get("timeout_s")
         .and_then(Value::as_u64)
@@ -1396,9 +1408,11 @@ async fn wait_child(
         let ready = phase == SandboxPhase::Ready
             && child.lifetime == "until_stopped"
             && args.get("until_exit").is_none()
-            && args.get("for_result").and_then(Value::as_bool) != Some(true);
+            && !for_result;
         // A submitted result ends the wait even while the child keeps running.
-        let result = state.children.result_of(&child.sandbox_id);
+        let result = direct
+            .then(|| state.children.result_of(&child.sandbox_id))
+            .flatten();
         if exited || ready || result.is_some() || tokio::time::Instant::now() >= deadline {
             return Ok(json!({
                 "handle": child.name,
@@ -1412,7 +1426,9 @@ async fn wait_child(
     }
 }
 
-const MAX_RESULT_BYTES: usize = 64 * 1024;
+/// Below the door's 64 KiB request limit even after JSON escaping, so an
+/// oversized result gets this gateway's `TOO_LARGE`, not the door's refusal.
+const MAX_RESULT_BYTES: usize = 32 * 1024;
 
 /// A child hands its final result to its parent; the parent's `wait` returns
 /// it. The caller is the authenticated sandbox, so a child can only submit its
@@ -2726,5 +2742,36 @@ mod tests {
             .insert("other".into(), lineage_for("other", None));
         let err = wait_child(&state, "other", &args).await.unwrap_err();
         assert_eq!(err.code, "NOT_YOUR_CHILD");
+    }
+
+    #[tokio::test]
+    async fn only_the_direct_parent_gets_a_result() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        {
+            let mut i = state.children.lock();
+            i.lineage.insert("lead".into(), lineage_for("lead", None));
+            i.lineage
+                .insert("w1".into(), lineage_for("w1", Some("lead")));
+            i.lineage.insert("g1".into(), lineage_for("g1", Some("w1")));
+        }
+        let mut sb = stored_sandbox("g1", SandboxPolicy::default(), Some("w1"));
+        sb.status = Some(openshell_core::proto::SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        });
+        state.store.put_message(&sb).await.unwrap();
+        submit_result(&state, "g1", "from g1").unwrap();
+
+        let for_result = json!({"handle": "g1", "timeout_s": 1, "for_result": true});
+        let v = wait_child(&state, "w1", &for_result).await.unwrap();
+        assert_eq!(v["result"], "from g1");
+        // The grandparent may still wait for the grandchild, but not for its result.
+        let err = wait_child(&state, "lead", &for_result).await.unwrap_err();
+        assert_eq!(err.code, "NOT_DIRECT_CHILD");
+        let v = wait_child(&state, "lead", &json!({"handle": "g1", "timeout_s": 1}))
+            .await
+            .unwrap();
+        assert_eq!(v["phase"], "SANDBOX_PHASE_READY");
+        assert!(v["result"].is_null());
     }
 }
