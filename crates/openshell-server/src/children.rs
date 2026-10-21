@@ -166,6 +166,9 @@ struct Inner {
     lineage: HashMap<String, Lineage>,
     /// (parent sandbox id, request_id) -> state of the first request.
     requests: HashMap<(String, String), RequestState>,
+    /// Child sandbox id -> the final result it submitted for its parent. In
+    /// memory, like lineage: lost on a gateway restart.
+    results: HashMap<String, String>,
 }
 
 /// The outcome of reserving a child slot under the grant.
@@ -374,9 +377,33 @@ impl ChildrenState {
             .collect()
     }
 
+    /// Keep a child's result. One per child: the same text again is a no-op
+    /// (`Ok(true)`), different text is refused.
+    fn submit_result(&self, sandbox_id: &str, result: &str) -> Result<bool, ToolError> {
+        let mut inner = self.lock();
+        match inner.results.get(sandbox_id) {
+            Some(prev) if prev == result => Ok(true),
+            Some(_) => Err(terr(
+                "ALREADY_SUBMITTED",
+                "a different result was already submitted; a child submits one final result",
+            )),
+            None => {
+                inner
+                    .results
+                    .insert(sandbox_id.to_string(), result.to_string());
+                Ok(false)
+            }
+        }
+    }
+
+    fn result_of(&self, sandbox_id: &str) -> Option<String> {
+        self.lock().results.get(sandbox_id).cloned()
+    }
+
     pub fn forget(&self, sandbox_id: &str) {
         let mut inner = self.lock();
         inner.lineage.remove(sandbox_id);
+        inner.results.remove(sandbox_id);
         inner.grants.retain(|_, g| g.holder_id != sandbox_id);
         inner.requests.retain(|(parent, _), _| parent != sandbox_id);
     }
@@ -851,6 +878,9 @@ impl SandboxApi for GatewaySandboxApi {
                 Ok(list_children(state, &s.sandbox_id))
             }
             (Principal::Sandbox(s), Operation::GetLimits) => Ok(get_limits(state, &s.sandbox_id)),
+            (Principal::Sandbox(s), Operation::SubmitResult(a)) => {
+                submit_result(state, &s.sandbox_id, &a.result)
+            }
             (Principal::User(u), Operation::GrantList) => Ok(grant_list(state, caller, u).await),
             (Principal::User(u), Operation::GrantCreate(a)) => {
                 grant_create(state, u, "default", &a.sandbox, &a.grant).await
@@ -1368,17 +1398,51 @@ async fn wait_child(
             );
         let ready = phase == SandboxPhase::Ready
             && child.lifetime == "until_stopped"
-            && args.get("until_exit").is_none();
-        if exited || ready || tokio::time::Instant::now() >= deadline {
+            && args.get("until_exit").is_none()
+            && args.get("for_result").and_then(Value::as_bool) != Some(true);
+        // A submitted result ends the wait even while the child keeps running.
+        let result = state.children.result_of(&child.sandbox_id);
+        if exited || ready || result.is_some() || tokio::time::Instant::now() >= deadline {
             return Ok(json!({
                 "handle": child.name,
                 "phase": phase.as_str_name(),
                 "exit_code": status.exit_code,
-                "timed_out": !exited && !ready
+                "result": result,
+                "timed_out": !exited && !ready && result.is_none()
             }));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+const MAX_RESULT_BYTES: usize = 64 * 1024;
+
+/// A child hands its final result to its parent; the parent's `wait` returns
+/// it. The caller is the authenticated sandbox, so a child can only submit its
+/// own result.
+fn submit_result(state: &ServerState, caller_id: &str, result: &str) -> Result<Value, ToolError> {
+    let me = state
+        .children
+        .lineage(caller_id)
+        .filter(|l| l.parent_id.is_some())
+        .ok_or_else(|| {
+            terr(
+                "NOT_A_CHILD",
+                "only a child sandbox has a parent to submit to",
+            )
+        })?;
+    if result.len() > MAX_RESULT_BYTES {
+        return Err(terr(
+            "TOO_LARGE",
+            format!(
+                "result is {} bytes; the limit is {MAX_RESULT_BYTES}. Leave larger output in a file \
+                 for the parent to read with get_file",
+                result.len()
+            ),
+        ));
+    }
+    let repeated = state.children.submit_result(caller_id, result)?;
+    Ok(json!({"handle": me.name, "saved": true, "repeated": repeated}))
 }
 
 async fn child_output(
@@ -1828,6 +1892,7 @@ pub(crate) mod grpc_surface {
         let op = Operation::Wait(WaitArgs {
             handle: r.handle,
             timeout_s: timeout(r.timeout.as_ref())?,
+            for_result: None,
         });
         let v = run(state, &req, op).await?;
         Ok(Response::new(pb::WaitChildSandboxResponse {
@@ -2560,5 +2625,109 @@ mod tests {
             .map(|l| l.name)
             .collect();
         assert_eq!(d, vec!["a1".to_string(), "a".to_string()]);
+    }
+
+    fn lineage_for(id: &str, parent: Option<&str>) -> Lineage {
+        Lineage {
+            sandbox_id: id.into(),
+            name: id.into(),
+            workspace: "default".into(),
+            parent_id: parent.map(str::to_string),
+            depth: u32::from(parent.is_some()),
+            grant_id: "g".into(),
+            kind: "agent".into(),
+            lifetime: "until_stopped".into(),
+            children_created: 0,
+            user: user("alice", &[]).identity,
+            idle_timeout_ms: None,
+            last_used_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_submits_one_result_for_its_parent() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        {
+            let mut i = state.children.lock();
+            i.lineage.insert("lead".into(), lineage_for("lead", None));
+            i.lineage
+                .insert("w1".into(), lineage_for("w1", Some("lead")));
+        }
+        // The top of the tree has no parent to submit to.
+        let err = submit_result(&state, "lead", "x").unwrap_err();
+        assert_eq!(err.code, "NOT_A_CHILD");
+
+        let v = submit_result(&state, "w1", "LGTM, 2 nits").unwrap();
+        assert_eq!(v["saved"], true);
+        assert_eq!(v["repeated"], false);
+        // A retry with the same text is a no-op; different text is refused.
+        assert_eq!(
+            submit_result(&state, "w1", "LGTM, 2 nits").unwrap()["repeated"],
+            true
+        );
+        let err = submit_result(&state, "w1", "something else").unwrap_err();
+        assert_eq!(err.code, "ALREADY_SUBMITTED");
+        assert_eq!(
+            state.children.result_of("w1").as_deref(),
+            Some("LGTM, 2 nits")
+        );
+
+        // Stopping the child forgets its result.
+        state.children.forget("w1");
+        assert_eq!(state.children.result_of("w1"), None);
+    }
+
+    #[tokio::test]
+    async fn a_result_has_a_size_limit() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .children
+            .lock()
+            .lineage
+            .insert("w1".into(), lineage_for("w1", Some("lead")));
+        let big = "x".repeat(MAX_RESULT_BYTES + 1);
+        assert_eq!(
+            submit_result(&state, "w1", &big).unwrap_err().code,
+            "TOO_LARGE"
+        );
+        assert_eq!(state.children.result_of("w1"), None);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_a_submitted_result_while_the_child_runs() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        {
+            let mut i = state.children.lock();
+            i.lineage.insert("lead".into(), lineage_for("lead", None));
+            i.lineage
+                .insert("w1".into(), lineage_for("w1", Some("lead")));
+        }
+        let mut sb = stored_sandbox("w1", SandboxPolicy::default(), Some("lead"));
+        sb.status = Some(openshell_core::proto::SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        });
+        state.store.put_message(&sb).await.unwrap();
+
+        // Without a result, for_result keeps waiting past READY until the timeout.
+        let args = json!({"handle": "w1", "timeout_s": 1, "for_result": true});
+        let v = wait_child(&state, "lead", &args).await.unwrap();
+        assert_eq!(v["timed_out"], true);
+        assert!(v["result"].is_null());
+
+        submit_result(&state, "w1", "done: 391").unwrap();
+        let v = wait_child(&state, "lead", &args).await.unwrap();
+        assert_eq!(v["timed_out"], false);
+        assert_eq!(v["result"], "done: 391");
+        assert_eq!(v["phase"], "SANDBOX_PHASE_READY");
+
+        // Only the parent can wait for it.
+        state
+            .children
+            .lock()
+            .lineage
+            .insert("other".into(), lineage_for("other", None));
+        let err = wait_child(&state, "other", &args).await.unwrap_err();
+        assert_eq!(err.code, "NOT_YOUR_CHILD");
     }
 }

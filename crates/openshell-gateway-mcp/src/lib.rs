@@ -78,7 +78,8 @@ pub trait CallerInfo: Send + Sync {
 pub struct Access {
     /// `create_sandbox`.
     pub create_sandbox: bool,
-    /// `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`.
+    /// `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`,
+    /// `submit_result`.
     pub manage_children: bool,
     /// `grant_list`, `grant_create`, `grant_update` (users only).
     pub grants: bool,
@@ -150,6 +151,16 @@ pub struct WaitArgs {
     pub handle: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
+    /// Keep waiting past READY until the child submits its result or exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_result: Option<bool>,
+}
+
+/// A child hands its final result to its parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitResultArgs {
+    pub result: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +215,7 @@ pub enum Operation {
     Stop(HandleArgs),
     ListChildren,
     GetLimits,
+    SubmitResult(SubmitResultArgs),
     GrantList,
     GrantCreate(GrantCreateArgs),
     GrantUpdate(GrantUpdateArgs),
@@ -272,8 +284,9 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "wait",
         group: Group::Manage,
-        description: "Wait until a child is ready or has exited.",
-        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}}, "required": ["handle"]}),
+        description: "Wait until a child is ready, has submitted its result, or has exited. \
+            Returns the child's result once it has called submit_result.",
+        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "for_result": {"type": "boolean", "description": "Keep waiting past ready until the child submits its result or exits"}}, "required": ["handle"]}),
     },
     ToolDef {
         name: "exec",
@@ -311,6 +324,13 @@ const TOOLS: &[ToolDef] = &[
         group: Group::Manage,
         description: "Your depth, children and total used and allowed.",
         schema: || json!({"type": "object", "additionalProperties": false, "properties": {}}),
+    },
+    ToolDef {
+        name: "submit_result",
+        group: Group::Manage,
+        description: "Hand your final result to the sandbox that created you; its `wait` returns \
+            it. Call once when your task is done, then you may exit. Max 64 KiB.",
+        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"result": {"type": "string"}}, "required": ["result"]}),
     },
     ToolDef {
         name: "grant_list",
@@ -388,6 +408,7 @@ pub fn parse_operation(name: &str, arguments: Value) -> Result<Operation, ApiErr
         "stop_sandbox" => Operation::Stop(args(arguments)?),
         "list_children" => Operation::ListChildren,
         "get_limits" => Operation::GetLimits,
+        "submit_result" => Operation::SubmitResult(args(arguments)?),
         "grant_list" => Operation::GrantList,
         "grant_create" => Operation::GrantCreate(args(arguments)?),
         "grant_update" => Operation::GrantUpdate(args(arguments)?),
@@ -534,6 +555,24 @@ fn json_response(v: &Value) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_submit_result_and_wait_for_result() {
+        assert_eq!(
+            parse_operation("submit_result", json!({"result": "ok"})).unwrap(),
+            Operation::SubmitResult(SubmitResultArgs {
+                result: "ok".into()
+            })
+        );
+        assert!(parse_operation("submit_result", json!({})).is_err());
+        assert_eq!(
+            parse_operation("wait", json!({"handle": "w1", "for_result": true})).unwrap(),
+            Operation::Wait(WaitArgs {
+                handle: "w1".into(),
+                timeout_s: None,
+                for_result: Some(true),
+            })
+        );
+    }
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
