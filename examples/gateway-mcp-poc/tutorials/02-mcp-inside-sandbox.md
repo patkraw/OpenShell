@@ -30,7 +30,7 @@ mcp lead get_limits
 ```
 
 ```text
-["create_sandbox","wait","exec","get_file","get_output","stop_sandbox","list_children","get_limits","mark_done"]
+["create_sandbox","wait","exec","get_file","get_output","stop_sandbox","list_children","get_limits"]
 {"isError":false,"can_create_children":true,"can_create_tools":true,"children_created":0,"depth":0,"grant_id":"gr-1ffdaff2","has_grant":true,"max_breadth":4,"max_depth":1,"max_total":6,"total":1}
 ```
 
@@ -64,8 +64,8 @@ mcp lead wait '{"handle":"w1","timeout_s":60}'
 ```
 
 ```text
-{"isError":false,"done":false,"exit_code":null,"handle":"t1","phase":"SANDBOX_PHASE_READY","timed_out":false}
-{"isError":false,"done":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"handle":"t1","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","timed_out":false}
 ```
 
 Run a command in the tool sandbox, and read a file from the agent child:
@@ -88,7 +88,7 @@ mcp lead wait '{"handle":"once","timeout_s":60}'
 ```
 
 ```text
-{"isError":false,"done":false,"exit_code":0,"handle":"once","phase":"SANDBOX_PHASE_COMPLETED","timed_out":false}
+{"isError":false,"exit_code":0,"handle":"once","phase":"SANDBOX_PHASE_COMPLETED","timed_out":false}
 ```
 
 List and stop:
@@ -109,38 +109,38 @@ mcp lead stop_sandbox '{"handle":"t1"}'
 
 ### Collect an agent child's result
 
-**The child writes its result to a file and calls `mark_done`; the parent's
-`wait` returns, and the parent reads the file with `get_file`.** The gateway
-keeps only the "done" flag, never the result. Here the child's command stands
-in for an agent: it works for 20 seconds, writes `/tmp/result.txt`, marks
-itself done, and stays running so its file can be read. With a real agent,
-`run-child` does those steps around the agent's command, as in
-[`run-pi-done-demo.sh`](../run-pi-done-demo.sh), so the model does not have to
-remember them.
+**The child writes its result to a file and keeps running; the parent's `wait`
+with `until_file` returns once the file exists, and the parent reads it with
+`get_file`.** The child never calls the gateway, and the gateway stores
+nothing: it checks for the file through the same relay `get_file` uses. Here
+the child's command stands in for an agent: it works for 20 seconds, then
+writes `/tmp/result.txt` whole and renames it into place, so the file never
+appears half-written. With a real agent, `run-child` does that around the
+agent's command, as in [`run-pi-result-demo.sh`](../run-pi-result-demo.sh).
 
 ```shell
-mcp lead create_sandbox '{"name":"rev","command":["sh","-c","sleep 20; echo \"review: LGTM, 2 nits\" > /tmp/result.txt; node /usr/local/lib/gateway-mcp/mcp-client.mjs mark_done {}; sleep 600"]}'
-mcp lead wait '{"handle":"rev","timeout_s":120,"for_done":true}'
+mcp lead create_sandbox '{"name":"rev","command":["sh","-c","sleep 20; echo \"review: LGTM, 2 nits\" > /tmp/result.tmp && mv /tmp/result.tmp /tmp/result.txt; sleep 600"]}'
+mcp lead wait '{"handle":"rev","timeout_s":120,"until_file":"/tmp/result.txt"}'
 mcp lead get_file '{"handle":"rev","path":"/tmp/result.txt"}'
 mcp lead stop_sandbox '{"handle":"rev"}'
 ```
 
 ```text
 {"isError":false,...,"handle":"rev","kind":"agent","lifetime":"until_stopped"}
-{"isError":false,"done":true,"exit_code":null,"handle":"rev","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"file_ready":true,"handle":"rev","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":false,"content":"review: LGTM, 2 nits\n","handle":"rev","path":"/tmp/result.txt"}
 {"isError":false,"handle":"rev","stopped":true}
 ```
 
-- **`for_done: true`** keeps `wait` going past READY until the child calls
-  `mark_done` or exits. Without it, an agent child's `wait` returns at READY,
-  before the work is done.
-- **Not done plus an exit code means it failed:** a child that exits without
-  marking done returns `"done":false` and its exit code, and its files are gone.
+- **`until_file`** keeps `wait` going past READY until that file exists in the
+  child, or the child exits. Without it, an agent child's `wait` returns at
+  READY, before the work is done.
+- **No file plus an exit code means it failed:** a child that exits without
+  writing the file returns `"file_ready":false` and its exit code, and its
+  files are gone.
 - **The child must stay running** until the parent has read its file, so
   don't use `lifetime: until_exit` for agent children whose result you need.
   Stop the child when you have read it.
-- **Any ancestor** may wait for "done"; it carries no content.
 
 ## 4. Refusals, and why
 
@@ -150,14 +150,12 @@ mcp lead stop_sandbox '{"handle":"rev"}'
 | `w1` creates an agent | `LIMIT_REACHED` | `w1` is at `max_depth` |
 | `exec` on an agent | `WRONG_KIND` | `exec` is for tool sandboxes |
 | `get_file` on a sandbox that is not your child (here: the lead itself) | `NOT_YOUR_CHILD` | you act only on your descendants |
-| `mark_done` from the lead | `NOT_A_CHILD` | only a child has a parent to tell |
 
 ```shell
 openshell sandbox exec lead -- curl -s -X POST http://openshell.local/mcp -d '{}'; echo
 mcp w1 create_sandbox '{"name":"g1","command":["true"]}'
 mcp lead exec '{"handle":"w1","command":["id"]}'
 mcp lead get_file '{"handle":"lead","path":"/etc/hostname"}'
-mcp lead mark_done '{}'
 ```
 
 ```text
@@ -165,7 +163,6 @@ PROGRAM_NOT_ALLOWED: calls from '/usr/bin/curl' are not allowed; this tree's gra
 {"isError":true,"error":"LIMIT_REACHED","message":"depth: 1 of 1"}
 {"isError":true,"error":"WRONG_KIND","message":"'w1' is an agent sandbox; exec is for tool sandboxes"}
 {"isError":true,"error":"NOT_YOUR_CHILD","message":"'lead' is not your child"}
-{"isError":true,"error":"NOT_A_CHILD","message":"only a child sandbox has a parent to tell"}
 ```
 
 `w1` still reaches the gateway, sees the same tools, and can create **tool**
@@ -185,7 +182,7 @@ Clean up: `openshell sandbox delete lead`.
 
 - Agents reach the gateway at **`http://openshell.local/mcp`** with **no
   credential**; the supervisor adds the identity and program.
-- **Agents** run their own task, write a result file and call `mark_done`;
-  the parent `wait`s with `for_done` and reads the file with `get_file`.
-  **Tools** run your commands (`exec`).
+- **Agents** run their own task and write a result file; the parent `wait`s
+  with `until_file` and reads it with `get_file`. **Tools** run your commands
+  (`exec`).
 - Every refusal names its reason, so an agent can adapt in one turn.

@@ -55,7 +55,7 @@ mise run gateway:docker                     # builds the gateway and supervisor 
 docker build -t pi-agent:local -f examples/gateway-mcp-poc/Dockerfile.pi examples/gateway-mcp-poc
 cargo build -p openshell-cli
 examples/gateway-mcp-poc/run-checks.sh      # end-to-end checks; see Results below
-examples/gateway-mcp-poc/check-child-done.sh     # mark_done, wait for_done, get_file
+examples/gateway-mcp-poc/check-child-results.sh  # wait until_file, get_file
 ```
 
 Try it by hand:
@@ -131,19 +131,20 @@ Python. One `openshell-supervisor-network` proxy test
 (`mediated_connect_keeps_workload_bytes_read_with_the_synthesized_header`)
 fails on this machine with and without the proof of concept's changes.
 
-**Child results (`mark_done`): 74/74 plus 20/20 in `check-child-done.sh`**
-(2026-10-21, same setup). `run-pi-done-demo.sh` runs it with real Pi agents:
-`run-child` saves the worker's answer and marks it done, and the lead waits,
-reads the file with `get_file` and stops the worker.
+**Child results (`wait` with `until_file`): 74/74 plus 17/17 in
+`check-child-results.sh`** (2026-10-21, same setup). `run-pi-result-demo.sh` runs
+it with real Pi agents: `run-child` saves the worker's answer, and the lead waits
+for the file, reads it with `get_file` and stops the worker. The worker never
+calls the gateway.
 
 Run `examples/gateway-mcp-poc/run-checks.sh` against a dev gateway (see Test it)
 to reproduce.
 
 ## Known limits of the proof of concept
 
-- Grants, lineage and "done" flags live in memory; a gateway restart loses them.
-- `mark_done` and `wait`'s `done` are on MCP only; the gRPC `WaitChildSandbox`
-  response does not carry `done` yet.
+- Grants and lineage live in memory; a gateway restart loses them.
+- `wait`'s `until_file` is on MCP only; the gRPC `WaitChildSandbox` request does
+  not take it yet.
 - A child's result lives only in its files, so it is lost if the child exits or
   is stopped before the parent reads it.
 - The door forwards the sandbox's session token, not a dedicated short-lived token.

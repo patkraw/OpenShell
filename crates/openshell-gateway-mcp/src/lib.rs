@@ -78,8 +78,7 @@ pub trait CallerInfo: Send + Sync {
 pub struct Access {
     /// `create_sandbox`.
     pub create_sandbox: bool,
-    /// `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`,
-    /// `mark_done`.
+    /// `wait`, `exec`, `get_file`, `get_output`, `stop_sandbox`, `list_children`, `get_limits`.
     pub manage_children: bool,
     /// `grant_list`, `grant_create`, `grant_update` (users only).
     pub grants: bool,
@@ -151,9 +150,9 @@ pub struct WaitArgs {
     pub handle: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
-    /// Keep waiting past READY until the child marks itself done or exits.
+    /// Keep waiting past READY until this file exists in the child, or it exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_done: Option<bool>,
+    pub until_file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,7 +207,6 @@ pub enum Operation {
     Stop(HandleArgs),
     ListChildren,
     GetLimits,
-    MarkDone,
     GrantList,
     GrantCreate(GrantCreateArgs),
     GrantUpdate(GrantUpdateArgs),
@@ -277,9 +275,10 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "wait",
         group: Group::Manage,
-        description: "Wait until a child is ready, is done, or has exited. Once \"done\" is \
-            true, read its result with get_file, then stop it.",
-        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "for_done": {"type": "boolean", "description": "Keep waiting past ready until the child calls mark_done or exits"}}, "required": ["handle"]}),
+        description: "Wait until a child is ready or has exited. With until_file, wait until \
+            the child has written that file (its result), then read it with get_file and \
+            stop the child.",
+        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "until_file": {"type": "string", "description": "Absolute path in the child, e.g. /tmp/result.txt. Keep waiting past ready until it exists or the child exits"}}, "required": ["handle"]}),
     },
     ToolDef {
         name: "exec",
@@ -316,14 +315,6 @@ const TOOLS: &[ToolDef] = &[
         name: "get_limits",
         group: Group::Manage,
         description: "Your depth, children and total used and allowed.",
-        schema: || json!({"type": "object", "additionalProperties": false, "properties": {}}),
-    },
-    ToolDef {
-        name: "mark_done",
-        group: Group::Manage,
-        description: "Tell the sandbox that created you that your task is done. Write your \
-            result to a file first; the parent reads it with get_file. Stay running after \
-            this: your files go when you exit, and the parent stops you once it has read them.",
         schema: || json!({"type": "object", "additionalProperties": false, "properties": {}}),
     },
     ToolDef {
@@ -402,7 +393,6 @@ pub fn parse_operation(name: &str, arguments: Value) -> Result<Operation, ApiErr
         "stop_sandbox" => Operation::Stop(args(arguments)?),
         "list_children" => Operation::ListChildren,
         "get_limits" => Operation::GetLimits,
-        "mark_done" => Operation::MarkDone,
         "grant_list" => Operation::GrantList,
         "grant_create" => Operation::GrantCreate(args(arguments)?),
         "grant_update" => Operation::GrantUpdate(args(arguments)?),
@@ -550,19 +540,20 @@ fn json_response(v: &Value) -> Response {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn parses_mark_done_and_wait_for_done() {
+    fn parses_wait_until_file() {
         assert_eq!(
-            parse_operation("mark_done", json!({})).unwrap(),
-            Operation::MarkDone
-        );
-        assert_eq!(
-            parse_operation("wait", json!({"handle": "w1", "for_done": true})).unwrap(),
+            parse_operation(
+                "wait",
+                json!({"handle": "w1", "until_file": "/tmp/result.txt"})
+            )
+            .unwrap(),
             Operation::Wait(WaitArgs {
                 handle: "w1".into(),
                 timeout_s: None,
-                for_done: Some(true),
+                until_file: Some("/tmp/result.txt".into()),
             })
         );
+        assert!(parse_operation("mark_done", json!({})).is_err());
     }
     use super::*;
     use axum::body::Body;

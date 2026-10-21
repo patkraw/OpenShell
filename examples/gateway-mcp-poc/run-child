@@ -1,12 +1,12 @@
 #!/bin/sh
-# Run an agent child's task so its result reaches the parent without the model
-# having to remember anything: save the command's output to /tmp/result.txt
-# (written whole, then renamed), call mark_done, and stay running so the parent
-# can read the file with get_file. The parent stops the child when it is done.
+# Run an agent child's task so its parent can collect the result: save the
+# command's output to /tmp/result.txt (written whole, then renamed, so it never
+# appears half-written) and stay running so the parent can read it. The child
+# never calls the gateway; the parent's `wait` with until_file sees the file,
+# reads it with get_file and stops the child.
 # Usage: run-child <command> [args...]   e.g. run-child pi-run -p "task"
 out=/tmp/result.txt
 "$@" > "$out.tmp" 2> /tmp/result.err
 echo $? > /tmp/result.exit
 mv "$out.tmp" "$out"
-node /usr/local/lib/gateway-mcp/mcp-client.mjs mark_done '{}' >/dev/null
 exec sleep "${RUN_CHILD_LINGER_S:-3600}"
