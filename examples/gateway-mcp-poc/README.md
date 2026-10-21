@@ -55,6 +55,7 @@ mise run gateway:docker                     # builds the gateway and supervisor 
 docker build -t pi-agent:local -f examples/gateway-mcp-poc/Dockerfile.pi examples/gateway-mcp-poc
 cargo build -p openshell-cli
 examples/gateway-mcp-poc/run-checks.sh      # end-to-end checks; see Results below
+examples/gateway-mcp-poc/check-child-results.sh  # submit_result and wait for_result
 ```
 
 Try it by hand:
@@ -130,12 +131,18 @@ Python. One `openshell-supervisor-network` proxy test
 (`mediated_connect_keeps_workload_bytes_read_with_the_synthesized_header`)
 fails on this machine with and without the proof of concept's changes.
 
+**Child results (`submit_result`): 74/74 plus 20/20 in `check-child-results.sh`**
+(2026-10-21, same setup). `run-pi-result-demo.sh` runs it with real Pi agents: the
+worker calls `submit_result` itself and the lead's first `wait` returns the answer.
+
 Run `examples/gateway-mcp-poc/run-checks.sh` against a dev gateway (see Test it)
 to reproduce.
 
 ## Known limits of the proof of concept
 
-- Grants and lineage live in memory; a gateway restart loses them.
+- Grants, lineage and child results live in memory; a gateway restart loses them.
+- `submit_result` and `wait`'s `result` are on MCP only; the gRPC `WaitChildSandbox`
+  response does not carry the result yet.
 - The door forwards the sandbox's session token, not a dedicated short-lived token.
 - The global policy works as today (`replace`); a child create with a policy is refused while one is active. `maximum` mode from the RFC is not built.
 - The door handles only plain HTTP to the gateway (the dev gateway has TLS off).
