@@ -78,7 +78,7 @@ openshell sandbox exec sdk-lead -- node /usr/local/lib/gateway-mcp/sandbox_child
 ```
 
 ```text
-tools: create_sandbox, wait, exec, get_file, get_output, stop_sandbox, list_children, get_limits
+tools: create_sandbox, wait, exec, get_file, get_output, stop_sandbox, list_children, get_limits, mark_done
 get_limits: ok {"can_create_children":true,"can_create_tools":true,"children_created":0,"depth":0,...}
 create_sandbox: ok {"can_create_children":false,"depth":1,"handle":"sdk-tool","idle_timeout_s":600,"kind":"tool",...}
 wait: ok {"done":false,"exit_code":null,"handle":"sdk-tool","phase":"SANDBOX_PHASE_READY","timed_out":false}

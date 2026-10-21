@@ -76,8 +76,8 @@ openshell sandbox list --tree
 
 ```text
 NAME                 KIND   LIFETIME       DEPTH
-w1                   agent  until_stopped  1
 t1                   tool   until_stopped  1
+w1                   agent  until_stopped  1
 
 lead
 ├─ t1  (tool, depth 1)

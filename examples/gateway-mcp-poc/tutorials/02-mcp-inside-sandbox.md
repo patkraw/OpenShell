@@ -99,10 +99,11 @@ mcp lead stop_sandbox '{"handle":"t1"}'
 ```
 
 ```text
-{"isError":false,"children":[{"depth":1,"handle":"w1","kind":"agent",...},{"depth":1,"handle":"once",...},{"depth":1,"handle":"t1","kind":"tool",...}]}
+{"isError":false,"children":[{"depth":1,"handle":"once","kind":"agent",...},{"depth":1,"handle":"w1","kind":"agent",...},{"depth":1,"handle":"t1","kind":"tool",...}]}
 {"isError":false,"handle":"t1","stopped":true}
 ```
 
+- `list_children` returns the children in no fixed order.
 - A child that has **exited** leaves only its **exit code**. Its files are
   gone; read them while it runs (next section).
 
