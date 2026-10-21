@@ -114,11 +114,11 @@ target/debug/openshell -g docker-dev sandbox exec lead -- \
 
 ### Getting results
 
-A child writes its result to a file and calls `mark_done`; the parent's `wait`
-with `for_done: true` returns, and the parent reads the file with `get_file`
+A child writes its result to a file and keeps running; the parent's `wait` with
+`until_file` returns once the file exists, and the parent reads it with `get_file`
 while the child is still running ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)).
-The gateway keeps only the "done" flag. `get_file` reads any file from a running
-child:
+The child never calls the gateway, and the gateway stores nothing. `get_file`
+reads any file from a running child:
 
 ```shell
 target/debug/openshell -g docker-dev sandbox exec lead -- \
@@ -196,10 +196,10 @@ target/debug/openshell -g docker-dev sandbox exec sdk-lead -- \
 ```
 
 ```text
-tools: create_sandbox, wait, exec, get_file, get_output, stop_sandbox, list_children, get_limits, mark_done
+tools: create_sandbox, wait, exec, get_file, get_output, stop_sandbox, list_children, get_limits
 get_limits: ok {"can_create_children":true,"can_create_tools":true,"children_created":0,"depth":0,...}
 create_sandbox: ok {"can_create_children":false,"depth":1,"handle":"sdk-tool",...,"kind":"tool",...}
-wait: ok {"done":false,"exit_code":null,"handle":"sdk-tool","phase":"SANDBOX_PHASE_READY","timed_out":false}
+wait: ok {"exit_code":null,"handle":"sdk-tool","phase":"SANDBOX_PHASE_READY","timed_out":false}
 exec: ok {"exit_code":0,"handle":"sdk-tool","stderr":"","stdout":"hello from 44774938feb6\n"}
 stop_sandbox: ok {"handle":"sdk-tool","stopped":true}
 ```

@@ -35,7 +35,7 @@ mcp lead exec '{"handle":"build","command":["sh","-c","echo compiling; ls /usr/l
 
 ```text
 {"isError":false,"can_create_children":false,"depth":1,"handle":"build","idle_timeout_s":600,"kind":"tool",...}
-{"isError":false,"done":false,"exit_code":null,"handle":"build","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"handle":"build","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":false,"exit_code":2,"handle":"build","stderr":"","stdout":"compiling\ncorepack\ndocker-entrypoint.sh\nfd\n"}
 ```
 
@@ -76,11 +76,11 @@ mcp w1 exec '{"handle":"w1-tool","command":["echo","leaf ran this"]}'
 
 ```text
 {"isError":false,"can_create_children":false,"depth":1,"handle":"w1","kind":"agent",...}
-{"isError":false,"done":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":false,"can_create_children":false,"can_create_tools":true,"depth":1,...}
 {"isError":true,"error":"LIMIT_REACHED","message":"depth: 1 of 1"}
 {"isError":false,"can_create_children":false,"depth":2,"handle":"w1-tool","idle_timeout_s":600,"kind":"tool",...}
-{"isError":false,"done":false,"exit_code":null,"handle":"w1-tool","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"exit_code":null,"handle":"w1-tool","phase":"SANDBOX_PHASE_READY","timed_out":false}
 {"isError":false,"exit_code":0,"handle":"w1-tool","stderr":"","stdout":"leaf ran this\n"}
 ```
 

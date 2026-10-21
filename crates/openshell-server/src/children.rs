@@ -38,7 +38,7 @@ use openshell_gateway_mcp::{
 };
 use openshell_prover::containment::{self, CheckOptions, CheckResult};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -166,10 +166,6 @@ struct Inner {
     lineage: HashMap<String, Lineage>,
     /// (parent sandbox id, request_id) -> state of the first request.
     requests: HashMap<(String, String), RequestState>,
-    /// Child sandbox ids that said they are done. Only a flag: the result stays
-    /// in the child, and its parent reads it with `get_file`. In memory, like
-    /// lineage: lost on a gateway restart.
-    done: HashSet<String>,
 }
 
 /// The outcome of reserving a child slot under the grant.
@@ -378,19 +374,9 @@ impl ChildrenState {
             .collect()
     }
 
-    /// Mark a child done. Returns whether it already was.
-    fn mark_done(&self, sandbox_id: &str) -> bool {
-        !self.lock().done.insert(sandbox_id.to_string())
-    }
-
-    fn is_done(&self, sandbox_id: &str) -> bool {
-        self.lock().done.contains(sandbox_id)
-    }
-
     pub fn forget(&self, sandbox_id: &str) {
         let mut inner = self.lock();
         inner.lineage.remove(sandbox_id);
-        inner.done.remove(sandbox_id);
         inner.grants.retain(|_, g| g.holder_id != sandbox_id);
         inner.requests.retain(|(parent, _), _| parent != sandbox_id);
     }
@@ -865,7 +851,6 @@ impl SandboxApi for GatewaySandboxApi {
                 Ok(list_children(state, &s.sandbox_id))
             }
             (Principal::Sandbox(s), Operation::GetLimits) => Ok(get_limits(state, &s.sandbox_id)),
-            (Principal::Sandbox(s), Operation::MarkDone) => mark_done(state, &s.sandbox_id),
             (Principal::User(u), Operation::GrantList) => Ok(grant_list(state, caller, u).await),
             (Principal::User(u), Operation::GrantCreate(a)) => {
                 grant_create(state, u, "default", &a.sandbox, &a.grant).await
@@ -1359,7 +1344,23 @@ async fn wait_child(
     args: &Value,
 ) -> Result<Value, ToolError> {
     let child = own_child(state, caller_id, args)?;
-    let for_done = args.get("for_done").and_then(Value::as_bool) == Some(true);
+    // The result stays in the child's files. With until_file the gateway checks
+    // for the file itself, so the child never calls the gateway and the parent
+    // makes one call; nothing is stored.
+    let until_file = match args.get("until_file") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let path = v.as_str().unwrap_or_default();
+            if !path.starts_with('/') || path.contains('\0') {
+                return Err(terr(
+                    "INVALID_ARGUMENT",
+                    "until_file must be an absolute path in the child",
+                ));
+            }
+            Some(path.to_string())
+        }
+    };
+    let mut next_check = tokio::time::Instant::now();
     let timeout = args
         .get("timeout_s")
         .and_then(Value::as_u64)
@@ -1385,36 +1386,43 @@ async fn wait_child(
         let ready = phase == SandboxPhase::Ready
             && child.lifetime == "until_stopped"
             && args.get("until_exit").is_none()
-            && !for_done;
-        // "Done" ends the wait while the child keeps running, so its files are
-        // still there for get_file.
-        let done = state.children.is_done(&child.sandbox_id);
-        if exited || ready || done || tokio::time::Instant::now() >= deadline {
-            return Ok(json!({
+            && until_file.is_none();
+        let mut file_ready = false;
+        if let Some(path) = until_file.as_deref()
+            && phase == SandboxPhase::Ready
+            && tokio::time::Instant::now() >= next_check
+        {
+            next_check = tokio::time::Instant::now() + FILE_CHECK_INTERVAL;
+            // A failed check (the child is still starting) just means "not yet".
+            file_ready = matches!(
+                run_in_child(
+                    state,
+                    &child,
+                    vec!["test".into(), "-f".into(), path.into()],
+                    Duration::from_secs(10),
+                )
+                .await,
+                Ok((_, _, 0))
+            );
+        }
+        if exited || ready || file_ready || tokio::time::Instant::now() >= deadline {
+            let mut out = json!({
                 "handle": child.name,
                 "phase": phase.as_str_name(),
                 "exit_code": status.exit_code,
-                "done": done,
-                "timed_out": !exited && !ready && !done
-            }));
+                "timed_out": !exited && !ready && !file_ready
+            });
+            if until_file.is_some() {
+                out["file_ready"] = json!(file_ready);
+            }
+            return Ok(out);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-/// A child tells its parent it is done. Only a flag is kept: the result stays
-/// in the child's files, and the parent reads it with `get_file` before it
-/// stops the child. The caller is the authenticated sandbox, so a child can
-/// only mark itself done.
-fn mark_done(state: &ServerState, caller_id: &str) -> Result<Value, ToolError> {
-    let me = state
-        .children
-        .lineage(caller_id)
-        .filter(|l| l.parent_id.is_some())
-        .ok_or_else(|| terr("NOT_A_CHILD", "only a child sandbox has a parent to tell"))?;
-    let repeated = state.children.mark_done(caller_id);
-    Ok(json!({"handle": me.name, "done": true, "repeated": repeated}))
-}
+/// How often `wait` with `until_file` looks for the file.
+const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
 async fn child_output(
     state: &Arc<ServerState>,
@@ -1863,7 +1871,7 @@ pub(crate) mod grpc_surface {
         let op = Operation::Wait(WaitArgs {
             handle: r.handle,
             timeout_s: timeout(r.timeout.as_ref())?,
-            for_done: None,
+            until_file: None,
         });
         let v = run(state, &req, op).await?;
         Ok(Response::new(pb::WaitChildSandboxResponse {
@@ -2616,7 +2624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_child_marks_itself_done() {
+    async fn until_file_needs_an_absolute_path() {
         let state = crate::grpc::test_support::test_server_state().await;
         {
             let mut i = state.children.lock();
@@ -2624,61 +2632,39 @@ mod tests {
             i.lineage
                 .insert("w1".into(), lineage_for("w1", Some("lead")));
         }
-        // The top of the tree has no parent to tell.
-        assert_eq!(mark_done(&state, "lead").unwrap_err().code, "NOT_A_CHILD");
-
-        let v = mark_done(&state, "w1").unwrap();
-        assert_eq!(v["done"], true);
-        assert_eq!(v["repeated"], false);
-        assert_eq!(mark_done(&state, "w1").unwrap()["repeated"], true);
-        assert!(state.children.is_done("w1"));
-
-        // Stopping the child forgets the flag.
-        state.children.forget("w1");
-        assert!(!state.children.is_done("w1"));
+        for path in ["result.txt", "", "/tmp/a\0b"] {
+            let args = json!({"handle": "w1", "timeout_s": 1, "until_file": path});
+            let err = wait_child(&state, "lead", &args).await.unwrap_err();
+            assert_eq!(err.code, "INVALID_ARGUMENT", "{path:?}");
+        }
     }
 
     #[tokio::test]
-    async fn wait_for_done_returns_while_the_child_runs() {
+    async fn until_file_keeps_waiting_past_ready() {
         let state = crate::grpc::test_support::test_server_state().await;
         {
             let mut i = state.children.lock();
             i.lineage.insert("lead".into(), lineage_for("lead", None));
             i.lineage
                 .insert("w1".into(), lineage_for("w1", Some("lead")));
-            i.lineage.insert("g1".into(), lineage_for("g1", Some("w1")));
         }
-        for (name, parent) in [("w1", "lead"), ("g1", "w1")] {
-            let mut sb = stored_sandbox(name, SandboxPolicy::default(), Some(parent));
-            sb.status = Some(openshell_core::proto::SandboxStatus {
-                phase: SandboxPhase::Ready as i32,
-                ..Default::default()
-            });
-            state.store.put_message(&sb).await.unwrap();
-        }
+        let mut sb = stored_sandbox("w1", SandboxPolicy::default(), Some("lead"));
+        sb.status = Some(openshell_core::proto::SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        });
+        state.store.put_message(&sb).await.unwrap();
 
-        // Before "done", for_done keeps waiting past READY until the timeout.
-        let args = json!({"handle": "w1", "timeout_s": 1, "for_done": true});
+        // A plain wait returns at READY; with until_file it waits for the file.
+        // There is no real sandbox here, so the file never shows up.
+        let v = wait_child(&state, "lead", &json!({"handle": "w1", "timeout_s": 1}))
+            .await
+            .unwrap();
+        assert_eq!(v["timed_out"], false);
+        let args = json!({"handle": "w1", "timeout_s": 1, "until_file": "/tmp/result.txt"});
         let v = wait_child(&state, "lead", &args).await.unwrap();
         assert_eq!(v["timed_out"], true);
-        assert_eq!(v["done"], false);
-
-        mark_done(&state, "w1").unwrap();
-        let v = wait_child(&state, "lead", &args).await.unwrap();
-        assert_eq!(v["timed_out"], false);
-        assert_eq!(v["done"], true);
-        assert_eq!(v["phase"], "SANDBOX_PHASE_READY");
-
-        // Any ancestor may see the flag; it carries no content.
-        mark_done(&state, "g1").unwrap();
-        let v = wait_child(
-            &state,
-            "lead",
-            &json!({"handle": "g1", "timeout_s": 1, "for_done": true}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(v["done"], true);
+        assert_eq!(v["file_ready"], false);
 
         // A sandbox outside the tree cannot wait for it.
         state
