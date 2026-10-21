@@ -37,7 +37,7 @@ use openshell_gateway_mcp::{
 };
 use openshell_prover::containment::{self, CheckOptions, CheckResult};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -165,9 +165,10 @@ struct Inner {
     lineage: HashMap<String, Lineage>,
     /// (parent sandbox id, request_id) -> state of the first request.
     requests: HashMap<(String, String), RequestState>,
-    /// Child sandbox id -> the final result it submitted for its parent. In
-    /// memory, like lineage: lost on a gateway restart.
-    results: HashMap<String, String>,
+    /// Child sandbox ids that said they are done. Only a flag: the result stays
+    /// in the child, and its parent reads it with `get_file`. In memory, like
+    /// lineage: lost on a gateway restart.
+    done: HashSet<String>,
 }
 
 /// The outcome of reserving a child slot under the grant.
@@ -376,33 +377,19 @@ impl ChildrenState {
             .collect()
     }
 
-    /// Keep a child's result. One per child: the same text again is a no-op
-    /// (`Ok(true)`), different text is refused.
-    fn submit_result(&self, sandbox_id: &str, result: &str) -> Result<bool, ToolError> {
-        let mut inner = self.lock();
-        match inner.results.get(sandbox_id) {
-            Some(prev) if prev == result => Ok(true),
-            Some(_) => Err(terr(
-                "ALREADY_SUBMITTED",
-                "a different result was already submitted; a child submits one final result",
-            )),
-            None => {
-                inner
-                    .results
-                    .insert(sandbox_id.to_string(), result.to_string());
-                Ok(false)
-            }
-        }
+    /// Mark a child done. Returns whether it already was.
+    fn mark_done(&self, sandbox_id: &str) -> bool {
+        !self.lock().done.insert(sandbox_id.to_string())
     }
 
-    fn result_of(&self, sandbox_id: &str) -> Option<String> {
-        self.lock().results.get(sandbox_id).cloned()
+    fn is_done(&self, sandbox_id: &str) -> bool {
+        self.lock().done.contains(sandbox_id)
     }
 
     pub fn forget(&self, sandbox_id: &str) {
         let mut inner = self.lock();
         inner.lineage.remove(sandbox_id);
-        inner.results.remove(sandbox_id);
+        inner.done.remove(sandbox_id);
         inner.grants.retain(|_, g| g.holder_id != sandbox_id);
         inner.requests.retain(|(parent, _), _| parent != sandbox_id);
     }
@@ -875,9 +862,7 @@ impl SandboxApi for GatewaySandboxApi {
                 Ok(list_children(state, &s.sandbox_id))
             }
             (Principal::Sandbox(s), Operation::GetLimits) => Ok(get_limits(state, &s.sandbox_id)),
-            (Principal::Sandbox(s), Operation::SubmitResult(a)) => {
-                submit_result(state, &s.sandbox_id, &a.result)
-            }
+            (Principal::Sandbox(s), Operation::MarkDone) => mark_done(state, &s.sandbox_id),
             (Principal::User(u), Operation::GrantList) => Ok(grant_list(state, caller, u).await),
             (Principal::User(u), Operation::GrantCreate(a)) => {
                 grant_create(state, u, "default", &a.sandbox, &a.grant).await
@@ -1371,18 +1356,7 @@ async fn wait_child(
     args: &Value,
 ) -> Result<Value, ToolError> {
     let child = own_child(state, caller_id, args)?;
-    // A result goes to the direct parent only; it decides what to pass up.
-    let direct = child.parent_id.as_deref() == Some(caller_id);
-    let for_result = args.get("for_result").and_then(Value::as_bool) == Some(true);
-    if for_result && !direct {
-        return Err(terr(
-            "NOT_DIRECT_CHILD",
-            format!(
-                "'{}' is not your direct child; its result goes to its own parent",
-                child.name
-            ),
-        ));
-    }
+    let for_done = args.get("for_done").and_then(Value::as_bool) == Some(true);
     let timeout = args
         .get("timeout_s")
         .and_then(Value::as_u64)
@@ -1408,54 +1382,35 @@ async fn wait_child(
         let ready = phase == SandboxPhase::Ready
             && child.lifetime == "until_stopped"
             && args.get("until_exit").is_none()
-            && !for_result;
-        // A submitted result ends the wait even while the child keeps running.
-        let result = direct
-            .then(|| state.children.result_of(&child.sandbox_id))
-            .flatten();
-        if exited || ready || result.is_some() || tokio::time::Instant::now() >= deadline {
+            && !for_done;
+        // "Done" ends the wait while the child keeps running, so its files are
+        // still there for get_file.
+        let done = state.children.is_done(&child.sandbox_id);
+        if exited || ready || done || tokio::time::Instant::now() >= deadline {
             return Ok(json!({
                 "handle": child.name,
                 "phase": phase.as_str_name(),
                 "exit_code": status.exit_code,
-                "result": result,
-                "timed_out": !exited && !ready && result.is_none()
+                "done": done,
+                "timed_out": !exited && !ready && !done
             }));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-/// Below the door's 64 KiB request limit even after JSON escaping, so an
-/// oversized result gets this gateway's `TOO_LARGE`, not the door's refusal.
-const MAX_RESULT_BYTES: usize = 32 * 1024;
-
-/// A child hands its final result to its parent; the parent's `wait` returns
-/// it. The caller is the authenticated sandbox, so a child can only submit its
-/// own result.
-fn submit_result(state: &ServerState, caller_id: &str, result: &str) -> Result<Value, ToolError> {
+/// A child tells its parent it is done. Only a flag is kept: the result stays
+/// in the child's files, and the parent reads it with `get_file` before it
+/// stops the child. The caller is the authenticated sandbox, so a child can
+/// only mark itself done.
+fn mark_done(state: &ServerState, caller_id: &str) -> Result<Value, ToolError> {
     let me = state
         .children
         .lineage(caller_id)
         .filter(|l| l.parent_id.is_some())
-        .ok_or_else(|| {
-            terr(
-                "NOT_A_CHILD",
-                "only a child sandbox has a parent to submit to",
-            )
-        })?;
-    if result.len() > MAX_RESULT_BYTES {
-        return Err(terr(
-            "TOO_LARGE",
-            format!(
-                "result is {} bytes; the limit is {MAX_RESULT_BYTES}. Leave larger output in a file \
-                 for the parent to read with get_file",
-                result.len()
-            ),
-        ));
-    }
-    let repeated = state.children.submit_result(caller_id, result)?;
-    Ok(json!({"handle": me.name, "saved": true, "repeated": repeated}))
+        .ok_or_else(|| terr("NOT_A_CHILD", "only a child sandbox has a parent to tell"))?;
+    let repeated = state.children.mark_done(caller_id);
+    Ok(json!({"handle": me.name, "done": true, "repeated": repeated}))
 }
 
 async fn child_output(
@@ -1905,7 +1860,7 @@ pub(crate) mod grpc_surface {
         let op = Operation::Wait(WaitArgs {
             handle: r.handle,
             timeout_s: timeout(r.timeout.as_ref())?,
-            for_result: None,
+            for_done: None,
         });
         let v = run(state, &req, op).await?;
         Ok(Response::new(pb::WaitChildSandboxResponse {
@@ -2658,7 +2613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_child_submits_one_result_for_its_parent() {
+    async fn a_child_marks_itself_done() {
         let state = crate::grpc::test_support::test_server_state().await;
         {
             let mut i = state.children.lock();
@@ -2666,86 +2621,22 @@ mod tests {
             i.lineage
                 .insert("w1".into(), lineage_for("w1", Some("lead")));
         }
-        // The top of the tree has no parent to submit to.
-        let err = submit_result(&state, "lead", "x").unwrap_err();
-        assert_eq!(err.code, "NOT_A_CHILD");
+        // The top of the tree has no parent to tell.
+        assert_eq!(mark_done(&state, "lead").unwrap_err().code, "NOT_A_CHILD");
 
-        let v = submit_result(&state, "w1", "LGTM, 2 nits").unwrap();
-        assert_eq!(v["saved"], true);
+        let v = mark_done(&state, "w1").unwrap();
+        assert_eq!(v["done"], true);
         assert_eq!(v["repeated"], false);
-        // A retry with the same text is a no-op; different text is refused.
-        assert_eq!(
-            submit_result(&state, "w1", "LGTM, 2 nits").unwrap()["repeated"],
-            true
-        );
-        let err = submit_result(&state, "w1", "something else").unwrap_err();
-        assert_eq!(err.code, "ALREADY_SUBMITTED");
-        assert_eq!(
-            state.children.result_of("w1").as_deref(),
-            Some("LGTM, 2 nits")
-        );
+        assert_eq!(mark_done(&state, "w1").unwrap()["repeated"], true);
+        assert!(state.children.is_done("w1"));
 
-        // Stopping the child forgets its result.
+        // Stopping the child forgets the flag.
         state.children.forget("w1");
-        assert_eq!(state.children.result_of("w1"), None);
+        assert!(!state.children.is_done("w1"));
     }
 
     #[tokio::test]
-    async fn a_result_has_a_size_limit() {
-        let state = crate::grpc::test_support::test_server_state().await;
-        state
-            .children
-            .lock()
-            .lineage
-            .insert("w1".into(), lineage_for("w1", Some("lead")));
-        let big = "x".repeat(MAX_RESULT_BYTES + 1);
-        assert_eq!(
-            submit_result(&state, "w1", &big).unwrap_err().code,
-            "TOO_LARGE"
-        );
-        assert_eq!(state.children.result_of("w1"), None);
-    }
-
-    #[tokio::test]
-    async fn wait_returns_a_submitted_result_while_the_child_runs() {
-        let state = crate::grpc::test_support::test_server_state().await;
-        {
-            let mut i = state.children.lock();
-            i.lineage.insert("lead".into(), lineage_for("lead", None));
-            i.lineage
-                .insert("w1".into(), lineage_for("w1", Some("lead")));
-        }
-        let mut sb = stored_sandbox("w1", SandboxPolicy::default(), Some("lead"));
-        sb.status = Some(openshell_core::proto::SandboxStatus {
-            phase: SandboxPhase::Ready as i32,
-            ..Default::default()
-        });
-        state.store.put_message(&sb).await.unwrap();
-
-        // Without a result, for_result keeps waiting past READY until the timeout.
-        let args = json!({"handle": "w1", "timeout_s": 1, "for_result": true});
-        let v = wait_child(&state, "lead", &args).await.unwrap();
-        assert_eq!(v["timed_out"], true);
-        assert!(v["result"].is_null());
-
-        submit_result(&state, "w1", "done: 391").unwrap();
-        let v = wait_child(&state, "lead", &args).await.unwrap();
-        assert_eq!(v["timed_out"], false);
-        assert_eq!(v["result"], "done: 391");
-        assert_eq!(v["phase"], "SANDBOX_PHASE_READY");
-
-        // Only the parent can wait for it.
-        state
-            .children
-            .lock()
-            .lineage
-            .insert("other".into(), lineage_for("other", None));
-        let err = wait_child(&state, "other", &args).await.unwrap_err();
-        assert_eq!(err.code, "NOT_YOUR_CHILD");
-    }
-
-    #[tokio::test]
-    async fn only_the_direct_parent_gets_a_result() {
+    async fn wait_for_done_returns_while_the_child_runs() {
         let state = crate::grpc::test_support::test_server_state().await;
         {
             let mut i = state.children.lock();
@@ -2754,24 +2645,45 @@ mod tests {
                 .insert("w1".into(), lineage_for("w1", Some("lead")));
             i.lineage.insert("g1".into(), lineage_for("g1", Some("w1")));
         }
-        let mut sb = stored_sandbox("g1", SandboxPolicy::default(), Some("w1"));
-        sb.status = Some(openshell_core::proto::SandboxStatus {
-            phase: SandboxPhase::Ready as i32,
-            ..Default::default()
-        });
-        state.store.put_message(&sb).await.unwrap();
-        submit_result(&state, "g1", "from g1").unwrap();
+        for (name, parent) in [("w1", "lead"), ("g1", "w1")] {
+            let mut sb = stored_sandbox(name, SandboxPolicy::default(), Some(parent));
+            sb.status = Some(openshell_core::proto::SandboxStatus {
+                phase: SandboxPhase::Ready as i32,
+                ..Default::default()
+            });
+            state.store.put_message(&sb).await.unwrap();
+        }
 
-        let for_result = json!({"handle": "g1", "timeout_s": 1, "for_result": true});
-        let v = wait_child(&state, "w1", &for_result).await.unwrap();
-        assert_eq!(v["result"], "from g1");
-        // The grandparent may still wait for the grandchild, but not for its result.
-        let err = wait_child(&state, "lead", &for_result).await.unwrap_err();
-        assert_eq!(err.code, "NOT_DIRECT_CHILD");
-        let v = wait_child(&state, "lead", &json!({"handle": "g1", "timeout_s": 1}))
-            .await
-            .unwrap();
+        // Before "done", for_done keeps waiting past READY until the timeout.
+        let args = json!({"handle": "w1", "timeout_s": 1, "for_done": true});
+        let v = wait_child(&state, "lead", &args).await.unwrap();
+        assert_eq!(v["timed_out"], true);
+        assert_eq!(v["done"], false);
+
+        mark_done(&state, "w1").unwrap();
+        let v = wait_child(&state, "lead", &args).await.unwrap();
+        assert_eq!(v["timed_out"], false);
+        assert_eq!(v["done"], true);
         assert_eq!(v["phase"], "SANDBOX_PHASE_READY");
-        assert!(v["result"].is_null());
+
+        // Any ancestor may see the flag; it carries no content.
+        mark_done(&state, "g1").unwrap();
+        let v = wait_child(
+            &state,
+            "lead",
+            &json!({"handle": "g1", "timeout_s": 1, "for_done": true}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["done"], true);
+
+        // A sandbox outside the tree cannot wait for it.
+        state
+            .children
+            .lock()
+            .lineage
+            .insert("other".into(), lineage_for("other", None));
+        let err = wait_child(&state, "other", &args).await.unwrap_err();
+        assert_eq!(err.code, "NOT_YOUR_CHILD");
     }
 }

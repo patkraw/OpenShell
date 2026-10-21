@@ -108,10 +108,11 @@ target/debug/openshell -g docker-dev sandbox exec lead -- \
 
 ### Getting results
 
-A child hands its final result (at most 32 KiB) to its direct parent with
-`submit_result`; the parent's `wait` with `for_result: true` returns it, even
-after the child has exited ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)).
-`get_file` reads any other file from a running child:
+A child writes its result to a file and calls `mark_done`; the parent's `wait`
+with `for_done: true` returns, and the parent reads the file with `get_file`
+while the child is still running ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)).
+The gateway keeps only the "done" flag. `get_file` reads any file from a running
+child:
 
 ```shell
 target/debug/openshell -g docker-dev sandbox exec lead -- \

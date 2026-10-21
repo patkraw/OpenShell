@@ -30,7 +30,7 @@ mcp lead get_limits
 ```
 
 ```text
-["create_sandbox","wait","exec","get_file","get_output","stop_sandbox","list_children","get_limits","submit_result"]
+["create_sandbox","wait","exec","get_file","get_output","stop_sandbox","list_children","get_limits","mark_done"]
 {"isError":false,"can_create_children":true,"can_create_tools":true,"children_created":0,"depth":0,"grant_id":"gr-1ffdaff2","has_grant":true,"max_breadth":4,"max_depth":1,"max_total":6,"total":1}
 ```
 
@@ -64,8 +64,8 @@ mcp lead wait '{"handle":"w1","timeout_s":60}'
 ```
 
 ```text
-{"isError":false,"exit_code":null,"handle":"t1","phase":"SANDBOX_PHASE_READY","result":null,"timed_out":false}
-{"isError":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","result":null,"timed_out":false}
+{"isError":false,"done":false,"exit_code":null,"handle":"t1","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"done":false,"exit_code":null,"handle":"w1","phase":"SANDBOX_PHASE_READY","timed_out":false}
 ```
 
 Run a command in the tool sandbox, and read a file from the agent child:
@@ -88,7 +88,7 @@ mcp lead wait '{"handle":"once","timeout_s":60}'
 ```
 
 ```text
-{"isError":false,"exit_code":0,"handle":"once","phase":"SANDBOX_PHASE_COMPLETED","result":null,"timed_out":false}
+{"isError":false,"done":false,"exit_code":0,"handle":"once","phase":"SANDBOX_PHASE_COMPLETED","timed_out":false}
 ```
 
 List and stop:
@@ -103,50 +103,43 @@ mcp lead stop_sandbox '{"handle":"t1"}'
 {"isError":false,"handle":"t1","stopped":true}
 ```
 
-- A child that has **exited** leaves its **exit code** and, if it submitted
-  one, its **result** (next section). Its files are gone; read them while it runs.
+- A child that has **exited** leaves only its **exit code**. Its files are
+  gone; read them while it runs (next section).
 
 ### Collect an agent child's result
 
-**The child hands its final result to its parent with `submit_result`, and the
-parent's `wait` returns it.** No result file, no polling. Here the child's
-command stands in for an agent: it works for 20 seconds, submits, and exits. A
-real agent calls the tool itself, as Pi does in
-[`run-pi-result-demo.sh`](../run-pi-result-demo.sh).
+**The child writes its result to a file and calls `mark_done`; the parent's
+`wait` returns, and the parent reads the file with `get_file`.** The gateway
+keeps only the "done" flag, never the result. Here the child's command stands
+in for an agent: it works for 20 seconds, writes `/tmp/result.txt`, marks
+itself done, and stays running so its file can be read. With a real agent,
+`run-child` does those steps around the agent's command, as in
+[`run-pi-done-demo.sh`](../run-pi-done-demo.sh), so the model does not have to
+remember them.
 
 ```shell
-mcp lead create_sandbox '{"name":"rev","lifetime":"until_exit","command":["sh","-c","sleep 20; node /usr/local/lib/gateway-mcp/mcp-client.mjs submit_result \"$0\"","{\"result\":\"review: LGTM, 2 nits\"}"]}'
-mcp lead wait '{"handle":"rev","timeout_s":120,"for_result":true}'
+mcp lead create_sandbox '{"name":"rev","command":["sh","-c","sleep 20; echo \"review: LGTM, 2 nits\" > /tmp/result.txt; node /usr/local/lib/gateway-mcp/mcp-client.mjs mark_done {}; sleep 600"]}'
+mcp lead wait '{"handle":"rev","timeout_s":120,"for_done":true}'
+mcp lead get_file '{"handle":"rev","path":"/tmp/result.txt"}'
+mcp lead stop_sandbox '{"handle":"rev"}'
 ```
 
 ```text
-{"isError":false,...,"handle":"rev","kind":"agent","lifetime":"until_exit"}
-{"isError":false,"exit_code":0,"handle":"rev","phase":"SANDBOX_PHASE_COMPLETED","result":"review: LGTM, 2 nits","timed_out":false}
+{"isError":false,...,"handle":"rev","kind":"agent","lifetime":"until_stopped"}
+{"isError":false,"done":true,"exit_code":null,"handle":"rev","phase":"SANDBOX_PHASE_READY","timed_out":false}
+{"isError":false,"content":"review: LGTM, 2 nits\n","handle":"rev","path":"/tmp/result.txt"}
+{"isError":false,"handle":"rev","stopped":true}
 ```
 
-- **`for_result: true`** keeps `wait` going past READY until the child submits
-  or exits. It returns as soon as the result is saved, even while the child
-  is still running.
-
-The child exits after submitting. Its result outlives it:
-
-```shell
-mcp lead wait '{"handle":"rev","timeout_s":60}'
-```
-
-```text
-{"isError":false,"exit_code":0,"handle":"rev","phase":"SANDBOX_PHASE_COMPLETED","result":"review: LGTM, 2 nits","timed_out":false}
-```
-
-- **No result plus an exit code means it failed:** a child that crashes before
-  submitting returns `"result":null` and its exit code.
-- **One result per child**, at most **32 KiB**. Leave bigger output in a file
-  and read it with `get_file` while the child runs (`until_stopped`).
-- **Only the direct parent** gets it. A grandparent's `wait` with
-  `for_result` is refused with `NOT_DIRECT_CHILD`, so each level decides what
-  to pass up.
-- Results are kept in the gateway's memory in this POC and are lost if it
-  restarts.
+- **`for_done: true`** keeps `wait` going past READY until the child calls
+  `mark_done` or exits. Without it, an agent child's `wait` returns at READY,
+  before the work is done.
+- **Not done plus an exit code means it failed:** a child that exits without
+  marking done returns `"done":false` and its exit code, and its files are gone.
+- **The child must stay running** until the parent has read its file, so
+  don't use `lifetime: until_exit` for agent children whose result you need.
+  Stop the child when you have read it.
+- **Any ancestor** may wait for "done"; it carries no content.
 
 ## 4. Refusals, and why
 
@@ -156,14 +149,14 @@ mcp lead wait '{"handle":"rev","timeout_s":60}'
 | `w1` creates an agent | `LIMIT_REACHED` | `w1` is at `max_depth` |
 | `exec` on an agent | `WRONG_KIND` | `exec` is for tool sandboxes |
 | `get_file` on a sandbox that is not your child (here: the lead itself) | `NOT_YOUR_CHILD` | you act only on your descendants |
-| `submit_result` from the lead | `NOT_A_CHILD` | only a child has a parent to submit to |
+| `mark_done` from the lead | `NOT_A_CHILD` | only a child has a parent to tell |
 
 ```shell
 openshell sandbox exec lead -- curl -s -X POST http://openshell.local/mcp -d '{}'; echo
 mcp w1 create_sandbox '{"name":"g1","command":["true"]}'
 mcp lead exec '{"handle":"w1","command":["id"]}'
 mcp lead get_file '{"handle":"lead","path":"/etc/hostname"}'
-mcp lead submit_result '{"result":"done"}'
+mcp lead mark_done '{}'
 ```
 
 ```text
@@ -171,7 +164,7 @@ PROGRAM_NOT_ALLOWED: calls from '/usr/bin/curl' are not allowed; this tree's gra
 {"isError":true,"error":"LIMIT_REACHED","message":"depth: 1 of 1"}
 {"isError":true,"error":"WRONG_KIND","message":"'w1' is an agent sandbox; exec is for tool sandboxes"}
 {"isError":true,"error":"NOT_YOUR_CHILD","message":"'lead' is not your child"}
-{"isError":true,"error":"NOT_A_CHILD","message":"only a child sandbox has a parent to submit to"}
+{"isError":true,"error":"NOT_A_CHILD","message":"only a child sandbox has a parent to tell"}
 ```
 
 `w1` still reaches the gateway, sees the same tools, and can create **tool**
@@ -191,6 +184,7 @@ Clean up: `openshell sandbox delete lead`.
 
 - Agents reach the gateway at **`http://openshell.local/mcp`** with **no
   credential**; the supervisor adds the identity and program.
-- **Agents** run their own task and hand back a result (`submit_result`, then
-  `wait` with `for_result`); **tools** run your commands (`exec`).
+- **Agents** run their own task, write a result file and call `mark_done`;
+  the parent `wait`s with `for_done` and reads the file with `get_file`.
+  **Tools** run your commands (`exec`).
 - Every refusal names its reason, so an agent can adapt in one turn.

@@ -20,6 +20,8 @@ COPY sdk/sandbox_child.mjs /usr/local/lib/gateway-mcp/sandbox_child.mjs
 # Pi config seed (copied into PI_CODING_AGENT_DIR by pi-run) and the wrapper.
 COPY pi-seed/ /usr/local/share/pi-seed/
 COPY --chmod=755 pi-run /usr/local/bin/pi-run
+# Runs a child's task, saves its output to /tmp/result.txt and calls mark_done.
+COPY --chmod=755 run-child /usr/local/bin/run-child
 
 RUN mkdir -p /workspace && chown node:node /workspace
 USER node
