@@ -1,0 +1,44 @@
+# Hermes Agent (Nous Research) for the harness matrix: Python, MCP over
+# Streamable HTTP, and its own built-in `delegate_task` subagent tool.
+# Needs run-child and mcp-client.mjs from the parent folder, so build from there:
+#   docker build -t harness-hermes:local -f examples/gateway-mcp-poc/harnesses/Dockerfile.hermes \
+#     examples/gateway-mcp-poc
+FROM node:24-bookworm-slim
+
+# Hermes publishes releases on GitHub only (PyPI stopped at 0.19.0), and its
+# dependencies are pinned for Python 3.14 alone. uv and Python match the pins
+# in Hermes' own pm/lock.json for this release.
+ARG HERMES_VERSION=0.22.2
+ARG PYTHON_VERSION=3.14.7
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git ripgrep procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /usr/local/bin/uv
+
+# Move the standalone CPython to a fixed path, so the interpreter that makes
+# Hermes' network calls is /opt/python/bin/python3.14 on every architecture.
+RUN UV_PYTHON_INSTALL_DIR=/tmp/uv-python uv python install --no-bin "${PYTHON_VERSION}" \
+    && mv /tmp/uv-python/cpython-"${PYTHON_VERSION}"-linux-* /opt/python \
+    && rm -rf /tmp/uv-python /root/.cache
+# Install the tagged source from its lock file, with the MCP client extra only.
+# Hermes only supports an editable install from source, so the checkout stays.
+RUN git clone --quiet --depth 1 --branch "v${HERMES_VERSION}" \
+        https://github.com/NousResearch/hermes-agent /opt/hermes-src \
+    && cd /opt/hermes-src \
+    && UV_PROJECT_ENVIRONMENT=/opt/hermes UV_PYTHON_DOWNLOADS=never \
+        uv sync --frozen --no-dev --no-cache --compile-bytecode \
+        --python /opt/python/bin/python3.14 --extra mcp \
+    && ln -s /opt/hermes/bin/hermes /usr/local/bin/hermes \
+    && git config --system --add safe.directory /opt/hermes-src
+
+# Scripted MCP client used by run-child (no npm dependencies).
+COPY mcp-client.mjs /usr/local/lib/gateway-mcp/mcp-client.mjs
+# Runs a child's task, saves its output to /tmp/result.txt and calls mark_done.
+COPY --chmod=755 run-child /usr/local/bin/run-child
+COPY harnesses/hermes-seed/ /usr/local/share/hermes-seed/
+COPY --chmod=755 harnesses/hermes-run /usr/local/bin/hermes-run
+
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+WORKDIR /workspace
+ENV HERMES_HOME=/tmp/hermes-home HERMES_DISABLE_LAZY_INSTALLS=1 PYTHONDONTWRITEBYTECODE=1
