@@ -130,6 +130,26 @@ where
         )
         .await;
     }
+    // Refuse an oversized body with an answer instead of dropping the
+    // connection, so the agent learns why its call failed.
+    let max = crate::policy_local::MAX_POLICY_LOCAL_BODY_BYTES;
+    if let Some(len) = crate::policy_local::declared_body_len(initial_request)
+        && len > max
+    {
+        let body = serde_json::json!({
+            "error": "request_too_large",
+            "detail": format!("request body is {len} bytes; the door accepts at most {max}"),
+        })
+        .to_string();
+        return respond(
+            client,
+            413,
+            "Payload Too Large",
+            "application/json",
+            body.as_bytes(),
+        )
+        .await;
+    }
     let body = crate::policy_local::read_request_body(initial_request, client).await?;
     let Some(endpoint) = ctx.gateway_endpoint() else {
         return respond(
@@ -215,5 +235,12 @@ mod tests {
         let req = b"POST /mcp HTTP/1.1\r\nHost: openshell.local\r\nContent-Length: 2\r\n\r\n{}";
         assert_eq!(request_host(req).as_deref(), Some("openshell.local"));
         assert_eq!(header_value(req, "content-length").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn sees_an_oversized_body_from_its_headers() {
+        let req = b"POST /mcp HTTP/1.1\r\nHost: openshell.local\r\nContent-Length: 70000\r\n\r\n{";
+        let len = crate::policy_local::declared_body_len(req).unwrap();
+        assert!(len > crate::policy_local::MAX_POLICY_LOCAL_BODY_BYTES);
     }
 }
