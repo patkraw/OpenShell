@@ -4,9 +4,11 @@
 # appears half-written) and stay running so the parent can read it. The child
 # never calls the gateway; the parent's `wait` with until_file sees the file,
 # reads it with get_file and stops the child.
+# stdin is closed: as a sandbox's main command it is open but never written, and
+# some harnesses (OpenCode) wait on it forever.
 # Usage: run-child <command> [args...]   e.g. run-child pi-run -p "task"
 out=/tmp/result.txt
-"$@" > "$out.tmp" 2> /tmp/result.err
+"$@" < /dev/null > "$out.tmp" 2> /tmp/result.err
 echo $? > /tmp/result.exit
 mv "$out.tmp" "$out"
 exec sleep "${RUN_CHILD_LINGER_S:-3600}"
