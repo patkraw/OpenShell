@@ -3,7 +3,7 @@
 # for these programs' requests to inference-api.nvidia.com.
 id: harness-nvidia
 display_name: Harness matrix (NVIDIA inference API)
-description: Pi, Qwen Code, Codex, OpenCode, mini-SWE-agent and Deep Agents with models from inference-api.nvidia.com
+description: Pi, Qwen Code, Codex, OpenCode, Hermes and Deep Agents with models from inference-api.nvidia.com
 category: agent
 inference_capable: true
 credentials:
@@ -26,3 +26,4 @@ binaries:
   - /usr/bin/python3.11
   - /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex
   - /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe
+  - /opt/python/bin/python3.14
