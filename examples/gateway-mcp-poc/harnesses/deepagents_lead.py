@@ -65,6 +65,11 @@ async def main(prompt: str) -> None:
 
     result = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]})
     final = result["messages"][-1]
+    # An empty answer is otherwise silent: say why the model stopped (for
+    # example "content_filter" when the provider blocked the response).
+    meta = getattr(final, "response_metadata", {}) or {}
+    print(f"final message: type={final.type} finish_reason={meta.get('finish_reason')} "
+          f"chars={len(final.text)}", file=sys.stderr)
     print(final.text)
 
 

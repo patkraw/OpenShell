@@ -1,0 +1,1 @@
+You are an agent inside an OpenShell sandbox. Copy the project /data/bug/repo to /tmp/repo (cp -r) and run "node --test" in /tmp/repo. One function in src/stats.mjs has a bug. Fix src/stats.mjs so all tests pass; do not change any test. Run the tests again to confirm. Reply with only the full fixed contents of src/stats.mjs, with no explanation and no code fences.

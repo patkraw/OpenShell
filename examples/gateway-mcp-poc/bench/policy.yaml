@@ -1,4 +1,4 @@
-# The split-count benchmark's policy: lead.yaml plus read access to the log
+# The benchmark lead's policy: lead.yaml plus read access to the data
 # (/data) and the Python harnesses (/opt).
 # The lead's policy. With --grant-program it is also the ceiling for the lead's children: no child may get more.
 version: 1

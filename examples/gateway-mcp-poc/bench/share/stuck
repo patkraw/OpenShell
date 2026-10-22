@@ -1,0 +1,5 @@
+#!/bin/sh
+# A child that hangs: it never writes a result and never exits. The hang task
+# uses it to check that the lead gives up, stops it and still finishes.
+echo "stuck: waiting for a lock that never frees" >&2
+exec sleep 86400

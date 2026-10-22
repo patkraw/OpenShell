@@ -1,0 +1,16 @@
+#!/bin/sh
+# A child whose result file is bigger than the 256 KiB the gateway returns:
+# a one-line summary first, then about 500 KiB of per-test detail, then END.
+# Written whole and renamed into place, like run-child does.
+out=/tmp/result.txt
+{
+  echo '{"summary": {"tests": 6000, "failed": 137, "slowest_test": "test_upload_large_file"}}'
+  i=1
+  while [ $i -le 6000 ]; do
+    echo "test_case_$i: ok in 12ms; retries 0; shard $((i % 8)); notes: nothing to report for this case"
+    i=$((i + 1))
+  done
+  echo "END: the last line of the report"
+} > "$out.tmp"
+mv "$out.tmp" "$out"
+exec sleep 3600
