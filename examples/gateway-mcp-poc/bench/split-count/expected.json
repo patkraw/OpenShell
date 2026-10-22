@@ -1,0 +1,16 @@
+{
+  "total_errors": 790,
+  "top_error": "cache unavailable",
+  "top_error_count": 285,
+  "per_half": [
+    390,
+    400
+  ],
+  "by_kind": {
+    "database timeout": 200,
+    "cache unavailable": 285,
+    "authentication failed": 215,
+    "disk full": 45,
+    "upstream 502": 45
+  }
+}

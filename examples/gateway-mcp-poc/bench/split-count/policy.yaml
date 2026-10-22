@@ -1,0 +1,30 @@
+# The split-count benchmark's policy: lead.yaml plus read access to the log
+# (/data) and the Python harnesses (/opt).
+# The lead's policy. With --grant-program it is also the ceiling for the lead's children: no child may get more.
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /etc, /var/log, /data, /opt]
+  read_write: [/tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+network_policies:
+  github_read:
+    name: github_read
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {method: GET, path: "/repos/**"}
+    binaries:
+      - path: /usr/local/bin/node
+  example:
+    name: example
+    endpoints:
+      - host: example.com
+        port: 443
+    binaries:
+      - path: /usr/local/bin/node
+      - path: /usr/bin/curl

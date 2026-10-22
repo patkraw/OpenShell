@@ -1,0 +1,11 @@
+# Adds the benchmark data and the child helpers to any harness image:
+#   docker build --build-arg BASE=harness-codex:local -t harness-codex:bench \
+#     -f bench/Dockerfile.bench examples/gateway-mcp-poc
+ARG BASE
+FROM ${BASE}
+USER root
+COPY mcp-client.mjs /usr/local/lib/gateway-mcp/mcp-client.mjs
+COPY --chmod=755 run-child /usr/local/bin/run-child
+COPY bench/split-count/app.log /data/app.log
+RUN chmod 644 /data/app.log
+USER node
