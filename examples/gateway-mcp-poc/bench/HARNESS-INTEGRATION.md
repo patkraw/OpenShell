@@ -35,52 +35,108 @@ files referred to below are in [`../harnesses/`](../harnesses/) and
 ### 1. Telling the harness where the MCP server is
 
 **What happened.** Every harness has its own config format for MCP servers, and
-none of them knows about `http://openshell.local/mcp` by itself:
+none of them knows about `http://openshell.local/mcp` by itself. The entry is
+small and identical in meaning everywhere: a name, the URL, no credential. The
+sandbox's door to the gateway adds the sandbox's identity, so the harness never
+needs a token.
 
-| Harness | Where we configured it |
-|---|---|
-| Pi | `pi-seed/mcp.json`, `mcpServers.openshell.url` |
-| OpenCode | `opencode-seed/opencode.json`, `mcp.openshell` with `type: remote` |
-| Qwen Code | `qwen-seed/settings.json`, `mcpServers.openshell.httpUrl` |
-| Codex | `codex-seed/config.toml`, `[mcp_servers.openshell] url` |
-| Hermes | `hermes-seed/config.yaml`, `mcp_servers.openshell.url` |
-| Deep Agents | Python code: `MultiServerMCPClient({"openshell": {"transport": "streamable_http", "url": ...}})` |
+**What it takes today, per harness.** Three pieces: the MCP entry in the
+harness's own config file, a Dockerfile line that puts that file in the image,
+and a wrapper that copies it to a writable place (problem 4) and starts the
+harness.
 
-The entry itself is small and identical in meaning: a name, the URL, no
-credential. The door adds the sandbox's identity, so the harness never needs a
-token.
+| Harness | MCP entry | Put in the image | Loaded by |
+|---|---|---|---|
+| Pi | [`pi-seed/mcp.json` L3-L7](../pi-seed/mcp.json#L3-L7) | [`Dockerfile.pi` L21](../Dockerfile.pi#L21) | [`pi-run` L6-L8](../pi-run#L6-L8): copy into `PI_CODING_AGENT_DIR` |
+| OpenCode | [`opencode-seed/opencode.json` L21-L23](../harnesses/opencode-seed/opencode.json#L21-L23) | [`Dockerfile.opencode` L12](../harnesses/Dockerfile.opencode#L12) | [`opencode-run` L4](../harnesses/opencode-run#L4): `OPENCODE_CONFIG` points at it, no copy |
+| Qwen Code | [`qwen-seed/settings.json` L14-L21](../harnesses/qwen-seed/settings.json#L14-L21) | [`Dockerfile.qwen` L14](../harnesses/Dockerfile.qwen#L14) | [`qwen-run` L5-L7](../harnesses/qwen-run#L5-L7): copy into `$HOME/.qwen` |
+| Codex | [`codex-seed/config.toml` L16-L20](../harnesses/codex-seed/config.toml#L16-L20) | [`Dockerfile.codex` L12](../harnesses/Dockerfile.codex#L12) | [`codex-run` L3-L5](../harnesses/codex-run#L3-L5): copy into `CODEX_HOME` |
+| Hermes | [`hermes-seed/config.yaml` L21-L27](../harnesses/hermes-seed/config.yaml#L21-L27) | [`Dockerfile.hermes` L38](../harnesses/Dockerfile.hermes#L38) | [`hermes-run` L6-L9](../harnesses/hermes-run#L6-L9): copy into `HERMES_HOME` |
+| Deep Agents | [`deepagents_lead.py` L43-L51](../harnesses/deepagents_lead.py#L43-L51), in code | [`Dockerfile.python` L14](../harnesses/Dockerfile.python#L14) | the agent's own code; URL from `OPENSHELL_MCP_URL` ([L20](../harnesses/deepagents_lead.py#L20)) |
+
+The entries side by side. Only the URL matters for connecting; the `timeout`
+lines are the workaround for problem 2.
+
+```jsonc
+// Pi: mcp.json in PI_CODING_AGENT_DIR
+{ "mcpServers": { "openshell": { "url": "http://openshell.local/mcp", "timeout": 600 } } }
+
+// OpenCode: opencode.json (any path, via OPENCODE_CONFIG)
+{ "mcp": { "openshell": { "type": "remote", "url": "http://openshell.local/mcp", "oauth": false, "timeout": 600000 } } }
+
+// Qwen Code: ~/.qwen/settings.json
+{ "mcpServers": { "openshell": { "httpUrl": "http://openshell.local/mcp", "alwaysLoadTools": true, "timeout": 600000 } } }
+```
+
+```toml
+# Codex: config.toml in CODEX_HOME
+[mcp_servers.openshell]
+url = "http://openshell.local/mcp"
+required = true
+tool_timeout_sec = 600
+```
+
+```yaml
+# Hermes: config.yaml in HERMES_HOME
+mcp_servers:
+  openshell:
+    url: http://openshell.local/mcp
+    timeout: 600
+```
+
+```python
+# Deep Agents: in the agent's code
+client = MultiServerMCPClient({"openshell": {"transport": "streamable_http", "url": MCP_URL}})
+tools = await client.get_tools()
+```
+
+Things to notice:
+
+- **The key name differs** (`url`, `httpUrl`, `type: remote`), so one generic
+  file cannot serve every harness.
+- **The other keys are settings we chose, not requirements:** `oauth: false`
+  (OpenCode), `alwaysLoadTools: true` (Qwen Code), `required = true` (Codex).
+  We did not test each harness without them.
+- **Most of each wrapper is not about MCP.** It is about finding a writable
+  config directory (problem 4).
 
 **Workaround.** Each image ships a seed config, and its `<harness>-run` wrapper
 copies it into place before starting the harness.
 
-**Recommendation.** This is the one step that stays per harness, but it can come
-from OpenShell instead of the image:
+**Ways to remove the per-image work**, from smallest to biggest change:
 
-- **Provider files.** OpenShell can already place read-only files in a sandbox
-  from a provider profile (`/run/openshell/providers/...`, with an environment
-  variable pointing at the file; see `examples/provider-managed-files/`). A
-  profile per harness, or one profile with a file per harness, would add the MCP
-  entry without rebuilding images. This fits harnesses that take a config file path
-  from an environment variable, and only where the file can be read-only.
-- **Some harnesses take the entry on the command line or in an environment
-  variable**, with no file at all. Checked in the images:
+| Option | How it works | Covers | Trade-off |
+|---|---|---|---|
+| A. A flag or environment variable | pass the entry on the command line or in the environment, no file | OpenCode (`OPENCODE_CONFIG_CONTENT`), Codex (`-c 'mcp_servers.openshell.url="http://openshell.local/mcp"'`), Qwen Code (`--mcp-config`) | works today; Pi and Hermes have no such option |
+| B. Provider files | OpenShell mounts a read-only file from a provider profile (`/run/openshell/providers/...`) and sets an environment variable to its path; see `examples/provider-managed-files/` | OpenCode (`OPENCODE_CONFIG`), Qwen Code (`--mcp-config <path>`) | no image rebuild; Pi, Hermes and Codex need a writable config directory, so a read-only file does not fit |
+| C. A writable HOME by default | the seed config can live in the image at the harness's normal path | the five command-line harnesses | removes the copying in every wrapper; needed anyway (problem 4) |
+| D. Harness presets | `--harness codex` sets the MCP entry, the grant's program (problem 6) and the provider's programs (problem 7) in one place | all six | the most work; one place per harness instead of per user |
 
-  | Harness | Add the MCP server without a config file | Provider file fits? |
-  |---|---|---|
-  | OpenCode | `OPENCODE_CONFIG_CONTENT` (inline JSON), or `OPENCODE_CONFIG` (file path) | ✅ `OPENCODE_CONFIG` pointing at the provider file |
-  | Qwen Code | `--mcp-config '<json or path>'` | ✅ as the flag's path |
-  | Codex | `-c 'mcp_servers.openshell.url="http://openshell.local/mcp"'` | ❌ config lives in `CODEX_HOME`, which must be writable; the flag is simpler |
-  | Pi | none: only `mcp.json` in `PI_CODING_AGENT_DIR` (writable) | ❌ |
-  | Hermes | none: only `config.yaml` in `HERMES_HOME` (writable) | ❌ |
-  | Deep Agents | in code | n/a; read the URL from an environment variable |
+Checked in the images:
 
-  For Pi and Hermes the entry has to be written into their writable config
-  directory, so they need a wrapper or a harness-side change (an environment
-  variable or flag for MCP servers) to work out of the box.
-- **A short snippet per harness in the docs**, for users who build their own
-  images.
-- Avoid a generic "MCP server" setting in OpenShell that rewrites harness
-  configs: the formats differ and change between versions.
+| Harness | Add the MCP server without a config file | Provider file fits? |
+|---|---|---|
+| OpenCode | `OPENCODE_CONFIG_CONTENT` (inline JSON), or `OPENCODE_CONFIG` (file path) | ✅ `OPENCODE_CONFIG` pointing at the provider file |
+| Qwen Code | `--mcp-config '<json or path>'` | ✅ as the flag's path |
+| Codex | `-c 'mcp_servers.openshell.url="http://openshell.local/mcp"'` | ❌ config lives in `CODEX_HOME`, which must be writable; the flag is simpler |
+| Pi | none: only `mcp.json` in `PI_CODING_AGENT_DIR` (writable) | ❌ |
+| Hermes | none: only `config.yaml` in `HERMES_HOME` (writable) | ❌ |
+| Deep Agents | in code | n/a; read the URL from an environment variable |
+
+**Recommendation.**
+
+- **Now: C plus A.** A writable HOME by default, and the flag or environment
+  variable where a harness has one. Each wrapper shrinks to one command.
+- **Later: D.** One versioned preset per harness that knows its config format,
+  its calling program and its provider. The user names the harness.
+- **Not B on its own.** It fits only two of six harnesses.
+- **A short snippet per harness in the docs** (the ones above), for users who
+  build their own images.
+- **Pi and Hermes** need a harness-side change (a flag or environment variable
+  for MCP servers) to work without any file at all.
+- **Avoid a generic "MCP server" setting in OpenShell that rewrites harness
+  configs:** the formats differ and change between versions. A preset (D) is
+  versioned with the harness instead.
 
 ### 2. `wait` blocks longer than harness tool timeouts
 
@@ -104,9 +160,12 @@ our 600 s setting.** The benchmark did not hit these: its prompts ask for
 `timeout_s` 45 and to call `wait` again until the file is ready, and most
 children finish in well under a minute.
 
-**Workaround.** Every config sets a 600 s tool timeout (`timeout: 600` in Pi and
-Hermes, `timeout: 600000` ms in OpenCode and Qwen Code, `tool_timeout_sec = 600`
-in Codex). The benchmark prompts also keep each `wait` at 45 s and call it
+**Workaround.** Every config sets a 600 s tool timeout: `timeout: 600` in
+[Pi](../pi-seed/mcp.json#L6) and [Hermes](../harnesses/hermes-seed/config.yaml#L24),
+`timeout: 600000` ms in [OpenCode](../harnesses/opencode-seed/opencode.json#L22)
+and [Qwen Code](../harnesses/qwen-seed/settings.json#L18),
+[`tool_timeout_sec = 600`](../harnesses/codex-seed/config.toml#L20) in Codex.
+The prompts ask for 45 s waits in [`run-task.sh`](run-task.sh) (`WAIT`). The benchmark prompts also keep each `wait` at 45 s and call it
 again, so no single call relies on the raised limits; running with every
 harness's default timeout is still untested (next step 1).
 
@@ -143,9 +202,11 @@ in the POC. Checked in the images with a pipe that stays open:
 | Hermes | `hermes -z` | does not read stdin |
 | Deep Agents | our script | does not read stdin |
 
-**Workaround.** `run-child` starts the agent with `< /dev/null`. `pi-run` and
-`codex-run` close stdin too. (`hermes-run` also does, which turns out to be
-unnecessary.)
+**Workaround.** [`run-child` L11](../run-child#L11) starts the agent with
+`< /dev/null`. [`pi-run` L11](../pi-run#L11) and
+[`codex-run` L6](../harnesses/codex-run#L6) close stdin too.
+([`hermes-run` L10-L11](../harnesses/hermes-run#L10-L11) also does, which turns
+out to be unnecessary.)
 
 **Recommendation.** **Don't close stdin for every sandbox.** OpenShell keeps the
 main command's stdin open on purpose: `openshell sandbox create` attaches to
@@ -175,9 +236,13 @@ images with a HOME that cannot be written:
 | Hermes | fails: "Cannot initialize Hermes directory" | `HERMES_HOME` |
 | Deep Agents | works | not needed |
 
-**Workaround.** Each wrapper points `HOME` (or the harness's own variable:
-`PI_CODING_AGENT_DIR`, `CODEX_HOME`, `HERMES_HOME`) at a directory under `/tmp`
-and copies the seed config there.
+**Workaround.** Each wrapper points `HOME` or the harness's own variable at a
+directory under `/tmp` and copies the seed config there:
+[`pi-run` L6-L8](../pi-run#L6-L8) (`PI_CODING_AGENT_DIR`),
+[`opencode-run` L4-L5](../harnesses/opencode-run#L4-L5) (`HOME`),
+[`qwen-run` L5-L7](../harnesses/qwen-run#L5-L7) (`HOME`),
+[`codex-run` L3-L5](../harnesses/codex-run#L3-L5) (`CODEX_HOME`),
+[`hermes-run` L6-L9](../harnesses/hermes-run#L6-L9) (`HERMES_HOME`).
 
 **Recommendation.** Give every sandbox a writable home directory by default (for
 example a per-sandbox `HOME` inside the writable area), so a harness can start
@@ -189,7 +254,11 @@ without a wrapper. Policies that want a read-only home can still say so.
 benchmark starts each lead) do not see the `ENV` lines of the image. Settings
 such as `PI_CODING_AGENT_DIR` or `HERMES_HOME` were missing.
 
-**Workaround.** `pi-run` and `hermes-run` set the same variables again.
+**Workaround.** [`pi-run` L5-L6](../pi-run#L5-L6) and
+[`hermes-run` L5-L7](../harnesses/hermes-run#L5-L7) set the same variables
+again that the images already set with `ENV`
+([`Dockerfile.pi` L30](../Dockerfile.pi#L30),
+[`Dockerfile.hermes` L44](../harnesses/Dockerfile.hermes#L44)).
 
 **Recommendation.** Pass the image's environment to `exec`, as `docker exec`
 does, or document clearly that it is not passed.
@@ -215,8 +284,10 @@ We found the paths by setting a wrong `--grant-program` and reading the refusal,
 which names the real caller. A user should not have to do that. The Codex path
 also changes between arm64 and amd64.
 
-**Workaround.** `run.sh` hard-codes the program per harness, and
-`provider-harness-nvidia.yaml` lists all five.
+**Workaround.** [`run-task.sh` L26-L33](run-task.sh#L26-L33) hard-codes the
+program per harness, and
+[`provider-harness-nvidia.yaml` L24-L29](../harnesses/provider-harness-nvidia.yaml#L24-L29)
+lists all five.
 
 **Recommendation.**
 
@@ -237,7 +308,7 @@ also changes between arm64 and amd64.
 default its file tools work on a virtual, in-memory filesystem and it has no
 shell, so the agent never saw the sandbox's disk.
 
-**Workaround.** `deepagents_lead.py` passes
+**Workaround.** [`deepagents_lead.py` L60](../harnesses/deepagents_lead.py#L60) passes
 `backend=LocalShellBackend(root_dir="/", virtual_mode=False, inherit_env=True)`,
 which gives the agent the real disk and a shell.
 
@@ -264,10 +335,13 @@ which they decline when nobody can answer:
 | Hermes | `-z` already turns approvals off (a small floor remains) | `--yolo` |
 | Deep Agents | approvals only if `interrupt_on` is set | none |
 
-**Workaround.** `config.toml` sets `sandbox_mode = "danger-full-access"` and
-`approval_policy = "never"`. Other harnesses ran with their "yes to everything"
-mode (`--yolo` for Qwen Code and Hermes, `--auto` for OpenCode,
-`--no-approve` for Pi).
+**Workaround.** [`config.toml` L5-L6](../harnesses/codex-seed/config.toml#L5-L6)
+sets `approval_policy = "never"` and `sandbox_mode = "danger-full-access"`.
+Other harnesses ran with their "yes to everything" mode:
+[`--yolo` for Qwen Code](../harnesses/qwen-run#L8) and
+[Hermes](../harnesses/hermes-run#L12),
+[`--auto` for OpenCode](../harnesses/opencode-run#L6),
+[`--no-approve` for Pi](../pi-run#L12).
 
 **Recommendation.** Document per harness that OpenShell is the sandbox and the
 harness's own sandbox and prompts should be off. The settings sound alarming
@@ -290,8 +364,10 @@ denials are visible in the sandbox logs.
 **What happened.** A child's result lives in its files, and its files go when it
 exits. A harness in one-shot mode exits as soon as it answers.
 
-**Workaround.** `run-child` runs the harness, saves its reply to
-`/tmp/result.txt` (written whole, then renamed) and keeps the sandbox running.
+**Workaround.** [`run-child`](../run-child#L10-L14) runs the harness, saves its
+reply to `/tmp/result.txt` (written whole, then renamed) and keeps the sandbox
+running. The gateway side is `wait_child` in
+[`children.rs`](../../../crates/openshell-server/src/children.rs).
 The parent's `wait` with `until_file` and `return_file` returns once the file
 exists, with its content in the reply, and the parent then stops the child. The
 child never calls the gateway.
