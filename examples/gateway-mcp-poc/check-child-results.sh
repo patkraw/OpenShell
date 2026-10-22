@@ -2,7 +2,8 @@
 # Checks for wait(until_file) against a running dev gateway: fan-out,
 # grandchildren, stop and a child that exits early. No model needed; children
 # write /tmp/result.txt and never call the gateway. The gateway checks for the
-# file through the exec relay and stores nothing; the parent reads it with get_file.
+# file through the exec relay and stores nothing; wait can return its content
+# (return_file), or the parent reads it with get_file.
 # Needs: dev gateway (mise run gateway:docker) and image pi-agent:local.
 set -u
 cd "$(dirname "$0")"
@@ -28,7 +29,7 @@ check() { # label actual expected-substring
 $OS sandbox delete lead >/dev/null 2>&1; wait_gone lead
 $OS sandbox create --name lead --from pi-agent:local --policy lead.yaml \
   --grant-program /usr/local/bin/node \
-  --grant-max-depth 2 --grant-max-breadth 6 --grant-max-total 10 --grant-expires 1h \
+  --grant-max-depth 2 --grant-max-breadth 8 --grant-max-total 12 --grant-expires 1h \
   --no-tty --detach -- sleep 3600 >/dev/null
 wait_ready lead || { echo "lead not ready"; exit 1; }
 
@@ -55,6 +56,14 @@ check "w1 waits for g1's file" "$(mcp w1 wait '{"handle":"g1","timeout_s":120,"u
 check "w1 reads g1's result" "$(result w1 g1)" 'from-g1'
 check "w1 has no result file yet" "$(mcp lead wait '{"handle":"w1","timeout_s":5,"until_file":"/tmp/result.txt"}')" '"timed_out":true'
 
+echo "2b. return_file: the content comes back with wait"
+mcp lead create_sandbox "$(finishes r1 3 from-r1 'sleep 600')" >/dev/null
+out=$(mcp lead wait '{"handle":"r1","timeout_s":120,"until_file":"/tmp/result.txt","return_file":true}')
+check "r1's file is ready" "$out" '"file_ready":true'
+check "with its content" "$out" 'from-r1'
+check "not truncated" "$out" '"truncated":false'
+mcp lead stop_sandbox '{"handle":"r1"}' >/dev/null
+
 echo "3. A child that exits without writing its file"
 mcp lead create_sandbox '{"name":"x1","command":["sh","-c","sleep 3; exit 7"]}' >/dev/null
 out=$(mcp lead wait '{"handle":"x1","timeout_s":120,"until_file":"/tmp/result.txt"}')
@@ -69,8 +78,12 @@ wait_gone s1
 check "s1 is gone for the lead" "$(mcp lead wait '{"handle":"s1","timeout_s":3,"until_file":"/tmp/result.txt"}')" 'NOT_YOUR_CHILD'
 
 echo "5. Arguments"
+check "return_file without until_file is refused" "$(mcp lead wait '{"handle":"w1","timeout_s":3,"return_file":true}')" 'INVALID_ARGUMENT'
 check "a relative path is refused" "$(mcp lead wait '{"handle":"w1","timeout_s":3,"until_file":"result.txt"}')" 'INVALID_ARGUMENT'
 check "mark_done no longer exists" "$(mcp w1 mark_done '{}')" 'isError":true'
+
+# Deleting the lead stops its whole tree.
+$OS sandbox delete lead >/dev/null 2>&1
 
 echo
 echo "$pass passed, $fail failed"

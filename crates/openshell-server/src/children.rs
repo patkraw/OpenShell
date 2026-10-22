@@ -1388,6 +1388,15 @@ async fn wait_child(
             Some(path.to_string())
         }
     };
+    // return_file reads the file in the same call, so a parent that sends its
+    // next calls in parallel cannot stop the child before reading the result.
+    let return_file = args.get("return_file").and_then(Value::as_bool) == Some(true);
+    if return_file && until_file.is_none() {
+        return Err(terr(
+            "INVALID_ARGUMENT",
+            "return_file needs until_file: the path of the file to return",
+        ));
+    }
     let mut next_check = tokio::time::Instant::now();
     let timeout = args
         .get("timeout_s")
@@ -1416,22 +1425,28 @@ async fn wait_child(
             && args.get("until_exit").is_none()
             && until_file.is_none();
         let mut file_ready = false;
+        let mut content = None;
         if let Some(path) = until_file.as_deref()
             && phase == SandboxPhase::Ready
             && tokio::time::Instant::now() >= next_check
         {
             next_check = tokio::time::Instant::now() + FILE_CHECK_INTERVAL;
-            // A failed check (the child is still starting) just means "not yet".
-            file_ready = matches!(
-                run_in_child(
-                    state,
-                    &child,
-                    vec!["test".into(), "-f".into(), path.into()],
-                    Duration::from_secs(10),
-                )
-                .await,
-                Ok((_, _, 0))
-            );
+            // With return_file, cat is the check: it succeeds once the file
+            // exists. A failed check (the child is still starting) just means
+            // "not yet".
+            let command = if return_file {
+                vec!["cat".into(), path.into()]
+            } else {
+                vec!["test".into(), "-f".into(), path.into()]
+            };
+            if let Ok((out, _, 0)) =
+                run_in_child(state, &child, command, Duration::from_secs(10)).await
+            {
+                file_ready = true;
+                if return_file {
+                    content = Some(out);
+                }
+            }
         }
         if exited || ready || file_ready || tokio::time::Instant::now() >= deadline {
             let mut out = json!({
@@ -1442,6 +1457,11 @@ async fn wait_child(
             });
             if until_file.is_some() {
                 out["file_ready"] = json!(file_ready);
+            }
+            if let Some(content) = content {
+                // run_in_child keeps at most MAX_FILE_BYTES.
+                out["truncated"] = json!(content.len() >= MAX_FILE_BYTES);
+                out["content"] = json!(String::from_utf8_lossy(&content));
             }
             return Ok(out);
         }
@@ -1540,7 +1560,13 @@ async fn child_file(
             String::from_utf8_lossy(&err).trim().to_string(),
         ));
     }
-    Ok(json!({"handle": child.name, "path": path, "content": String::from_utf8_lossy(&out)}))
+    // run_in_child keeps at most MAX_FILE_BYTES; say so instead of cutting silently.
+    Ok(json!({
+        "handle": child.name,
+        "path": path,
+        "content": String::from_utf8_lossy(&out),
+        "truncated": out.len() >= MAX_FILE_BYTES
+    }))
 }
 
 /// `exec` is only for tool children: an agent child runs its own task.
@@ -1900,6 +1926,7 @@ pub(crate) mod grpc_surface {
             handle: r.handle,
             timeout_s: timeout(r.timeout.as_ref())?,
             until_file: None,
+            return_file: false,
         });
         let v = run(state, &req, op).await?;
         Ok(Response::new(pb::WaitChildSandboxResponse {
@@ -2665,6 +2692,10 @@ mod tests {
             let err = wait_child(&state, "lead", &args).await.unwrap_err();
             assert_eq!(err.code, "INVALID_ARGUMENT", "{path:?}");
         }
+        // return_file only makes sense with a file to return.
+        let args = json!({"handle": "w1", "timeout_s": 1, "return_file": true});
+        let err = wait_child(&state, "lead", &args).await.unwrap_err();
+        assert_eq!(err.code, "INVALID_ARGUMENT");
     }
 
     #[tokio::test]
@@ -2693,6 +2724,12 @@ mod tests {
         let v = wait_child(&state, "lead", &args).await.unwrap();
         assert_eq!(v["timed_out"], true);
         assert_eq!(v["file_ready"], false);
+        // Without the file there is no content to return.
+        let mut with_read = args.clone();
+        with_read["return_file"] = json!(true);
+        let v = wait_child(&state, "lead", &with_read).await.unwrap();
+        assert_eq!(v["file_ready"], false);
+        assert!(v.get("content").is_none());
 
         // A sandbox outside the tree cannot wait for it.
         state
