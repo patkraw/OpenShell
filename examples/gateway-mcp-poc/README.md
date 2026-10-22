@@ -125,19 +125,20 @@ second child.
 ## Results
 
 **74/74 end-to-end checks pass at commit `a1b94e583`** (dev gateway, Docker
-driver, macOS arm64, 2026-10-15). Unit tests at the same commit: 2,049
+driver, macOS arm64). Unit tests at the same commit: 2,049
 `openshell-server`, all `openshell-gateway-mcp` and `openshell-cli`, and 190
 Python. One `openshell-supervisor-network` proxy test
 (`mediated_connect_keeps_workload_bytes_read_with_the_synthesized_header`)
 fails on this machine with and without the proof of concept's changes.
 
-**Child results (`wait` with `until_file`): 74/74 plus 17/17 in
-`check-child-results.sh`** (2026-10-21, same setup). `run-pi-result-demo.sh` runs
+**Child results (`wait` with `until_file`): 74/74 plus 21/21 in
+`check-child-results.sh`** (same setup). `run-pi-result-demo.sh` runs
 it with real Pi agents: `run-child` saves the worker's answer, and the lead waits
-for the file, reads it with `get_file` and stops the worker. The worker never
+for the file, gets its content in the same reply (`return_file`) and stops the
+worker. The worker never
 calls the gateway.
 
-**Harness matrix: 6/6 harnesses pass the split-count benchmark** (2026-10-21):
+**Harness matrix: 6/6 harnesses pass the split-count benchmark:**
 Pi, OpenCode, Qwen Code, Codex, Deep Agents and Hermes each split a log between
 two child sandboxes and combined their results. How to run it, per-harness
 setup and findings: [bench/README.md](bench/README.md).

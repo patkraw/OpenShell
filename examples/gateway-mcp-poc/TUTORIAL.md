@@ -115,8 +115,8 @@ target/debug/openshell -g docker-dev sandbox exec lead -- \
 ### Getting results
 
 A child writes its result to a file and keeps running; the parent's `wait` with
-`until_file` returns once the file exists, and the parent reads it with `get_file`
-while the child is still running ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)).
+`until_file` and `return_file` returns once the file exists, with its content in
+the reply, so the parent has the result before it stops the child ([tutorial 02](tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result)).
 The child never calls the gateway, and the gateway stores nothing. `get_file`
 reads any file from a running child:
 

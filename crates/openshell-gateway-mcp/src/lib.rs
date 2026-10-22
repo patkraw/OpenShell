@@ -153,6 +153,10 @@ pub struct WaitArgs {
     /// Keep waiting past READY until this file exists in the child, or it exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_file: Option<String>,
+    /// With until_file: return the file's content in the reply, so the parent
+    /// has the result before it can stop the child.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub return_file: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,9 +280,9 @@ const TOOLS: &[ToolDef] = &[
         name: "wait",
         group: Group::Manage,
         description: "Wait until a child is ready or has exited. With until_file, wait until \
-            the child has written that file (its result), then read it with get_file and \
-            stop the child.",
-        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "until_file": {"type": "string", "description": "Absolute path in the child, e.g. /tmp/result.txt. Keep waiting past ready until it exists or the child exits"}}, "required": ["handle"]}),
+            the child has written that file (its result). Add return_file: true to get the \
+            file's content in the reply, then stop the child.",
+        schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "until_file": {"type": "string", "description": "Absolute path in the child, e.g. /tmp/result.txt. Keep waiting past ready until it exists or the child exits"}, "return_file": {"type": "boolean", "description": "With until_file: include the file's content (up to 256 KiB) in the reply"}}, "required": ["handle"]}),
     },
     ToolDef {
         name: "exec",
@@ -551,6 +555,20 @@ mod tests {
                 handle: "w1".into(),
                 timeout_s: None,
                 until_file: Some("/tmp/result.txt".into()),
+                return_file: false,
+            })
+        );
+        assert_eq!(
+            parse_operation(
+                "wait",
+                json!({"handle": "w1", "until_file": "/tmp/r", "return_file": true})
+            )
+            .unwrap(),
+            Operation::Wait(WaitArgs {
+                handle: "w1".into(),
+                timeout_s: None,
+                until_file: Some("/tmp/r".into()),
+                return_file: true,
             })
         );
         assert!(parse_operation("mark_done", json!({})).is_err());

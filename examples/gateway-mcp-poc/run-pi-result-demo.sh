@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A real Pi lead delegates to a real Pi worker. run-child saves the worker's
 # answer to /tmp/result.txt; the lead's wait (until_file) returns once the file
-# exists, it reads the file with get_file and stops the worker. The worker never
+# exists, with the file's content in the reply (return_file), and stops the worker. The worker never
 # calls the gateway, and the gateway stores nothing.
 # Needs: dev gateway (mise run gateway:docker), image pi-agent:local, and a
 # provider "harness-nvidia" with your key (see harnesses/provider-harness-nvidia.yaml).
@@ -27,11 +27,11 @@ You are a lead agent running inside an OpenShell sandbox. You have MCP tools fro
 
 1. Call create_sandbox with name "worker", providers ["$PROVIDER"], request_id "result-demo-1",
    and command ["run-child","pi-run","-p","$WORKER_TASK"].
-2. Call wait with handle "worker", until_file "/tmp/result.txt" and timeout_s 300. If it
-   timed out, call wait again the same way (at most 3 times).
-3. When "file_ready" is true, call get_file with handle "worker" and path "/tmp/result.txt".
-4. Call stop_sandbox with handle "worker".
-5. Reply with: the worker's answer exactly as in the file, and one sentence on how you
+2. Call wait with handle "worker", until_file "/tmp/result.txt", return_file true and
+   timeout_s 300. If it timed out, call wait again the same way (at most 3 times).
+3. When "file_ready" is true, the reply's "content" is the worker's answer. Only then call
+   stop_sandbox with handle "worker".
+4. Reply with: the worker's answer exactly as in the file, and one sentence on how you
    received it.
 PROMPT
 echo "== Running Pi in the lead"

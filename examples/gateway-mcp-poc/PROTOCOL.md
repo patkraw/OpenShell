@@ -53,9 +53,9 @@ at its maximum depth or out of budget gets `NOT_ALLOWED` or `LIMIT_REACHED`.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `create_sandbox` | `command`, `kind` (`agent`/`tool`), `lifetime`, `name`, `task`, `policy` (`{"network_policies": {...}}`), `providers`, `request_id`, `idle_timeout_s`; users only: `image`, `grant` | `handle` |
-| `wait` | `handle`, `timeout_s`, `until_file` (absolute path in the child; keep waiting past ready until it exists or the child exits) | `phase`, `exit_code`, `file_ready` (with `until_file`) |
+| `wait` | `handle`, `timeout_s`, `until_file` (absolute path in the child; keep waiting past ready until it exists or the child exits), `return_file` (with `until_file`: include the file's content) | `phase`, `exit_code`, `file_ready` (with `until_file`), `content` and `truncated` (with `return_file`, max 256 KiB) |
 | `exec` | `handle`, `command`, `timeout_s` (tool children only) | `stdout`, `stderr`, `exit_code` |
-| `get_file` | `handle`, `path` | `content` (max 256 KiB) |
+| `get_file` | `handle`, `path` | `content` (max 256 KiB), `truncated` |
 | `get_output` | `handle` | recent log lines of the child (not a durable result; the child's own standard output is not included) |
 | `stop_sandbox` | `handle` | `stopped` (its children are stopped first) |
 | `list_children` | none | children |

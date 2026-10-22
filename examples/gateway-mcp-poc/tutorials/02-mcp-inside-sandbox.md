@@ -110,9 +110,10 @@ mcp lead stop_sandbox '{"handle":"t1"}'
 ### Collect an agent child's result
 
 **The child writes its result to a file and keeps running; the parent's `wait`
-with `until_file` returns once the file exists, and the parent reads it with
-`get_file`.** The child never calls the gateway, and the gateway stores
-nothing: it checks for the file through the same relay `get_file` uses. Here
+with `until_file` and `return_file` returns once the file exists, with the
+file's content in the reply.** The child never calls the gateway, and the
+gateway stores nothing: it reads the file through the same relay `get_file`
+uses. Here
 the child's command stands in for an agent: it works for 20 seconds, then
 writes `/tmp/result.txt` whole and renames it into place, so the file never
 appears half-written. With a real agent, `run-child` does that around the
@@ -120,21 +121,25 @@ agent's command, as in [`run-pi-result-demo.sh`](../run-pi-result-demo.sh).
 
 ```shell
 mcp lead create_sandbox '{"name":"rev","command":["sh","-c","sleep 20; echo \"review: LGTM, 2 nits\" > /tmp/result.tmp && mv /tmp/result.tmp /tmp/result.txt; sleep 600"]}'
-mcp lead wait '{"handle":"rev","timeout_s":120,"until_file":"/tmp/result.txt"}'
-mcp lead get_file '{"handle":"rev","path":"/tmp/result.txt"}'
+mcp lead wait '{"handle":"rev","timeout_s":120,"until_file":"/tmp/result.txt","return_file":true}'
 mcp lead stop_sandbox '{"handle":"rev"}'
 ```
 
 ```text
 {"isError":false,...,"handle":"rev","kind":"agent","lifetime":"until_stopped"}
-{"isError":false,"exit_code":null,"file_ready":true,"handle":"rev","phase":"SANDBOX_PHASE_READY","timed_out":false}
-{"isError":false,"content":"review: LGTM, 2 nits\n","handle":"rev","path":"/tmp/result.txt"}
+{"isError":false,"content":"review: LGTM, 2 nits\n","exit_code":null,"file_ready":true,"handle":"rev","phase":"SANDBOX_PHASE_READY","timed_out":false,"truncated":false}
 {"isError":false,"handle":"rev","stopped":true}
 ```
 
 - **`until_file`** keeps `wait` going past READY until that file exists in the
   child, or the child exits. Without it, an agent child's `wait` returns at
   READY, before the work is done.
+- **`return_file`** puts the file's content in the reply (up to 256 KiB;
+  `truncated` says if it was cut; `get_file` has the same limit, so keep
+  result files small). Read and wait are one call, so a harness that sends
+  its next calls in parallel cannot stop the child before it has the result.
+  Without `return_file`, read the file with `get_file` before stopping the
+  child.
 - **No file plus an exit code means it failed:** a child that exits without
   writing the file returns `"file_ready":false` and its exit code, and its
   files are gone.
