@@ -481,6 +481,7 @@ fn check_caller_program(
     if program == grant.program {
         Ok(())
     } else {
+        warn!(sandbox = %sandbox_id, %program, code = "PROGRAM_NOT_ALLOWED", "mcp: call refused");
         Err(ApiError::new(
             "PROGRAM_NOT_ALLOWED",
             format!(
@@ -822,6 +823,7 @@ impl SandboxApi for GatewaySandboxApi {
 
     async fn call(&self, caller: &Principal, op: Operation) -> Result<Value, ApiError> {
         let state = &self.state;
+        let tool = op_name(&op);
         let result = match (caller, op) {
             (Principal::Sandbox(s), Operation::CreateSandbox(a)) => {
                 create_child(state, &s.sandbox_id, &val(&a)).await
@@ -860,7 +862,33 @@ impl SandboxApi for GatewaySandboxApi {
             }
             _ => Err(terr("NOT_ALLOWED", "not available to this caller")),
         };
+        // Every refusal is logged, so a tree's attempts to go past its grant or
+        // ceiling can be audited after the fact.
+        if let Err(e) = &result {
+            let who = match caller {
+                Principal::Sandbox(s) => s.sandbox_id.clone(),
+                Principal::User(u) => u.identity.subject.clone(),
+                _ => String::new(),
+            };
+            warn!(caller = %who, tool, code = %e.code, message = %e.message, "mcp: call refused");
+        }
         result.map_err(ApiError::from)
+    }
+}
+
+const fn op_name(op: &Operation) -> &'static str {
+    match op {
+        Operation::CreateSandbox(_) => "create_sandbox",
+        Operation::Wait(_) => "wait",
+        Operation::Exec(_) => "exec",
+        Operation::GetFile(_) => "get_file",
+        Operation::GetOutput(_) => "get_output",
+        Operation::Stop(_) => "stop_sandbox",
+        Operation::ListChildren => "list_children",
+        Operation::GetLimits => "get_limits",
+        Operation::GrantList => "grant_list",
+        Operation::GrantCreate(_) => "grant_create",
+        Operation::GrantUpdate(_) => "grant_update",
     }
 }
 
