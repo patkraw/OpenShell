@@ -137,6 +137,11 @@ it with real Pi agents: `run-child` saves the worker's answer, and the lead wait
 for the file, reads it with `get_file` and stops the worker. The worker never
 calls the gateway.
 
+**Harness matrix: 6/6 harnesses pass the split-count benchmark** (2026-10-21):
+Pi, OpenCode, Qwen Code, Codex, Deep Agents and Hermes each split a log between
+two child sandboxes and combined their results. How to run it, per-harness
+setup and findings: [bench/README.md](bench/README.md).
+
 Run `examples/gateway-mcp-poc/run-checks.sh` against a dev gateway (see Test it)
 to reproduce.
 
