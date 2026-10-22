@@ -1,14 +1,19 @@
 #!/bin/sh
-# Run an agent child's task so its parent can collect the result: save the
-# command's output to /tmp/result.txt (written whole, then renamed, so it never
-# appears half-written) and stay running so the parent can read it. The child
-# never calls the gateway; the parent's `wait` with until_file and return_file
-# sees the file, returns its content and the parent stops the child.
+# Run an agent child's task so its parent can collect the result. The result
+# file's first line is the command's exit status (exit=N), then its output.
+# The file is written whole, then renamed, so it never appears half-written,
+# and it is published even when the command fails: exit=N other than 0 means
+# the output may be partial. The status comes first so that it survives when a
+# reader cuts a large file short. The child then stays running so the parent
+# can read the file, as often as it needs to. The child never calls the
+# gateway; the parent's `wait` with until_file and return_file returns the file
+# and the parent stops the child.
 # stdin is closed: as a sandbox's main command it is open but never written, and
 # some harnesses (OpenCode) wait on it forever.
 # Usage: run-child <command> [args...]   e.g. run-child pi-run -p "task"
 out=/tmp/result.txt
-"$@" < /dev/null > "$out.tmp" 2> /tmp/result.err
-echo $? > /tmp/result.exit
+"$@" < /dev/null > /tmp/result.body 2> /tmp/result.err
+code=$?
+{ echo "exit=$code"; cat /tmp/result.body; } > "$out.tmp"
 mv "$out.tmp" "$out"
 exec sleep "${RUN_CHILD_LINGER_S:-3600}"

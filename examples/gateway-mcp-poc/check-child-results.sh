@@ -29,7 +29,7 @@ check() { # label actual expected-substring
 $OS sandbox delete lead >/dev/null 2>&1; wait_gone lead
 $OS sandbox create --name lead --from pi-agent:local --policy lead.yaml \
   --grant-program /usr/local/bin/node \
-  --grant-max-depth 2 --grant-max-breadth 8 --grant-max-total 12 --grant-expires 1h \
+  --grant-max-depth 2 --grant-max-breadth 10 --grant-max-total 14 --grant-expires 1h \
   --no-tty --detach -- sleep 3600 >/dev/null
 wait_ready lead || { echo "lead not ready"; exit 1; }
 
@@ -63,6 +63,20 @@ check "r1's file is ready" "$out" '"file_ready":true'
 check "with its content" "$out" 'from-r1'
 check "not truncated" "$out" '"truncated":false'
 mcp lead stop_sandbox '{"handle":"r1"}' >/dev/null
+
+echo "2c. run-child: the exit status is the result's first line"
+mcp lead create_sandbox '{"name":"k1","command":["run-child","sh","-c","echo all-good"]}' >/dev/null
+out=$(mcp lead wait '{"handle":"k1","timeout_s":120,"until_file":"/tmp/result.txt","return_file":true}')
+check "a command that succeeds says exit=0" "$out" 'exit=0\nall-good'
+mcp lead create_sandbox '{"name":"k2","command":["run-child","sh","-c","echo half-done; exit 4"]}' >/dev/null
+out=$(mcp lead wait '{"handle":"k2","timeout_s":120,"until_file":"/tmp/result.txt","return_file":true}')
+check "a command that fails is still published" "$out" '"file_ready":true'
+check "with exit=4 above its partial output" "$out" 'exit=4\nhalf-done'
+again=$(mcp lead wait '{"handle":"k2","timeout_s":10,"until_file":"/tmp/result.txt","return_file":true}')
+check "a second wait returns the same content" "$again" 'exit=4\nhalf-done'
+check "and get_file too" "$(result lead k2)" 'exit=4\nhalf-done'
+mcp lead stop_sandbox '{"handle":"k1"}' >/dev/null
+mcp lead stop_sandbox '{"handle":"k2"}' >/dev/null
 
 echo "3. A child that exits without writing its file"
 mcp lead create_sandbox '{"name":"x1","command":["sh","-c","sleep 3; exit 7"]}' >/dev/null

@@ -39,7 +39,7 @@ GRANT=(--grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3)
 KEEP_LOGS=()      # children whose sandbox logs to keep (network denials)
 post() { :; }     # runs after the lead finishes, before clean-up
 LEAD="You are the lead agent inside an OpenShell sandbox, with the tools of the \"openshell\" MCP server."
-WAIT='call wait with its handle, until_file "/tmp/result.txt", return_file true and timeout_s 45; if it timed out, call wait again the same way until file_ready is true or the child has exited'
+WAIT='call wait with its handle, until_file "/tmp/result.txt", return_file true and timeout_s 45; if it timed out, call wait again the same way until file_ready is true or the child has exited. The content field is the result file of the child: its first line is exit=N, the exit status of the child command, and the rest is its output. If it is not exit=0 the child failed: report its exit code and do not use its output as a result'
 . "tasks/$TASK/task.sh"
 printf '%s\n' "$PROMPT" > "$OUT/prompt.txt"
 
@@ -69,9 +69,10 @@ pkill -P $DOG 2>/dev/null; kill $DOG 2>/dev/null; wait $DOG 2>/dev/null
 post
 for n in ${KEEP_LOGS[@]+"${KEEP_LOGS[@]}"}; do $OS logs "$n" -n 1000 > "$OUT/logs-$n.txt" 2>&1; done
 names | grep -v '^lead$' > "$OUT/left.txt"
-# Keep each still-running child's own stderr and exit code from run-child.
+# Keep each still-running child's own stderr and result file (run-child puts
+# the exit status on the result's first line).
 while read -r n; do
-  $OS sandbox exec "$n" -- sh -c 'echo "exit: $(cat /tmp/result.exit 2>/dev/null)"; tail -c 4000 /tmp/result.err 2>/dev/null' \
+  $OS sandbox exec "$n" -- sh -c 'head -n 1 /tmp/result.txt 2>/dev/null; tail -c 4000 /tmp/result.err 2>/dev/null' \
     > "$OUT/child-$n.err" 2>&1
   $OS sandbox exec "$n" -- cat /tmp/result.txt > "$OUT/child-$n.result" 2>/dev/null
 done < "$OUT/left.txt"

@@ -111,13 +111,16 @@ and the other seven refused, and the summarizer ignored the injection.
 ### 6. crash
 
 The first child is a "fast counter" (`share/fast-count`) that exits with code 3
-without writing a result. The lead must notice (`wait` returns
+without writing a result. A third child (`share/partial-count`, through
+`run-child`) prints a partial, wrong result and exits with code 4, so its
+result file says `exit=4` above the partial output. The lead must notice (`wait` returns
 `file_ready: false` and the exit code), start a replacement with a
 `request_id`, and call `create_sandbox` again with the same `request_id`, as if
 the first reply had been lost.
 
-**Pass:** the exact answer; the exit code 3 reported; the repeated create
-returned the same child, and only `w1` and `w2` were ever created; nothing left
+**Pass:** the exact answer (which also shows the partial numbers were not
+added in); the exit codes 3 and 4 reported; the repeated create returned the
+same child, and only `w1`, `w2` and `w3` were ever created; nothing left
 running.
 
 ### 7. bug-hunt

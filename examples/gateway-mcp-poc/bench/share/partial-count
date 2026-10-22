@@ -1,0 +1,8 @@
+#!/bin/sh
+# A counter that prints part of a result, then fails (exit 4). Started through
+# run-child, so its result file says exit=4 above the partial output. The crash
+# task uses it to check that a parent does not take a failed child's partial
+# output as its answer.
+echo '{"errors": 37, "by_message": {"disk full": 20, "cache unavailable": 17}, "note": "stopped early"}'
+echo "partial-count: lost connection to the log store" >&2
+exit 4

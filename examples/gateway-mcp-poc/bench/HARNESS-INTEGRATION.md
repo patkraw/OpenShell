@@ -366,7 +366,9 @@ exits. A harness in one-shot mode exits as soon as it answers.
 
 **Workaround.** [`run-child`](../run-child#L10-L14) runs the harness, saves its
 reply to `/tmp/result.txt` (written whole, then renamed) and keeps the sandbox
-running. The gateway side is `wait_child` in
+running. The file's first line is the command's exit status (`exit=N`), so a
+parent can tell a finished answer from partial output left by a failed
+command. The gateway side is `wait_child` in
 [`children.rs`](../../../crates/openshell-server/src/children.rs).
 The parent's `wait` with `until_file` and `return_file` returns once the file
 exists, with its content in the reply, and the parent then stops the child. The

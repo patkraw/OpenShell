@@ -140,6 +140,10 @@ mcp lead stop_sandbox '{"handle":"rev"}'
   its next calls in parallel cannot stop the child before it has the result.
   Without `return_file`, read the file with `get_file` before stopping the
   child.
+- **With `run-child`, the result's first line is the command's exit status**
+  (`exit=0`, or `exit=4` for a command that failed after printing part of
+  its answer). The file is published either way, so read the status before
+  using the rest.
 - **No file plus an exit code means it failed:** a child that exits without
   writing the file returns `"file_ready":false` and its exit code, and its
   files are gone.

@@ -1,9 +1,11 @@
 #!/bin/sh
 # A child whose result file is bigger than the 256 KiB the gateway returns:
-# a one-line summary first, then about 500 KiB of per-test detail, then END.
-# Written whole and renamed into place, like run-child does.
+# the exit=0 status line and a one-line summary first, then about 500 KiB of
+# per-test detail, then END. Written whole and renamed into place, in the same
+# format as run-child.
 out=/tmp/result.txt
 {
+  echo 'exit=0'
   echo '{"summary": {"tests": 6000, "failed": 137, "slowest_test": "test_upload_large_file"}}'
   i=1
   while [ $i -le 6000 ]; do
