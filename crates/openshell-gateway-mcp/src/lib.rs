@@ -281,7 +281,10 @@ const TOOLS: &[ToolDef] = &[
         group: Group::Manage,
         description: "Wait until a child is ready or has exited. With until_file, wait until \
             the child has written that file (its result). Add return_file: true to get the \
-            file's content in the reply, then stop the child.",
+            file's content in the reply, and stop the child only after you have it: stopping \
+            deletes the child and its files. A result written by run-child starts with a line \
+            exit=N, the child command's exit status; any other value than exit=0 means the \
+            output may be partial.",
         schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "timeout_s": {"type": "integer"}, "until_file": {"type": "string", "description": "Absolute path in the child, e.g. /tmp/result.txt. Keep waiting past ready until it exists or the child exits"}, "return_file": {"type": "boolean", "description": "With until_file: include the file's content (up to 256 KiB) in the reply"}}, "required": ["handle"]}),
     },
     ToolDef {
@@ -294,7 +297,8 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "get_file",
         group: Group::Manage,
-        description: "Read a file from a running child, e.g. its result file. Max 256 KiB.",
+        description: "Read a file from a running child, e.g. its result file. Max 256 KiB; \
+            truncated says if the file was longer.",
         schema: || json!({"type": "object", "additionalProperties": false, "properties": {"handle": {"type": "string"}, "path": {"type": "string"}}, "required": ["handle", "path"]}),
     },
     ToolDef {

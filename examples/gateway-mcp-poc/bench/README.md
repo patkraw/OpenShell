@@ -150,7 +150,8 @@ children.
 
 Children are started with `agent-run`, which runs the image's harness once on a
 prompt through `run-child`. `run-child` closes stdin, saves the reply to
-`/tmp/result.txt` and keeps the sandbox running, so the parent's `wait` with
+`/tmp/result.txt` under a first line with the command's exit status
+(`exit=N`) and keeps the sandbox running, so the parent's `wait` with
 `until_file` and `return_file` gets the result. **Children never call the
 gateway**, so the grant's single calling program (the lead's harness) is
 enough. To add a harness, add its image to `build-images.sh` and a line to the
