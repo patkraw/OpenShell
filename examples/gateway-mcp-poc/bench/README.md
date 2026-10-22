@@ -1,7 +1,7 @@
 # Harness matrix: the split-count benchmark
 
 **Six agent harnesses ran the same delegation task through the gateway MCP
-server, and all six got the right answer** (2026-10-21, one run each). Each lead
+server, and all six got the right answer** (one run each). Each lead
 agent created two child sandboxes with `create_sandbox`, waited for their result
 files with `wait` and `until_file`, read them with `get_file`, combined the
 counts and stopped both children.
@@ -70,17 +70,26 @@ OPENAI_API_KEY="<your key>" target/debug/openshell -g docker-dev provider create
   --name harness-nvidia --type harness-nvidia --from-existing
 ```
 
-Run one harness, or all of them:
+Start the dev gateway with its output in a file, so runs can read the
+gateway's refusal log:
 
 ```shell
-cd examples/gateway-mcp-poc/bench/split-count
-./run.sh pi
-for h in pi opencode qwen codex deepagents hermes; do ./run.sh $h; done
+mise run gateway:docker > .cache/gateway-docker/gateway.log 2>&1 &
 ```
 
-Each run prints one JSON line and keeps the lead's reply, its stderr and the
-list of sandboxes seen during the run in `results/<harness>/`. A run that takes
-longer than 15 minutes is stopped (`RUN_TIMEOUT_S` changes the limit).
+Run one task with one harness, or every task:
+
+```shell
+cd examples/gateway-mcp-poc/bench
+./run-task.sh split-count pi
+for t in split-count budget tree least-privilege injection crash bug-hunt; do ./run-task.sh $t pi; done
+```
+
+Each run prints one JSON line and keeps the lead's prompt and reply, the
+sandboxes seen, the gateway's log lines, what was left running and kept sandbox
+logs in `results/<task>/<harness>/`. A run that takes longer than 20 minutes is
+stopped (`RUN_TIMEOUT_S` changes the limit). The tasks are described in
+[TASKS.md](TASKS.md).
 
 ## The harnesses
 

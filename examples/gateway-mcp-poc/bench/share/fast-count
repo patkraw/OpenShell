@@ -1,0 +1,6 @@
+#!/bin/sh
+# A "fast counter" that crashes before writing any result: the crash-and-retry
+# task uses it as the child that fails.
+echo "fast-count: out of memory" >&2
+sleep 3
+exit 3

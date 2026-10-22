@@ -1,11 +1,20 @@
-# Adds the benchmark data and the child helpers to any harness image:
-#   docker build --build-arg BASE=harness-codex:local -t harness-codex:bench \
-#     -f bench/Dockerfile.bench examples/gateway-mcp-poc
+# Adds the benchmark data, prompts and child helpers to any harness image:
+#   docker build --build-arg BASE=harness-codex:local --build-arg AGENT="codex-run" \
+#     -t harness-codex:bench -f bench/Dockerfile.bench examples/gateway-mcp-poc
+# AGENT is the harness's one-shot command; `agent-run FILE` runs it on the
+# prompt in FILE through run-child, so a child is started the same way in
+# every harness.
 ARG BASE
 FROM ${BASE}
+ARG AGENT
 USER root
 COPY mcp-client.mjs /usr/local/lib/gateway-mcp/mcp-client.mjs
 COPY --chmod=755 run-child /usr/local/bin/run-child
 COPY bench/split-count/app.log /data/app.log
-RUN chmod 644 /data/app.log
+COPY bench/data/ /data/
+COPY bench/share/ /usr/local/share/bench/
+RUN printf '#!/bin/sh\n# Run this image'"'"'s harness once through run-child, on the prompt in the\n# file $1, or on the arguments as the prompt text.\nif [ $# -eq 1 ] && [ -f "$1" ]; then p=$(cat "$1"); else p="$*"; fi\nexec run-child %s "$p"\n' "${AGENT}" \
+        > /usr/local/bin/agent-run \
+    && chmod 755 /usr/local/bin/agent-run /usr/local/share/bench/fast-count \
+    && chmod -R a+rX /data /usr/local/share/bench
 USER node

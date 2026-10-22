@@ -7,7 +7,6 @@ export HOME=/tmp/hermes-home HERMES_HOME=/tmp/hermes-home HERMES_DISABLE_LAZY_IN
     PYTHONDONTWRITEBYTECODE=1
 mkdir -p "$HERMES_HOME"
 cp -n /usr/local/share/hermes-seed/config.yaml "$HERMES_HOME/" 2>/dev/null
-# As a sandbox's main command, stdin is open but never written, and `hermes -z`
-# would read it as part of the prompt. Close it unless it is a terminal.
+# `hermes -z` does not read stdin; closing it is only a precaution.
 [ -t 0 ] || exec </dev/null
 exec hermes --yolo -z "$@"
