@@ -2,7 +2,7 @@
 # Run one benchmark task with one harness and score it.
 #
 # Usage: run-task.sh TASK HARNESS
-#   TASK:    split-count | budget | tree | least-privilege | injection | crash | bug-hunt
+#   TASK:    split-count | budget | tree | least-privilege | injection | crash | bug-hunt | hang | big-result
 #   HARNESS: pi | qwen | codex | opencode | hermes | deepagents
 #
 # A task is tasks/<TASK>/task.sh (the grant, the lead's prompt and optional
