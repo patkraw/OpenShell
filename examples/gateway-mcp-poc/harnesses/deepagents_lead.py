@@ -13,6 +13,7 @@ from deepagents import (
     create_deep_agent,
     register_harness_profile,
 )
+from deepagents.backends import LocalShellBackend
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
@@ -53,6 +54,10 @@ async def main(prompt: str) -> None:
     agent = create_deep_agent(
         model=model,
         tools=mcp_tools,
+        # The default backend is a virtual, in-memory filesystem with no shell, so
+        # the agent could not see the sandbox's files. Deep Agents says to give an
+        # agent the real disk and a shell only inside a sandbox; this is one.
+        backend=LocalShellBackend(root_dir="/", virtual_mode=False, inherit_env=True),
         # Neutral by default, so the matrix measures which spawn path the model picks.
         system_prompt=os.environ.get("EXTRA_SYSTEM_PROMPT") or None,
         # no interrupt_on, no checkpointer -> no human-in-the-loop interrupts
