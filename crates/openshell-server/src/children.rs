@@ -94,6 +94,9 @@ pub struct Grant {
     pub total: u32,
     /// Workspace of the holder; Workspace Admins of it may manage the grant.
     pub workspace: String,
+    /// Revoked grants are kept, not deleted, so the tree's program check
+    /// still applies to the calls its sandboxes may make after a revoke.
+    pub revoked: bool,
 }
 
 /// Who created whom. Separate from the sandbox record (no owner field).
@@ -187,7 +190,9 @@ fn check_limits(
     if lineage.kind == KIND_TOOL {
         return Err(terr("NOT_ALLOWED", "tool sandboxes cannot create children"));
     }
-    let grant = grant.ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
+    let grant = grant
+        .filter(|g| !g.revoked)
+        .ok_or_else(|| terr("NOT_ALLOWED", "grant revoked"))?;
     if now > grant.expires_at_ms {
         return Err(terr("NOT_ALLOWED", "grant expired"));
     }
@@ -536,6 +541,7 @@ fn new_grant(user: &UserPrincipal, holder: &Sandbox, spec: GrantSpec, total: u32
         expires_at_ms: now_ms().saturating_add(expires_ms),
         total,
         workspace: holder.object_workspace().to_string(),
+        revoked: false,
     }
 }
 
@@ -626,10 +632,10 @@ async fn grant_create(
             format!("'{sandbox_name}' is a child in a tree; its tree's grant already covers it"),
         ));
     }
-    // The tree's current grant: active means no replacement; an expired one
-    // may only be replaced by someone who may manage it.
+    // The tree's current grant: active means no replacement; a revoked or
+    // expired one may only be replaced by someone who may manage it.
     if let Some(old) = state.children.grant(&holder.grant_id) {
-        if now_ms() <= old.expires_at_ms {
+        if !old.revoked && now_ms() <= old.expires_at_ms {
             return Err(terr(
                 "ALREADY_EXISTS",
                 format!(
@@ -641,7 +647,7 @@ async fn grant_create(
         if !may_manage_grant(state, &principal, user, &old).await {
             return Err(terr(
                 "NOT_ALLOWED",
-                "only the user who set the expired grant, or a Workspace Admin, can replace it",
+                "only the user who set the revoked or expired grant, or a Workspace Admin, can replace it",
             ));
         }
     }
@@ -1672,7 +1678,7 @@ fn get_limits(state: &ServerState, caller_id: &str) -> Value {
     let Some(l) = state.children.lineage(caller_id) else {
         return json!({"has_grant": false, "can_create_children": false});
     };
-    let Some(g) = state.children.grant(&l.grant_id) else {
+    let Some(g) = state.children.grant(&l.grant_id).filter(|g| !g.revoked) else {
         return json!({"has_grant": false, "can_create_children": false});
     };
     json!({
@@ -1689,7 +1695,14 @@ fn get_limits(state: &ServerState, caller_id: &str) -> Value {
 /// Grants the caller may see: those it set, and those in workspaces it
 /// administers.
 async fn grant_list(state: &ServerState, principal: &Principal, user: &UserPrincipal) -> Value {
-    let all: Vec<Grant> = state.children.lock().grants.values().cloned().collect();
+    let all: Vec<Grant> = state
+        .children
+        .lock()
+        .grants
+        .values()
+        .filter(|g| !g.revoked)
+        .cloned()
+        .collect();
     let mut visible = Vec::new();
     for g in all {
         if may_manage_grant(state, principal, user, &g).await {
@@ -1715,9 +1728,11 @@ async fn grant_update(
 ) -> Result<Value, ToolError> {
     let id = str_arg(args, "grant_id")
         .ok_or_else(|| terr("INVALID_ARGUMENT", "grant_id is required"))?;
+    // A revoked grant is kept for the program check but is gone for users.
     let grant = state
         .children
         .grant(id)
+        .filter(|g| !g.revoked)
         .ok_or_else(|| terr("NOT_FOUND", "no such grant"))?;
     if !may_manage_grant(state, principal, user, &grant).await {
         return Err(terr(
@@ -1726,18 +1741,16 @@ async fn grant_update(
         ));
     }
     let mut inner = state.children.lock();
-    if args.get("revoke").and_then(Value::as_bool) == Some(true) {
-        inner
-            .grants
-            .remove(id)
-            .ok_or_else(|| terr("NOT_FOUND", "no such grant"))?;
-        info!(grant_id = %id, user = %user.identity.subject, "mcp: grant revoked");
-        return Ok(json!({"grant_id": id, "revoked": true}));
-    }
     let g = inner
         .grants
         .get_mut(id)
+        .filter(|g| !g.revoked)
         .ok_or_else(|| terr("NOT_FOUND", "no such grant"))?;
+    if args.get("revoke").and_then(Value::as_bool) == Some(true) {
+        g.revoked = true;
+        info!(grant_id = %id, user = %user.identity.subject, "mcp: grant revoked");
+        return Ok(json!({"grant_id": id, "revoked": true}));
+    }
     let set = |v: &mut u32, key: &str| {
         if let Some(n) = args.get(key).and_then(Value::as_u64) {
             *v = u32::try_from(n).unwrap_or(u32::MAX);
@@ -2422,6 +2435,7 @@ mod tests {
             expires_at_ms: i64::MAX,
             total: 1,
             workspace: "default".into(),
+            revoked: false,
         }
     }
 
@@ -2534,7 +2548,7 @@ mod tests {
         inner.grants.get_mut("g").unwrap().expires_at_ms = 10;
         let err = inner.reserve("lead", KIND_AGENT, None, 11).unwrap_err();
         assert_eq!(err.message, "grant expired");
-        inner.grants.remove("g");
+        inner.grants.get_mut("g").unwrap().revoked = true;
         let err = inner.reserve("lead", KIND_AGENT, None, 0).unwrap_err();
         assert_eq!(err.message, "grant revoked");
         assert_eq!(inner.lineage["lead"].children_created, 0);
@@ -2578,7 +2592,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(state.children.grant("g").is_none());
+        // Kept for the program check, but gone for users.
+        assert!(state.children.grant("g").expect("kept").revoked);
+        let listed = grant_list(&state, &as_principal(&alice), &alice).await;
+        assert_eq!(listed["grants"].as_array().unwrap().len(), 0);
+        let err = grant_update(
+            &state,
+            &as_principal(&alice),
+            &alice,
+            &json!({"grant_id": "g", "max_total": 99}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, "NOT_FOUND");
 
         // A platform admin may manage any grant.
         state
@@ -2618,7 +2644,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "ALREADY_EXISTS");
 
-        state.children.lock().grants.remove("g");
+        state.children.lock().grants.get_mut("g").unwrap().revoked = true;
         let v = grant_create(&state, &alice, "default", "lead", spec)
             .await
             .unwrap();
@@ -2628,6 +2654,42 @@ mod tests {
         assert_eq!(v["max_depth"], 2);
         let inner = state.children.lock();
         assert!(inner.lineage.values().all(|l| l.grant_id == new_id));
+        assert!(
+            !inner.grants.contains_key("g"),
+            "the revoked grant is replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_grant_still_limits_the_door_to_its_program() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        {
+            let mut inner = state.children.lock();
+            inner
+                .grants
+                .insert("g".into(), grant("g", "lead", "alice", 2, 3));
+            inner
+                .lineage
+                .insert("lead".into(), lineage("lead", None, 0, "g"));
+        }
+        let alice = user("alice", &["openshell-user"]);
+        grant_update(
+            &state,
+            &Principal::User(alice.clone()),
+            &alice,
+            &json!({"grant_id": "g", "revoke": true}),
+        )
+        .await
+        .unwrap();
+        let from = |program: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(CALLER_PROGRAM_HEADER, program.parse().unwrap());
+            check_caller_program(&state, "lead", &headers)
+        };
+        let err = from("/usr/bin/curl").unwrap_err();
+        assert_eq!(err.code, "PROGRAM_NOT_ALLOWED");
+        // The grant's program keeps its access to the tree's existing children.
+        assert!(from("/usr/local/bin/node").is_ok());
     }
 
     #[test]

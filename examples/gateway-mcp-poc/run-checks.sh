@@ -164,6 +164,8 @@ check "the user revokes plain's grant" "$($OS grant revoke "$pgid" 2>&1)" "revok
 check "after revoke, plain cannot create" "$(mcp plain create_sandbox '{"name":"pcx","command":["sleep","60"]}')" "grant revoked"
 wait_ready pc1 || echo "pc1 did not become ready"
 check "after revoke, plain still reads from its existing child" "$(mcp plain get_file '{"handle":"pc1","path":"/etc/hostname"}')" '"content":'
+check "after revoke, curl in plain is still refused (the program check stays)" \
+  "$($OS sandbox exec plain -- curl -s -m 10 -X POST http://openshell.local/mcp -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_children","arguments":{}}}' 2>&1 | tail -1)" "PROGRAM_NOT_ALLOWED"
 check "a new grant replaces it (grant create after revoke)" "$($OS grant create plain --program /usr/local/bin/node --max-depth 1 --max-breadth 4 --max-total 5 2>&1)" "attached to plain"
 npgid=$($OS grant list 2>&1 | awk '$2=="plain"{print $1}')
 check "the running child counts toward the new grant (total 2/5)" "$($OS grant get "$npgid" 2>&1)" "2/5"
