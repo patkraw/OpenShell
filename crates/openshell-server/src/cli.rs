@@ -1890,26 +1890,27 @@ mod tests {
 
     #[test]
     fn sandbox_mcp_is_enabled_by_default_and_can_be_disabled_from_file_or_env() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = EnvVarGuard::remove("OPENSHELL_GATEWAY_MCP_ENABLED");
-        let (mut args, matches) =
-            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
-        assert!(args.sandbox_mcp_enabled);
+        Environment::new()
+            .remove("OPENSHELL_GATEWAY_MCP_ENABLED")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                assert!(args.sandbox_mcp_enabled);
 
-        let file = config_file_from_toml("[openshell.gateway.sandbox_mcp]\nenabled = false\n");
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-        assert!(!args.sandbox_mcp_enabled);
+                let file =
+                    config_file_from_toml("[openshell.gateway.sandbox_mcp]\nenabled = false\n");
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.sandbox_mcp_enabled);
 
-        let (mut args, matches) = parse_with_args(&[
-            "openshell-gateway",
-            "--db-url",
-            "sqlite::memory:",
-            "--sandbox-mcp-enabled=on",
-        ]);
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-        assert!(args.sandbox_mcp_enabled, "CLI flag must override file");
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--sandbox-mcp-enabled=on",
+                ]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(args.sandbox_mcp_enabled, "CLI flag must override file");
+            });
     }
 
     #[test]

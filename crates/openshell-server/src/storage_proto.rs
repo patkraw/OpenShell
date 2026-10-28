@@ -163,8 +163,10 @@ mod tests {
     // and SUSPENDED values to the shared
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
+    // Gateway MCP adds 24 public child-sandbox and grant messages. These RPCs
+    // do not change the durable schema or its overlap with the public API.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f24c9b77a85f59ae9ab60f783d45654d78bf566fcf260f9131f1aba39fa4b59b";
+        "8a96d81698e06c9dae2f33cc81eabbfc94877216cc537d4e1ca87db1fc480335";
     const DURABLE_SCHEMA_SHA256: &str =
         "ffb20595e36032a9476d1c6956e2dcdc814f85286fc4735751e5ec6f499ea9ed";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -725,7 +727,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 31),
+                (354, 31),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
