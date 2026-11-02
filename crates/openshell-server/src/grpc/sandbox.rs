@@ -465,6 +465,15 @@ fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<St
     }
 }
 
+/// The user recorded as a new sandbox's creator. Only users are recorded;
+/// operators are not workspace members, so they leave the field empty.
+fn creator_subject(principal: &crate::auth::principal::Principal) -> String {
+    match principal {
+        crate::auth::principal::Principal::User(user) => user.identity.subject.clone(),
+        _ => String::new(),
+    }
+}
+
 /// Read the staging token a caller named for the active driver, without
 /// removing it. The gateway consumes it later, inside `create_sandbox`.
 fn staging_token_in_spec(spec: &SandboxSpec, driver_name: &str) -> Option<String> {
@@ -555,11 +564,12 @@ fn sandbox_create_telemetry_attrs(
 
 /// Check the parent named in a create request and return the link to store on
 /// the new child. Returns `None` when no parent is named, for a root sandbox.
+/// A child that names no providers gets all of its parent's providers.
 async fn resolve_create_parent(
     state: &ServerState,
     workspace: &str,
     parent_name: &str,
-    spec: &SandboxSpec,
+    spec: &mut SandboxSpec,
 ) -> Result<Option<openshell_core::proto::SandboxParent>, Status> {
     if parent_name.is_empty() {
         return Ok(None);
@@ -609,6 +619,9 @@ async fn resolve_create_parent(
             "provider '{provider}' is not attached to parent '{parent_name}'"
         )));
     }
+    if spec.providers.is_empty() {
+        spec.providers = parent_providers.to_vec();
+    }
     Ok(Some(openshell_core::proto::SandboxParent {
         name: parent.object_name().to_string(),
         id: parent.object_id().to_string(),
@@ -616,11 +629,13 @@ async fn resolve_create_parent(
 }
 
 /// Under the child-create lock, re-read the parent and check that it can take
-/// one more child. Every existing child counts, whatever its state.
+/// one more child and still has the child's providers. Every existing child
+/// counts, whatever its state.
 async fn check_parent_has_room(
     state: &ServerState,
     workspace: &str,
     parent: &openshell_core::proto::SandboxParent,
+    providers: &[String],
 ) -> Result<(), Status> {
     let current = state
         .store
@@ -637,6 +652,19 @@ async fn check_parent_has_room(
     if !usable {
         return Err(Status::failed_precondition(format!(
             "parent sandbox '{}' is no longer available",
+            parent.name
+        )));
+    }
+    let parent_providers = current
+        .as_ref()
+        .and_then(|current| current.spec.as_ref())
+        .map_or(&[][..], |parent_spec| parent_spec.providers.as_slice());
+    if let Some(provider) = providers
+        .iter()
+        .find(|provider| !parent_providers.contains(provider))
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider}' is not attached to parent '{}'",
             parent.name
         )));
     }
@@ -738,7 +766,7 @@ async fn handle_create_sandbox_inner(
         spec.tty = true;
     }
 
-    let parent = resolve_create_parent(state, &workspace, &request.parent, &spec).await?;
+    let parent = resolve_create_parent(state, &workspace, &request.parent, &mut spec).await?;
 
     // Validate field sizes before any create-side effects.
     validate_sandbox_spec(&request.name, &spec)?;
@@ -771,7 +799,7 @@ async fn handle_create_sandbox_inner(
     let (sandbox_lifecycle_guard, mutation_guard) = guards
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     if let Some(parent) = &parent {
-        check_parent_has_room(state, &workspace, parent).await?;
+        check_parent_has_room(state, &workspace, parent, &spec.providers).await?;
     }
 
     // Validate provider names exist (fail fast).
@@ -851,7 +879,7 @@ async fn handle_create_sandbox_inner(
         status: None,
         created_from_workload_template,
         parent,
-        created_by: String::new(),
+        created_by: creator_subject(&principal),
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
     sandbox
@@ -7343,6 +7371,83 @@ mod tests {
                 id: lead_id,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_records_its_creator() {
+        let state = child_sandboxes_state().await;
+        let root = handle_create_sandbox(
+            &state,
+            authed_request(child_request("lead", "", SandboxSpec::default())),
+        )
+        .await
+        .expect("root sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+        let child = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .expect("child sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+
+        assert_eq!(root.created_by, "dev-user");
+        assert_eq!(child.created_by, "dev-user");
+    }
+
+    #[tokio::test]
+    async fn child_without_providers_copies_the_parent_providers() {
+        let state = child_sandboxes_state().await;
+        put_parent_record(&state, "lead", &["a", "b"], None, false).await;
+
+        let mut spec = SandboxSpec::default();
+        resolve_create_parent(&state, "default", "lead", &mut spec)
+            .await
+            .expect("parent resolves");
+        assert_eq!(spec.providers, vec!["a".to_string(), "b".to_string()]);
+
+        let mut spec = SandboxSpec {
+            providers: vec!["a".to_string()],
+            ..Default::default()
+        };
+        resolve_create_parent(&state, "default", "lead", &mut spec)
+            .await
+            .expect("parent resolves");
+        assert_eq!(spec.providers, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn child_provider_detached_before_the_lock_is_refused() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &["a"], None, false).await;
+        let parent = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+
+        // The child resolved its providers when the lead still had "b".
+        let err = check_parent_has_room(
+            &state,
+            "default",
+            &parent,
+            &["a".to_string(), "b".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("provider 'b' is not attached to parent 'lead'"),
+            "{}",
+            err.message()
+        );
+        check_parent_has_room(&state, "default", &parent, &["a".to_string()])
+            .await
+            .expect("providers the lead still has are accepted");
     }
 
     #[tokio::test]
