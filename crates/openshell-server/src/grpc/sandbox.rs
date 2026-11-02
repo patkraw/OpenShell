@@ -763,6 +763,31 @@ async fn parent_rejected_a_newer_policy(
     }
 }
 
+/// Under the parent's lock, check that a provider being attached to a child is
+/// attached to its parent.
+async fn check_parent_has_provider(
+    state: &ServerState,
+    parent: &openshell_core::proto::SandboxParent,
+    provider: &str,
+) -> Result<(), Status> {
+    let current = state
+        .store
+        .get_message::<Sandbox>(&parent.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?;
+    let attached = current
+        .as_ref()
+        .and_then(|current| current.spec.as_ref())
+        .is_some_and(|spec| spec.providers.iter().any(|name| name == provider));
+    if !attached {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider}' is not attached to parent '{}'",
+            parent.name
+        )));
+    }
+    Ok(())
+}
+
 /// Count the children of a parent by scanning its workspace.
 async fn count_children(
     state: &ServerState,
@@ -1740,14 +1765,23 @@ pub(super) async fn handle_attach_sandbox_provider(
     if let Some(probe) = attach_wait_probe {
         probe.notify_one();
     }
-    let _mutation_guard = state
-        .compute
-        .mutation_guard(MutationScope::sandbox(
-            sandbox.object_workspace(),
-            sandbox.object_id(),
-        ))
-        .await
-        .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
+    // A child also locks its parent, so the parent's providers cannot change
+    // before the attach is saved.
+    let scope = sandbox.parent.as_ref().map_or_else(
+        || MutationScope::sandbox(sandbox.object_workspace(), sandbox.object_id()),
+        |parent| MutationScope::ChildSandbox {
+            workspace: sandbox.object_workspace(),
+            sandbox_id: sandbox.object_id(),
+            parent_id: &parent.id,
+        },
+    );
+    let _mutation_guard =
+        state.compute.mutation_guard(scope).await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
+    if let Some(parent) = &sandbox.parent {
+        check_parent_has_provider(state, parent, &request.provider).await?;
+    }
     let provider_record = get_provider_record(state.store.as_ref(), &workspace, &request.provider)
         .await
         .map_err(|err| {
@@ -7834,6 +7868,151 @@ mod tests {
         handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
             .await
             .expect("only deleting children remain, so the parent can be deleted");
+    }
+
+    /// A root `lead` with one child `worker1`. Returns the child's id.
+    async fn put_lead_and_worker(state: &ServerState) -> String {
+        let lead_id = put_parent_record(state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+        put_parent_record(state, "worker1", &[], Some(link), false).await
+    }
+
+    fn default_scope() -> openshell_core::proto::WorkspaceSelector {
+        openshell_core::proto::workspace_selector("default".to_string())
+    }
+
+    #[tokio::test]
+    async fn setting_a_child_policy_is_refused_but_settings_are_allowed() {
+        let state = child_sandboxes_state().await;
+        put_lead_and_worker(&state).await;
+
+        let err = super::super::policy::handle_update_config(
+            &state,
+            authed_request(openshell_core::proto::UpdateConfigRequest {
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("child sandboxes use their parent's policy"),
+            "{}",
+            err.message()
+        );
+
+        super::super::policy::handle_update_config(
+            &state,
+            authed_request(openshell_core::proto::UpdateConfigRequest {
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                setting_key: openshell_core::settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "manual".to_string(),
+                    )),
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("a child's settings can still be changed");
+    }
+
+    #[tokio::test]
+    async fn child_proposals_are_rejected_and_not_stored() {
+        let state = child_sandboxes_state().await;
+        let worker_id = put_lead_and_worker(&state).await;
+
+        let response = super::super::policy::handle_submit_policy_analysis(
+            &state,
+            authed_request(openshell_core::proto::SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(default_scope()),
+                name: "worker1".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![openshell_core::proto::PolicyChunk {
+                    rule_name: "api".to_string(),
+                    proposed_rule: lead_policy(false).network_policies.remove("api"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the submission itself succeeds")
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 0);
+        assert_eq!(response.rejected_chunks, 1);
+        assert!(
+            response.rejection_reasons[0].contains("child sandboxes use their parent's policy"),
+            "{:?}",
+            response.rejection_reasons
+        );
+        let stored = state
+            .store
+            .list_draft_chunks(&worker_id, None)
+            .await
+            .unwrap();
+        assert!(stored.is_empty(), "a child's proposal must not be stored");
+    }
+
+    #[tokio::test]
+    async fn approving_a_proposal_on_a_child_is_refused() {
+        let state = child_sandboxes_state().await;
+        put_lead_and_worker(&state).await;
+
+        let err = super::super::policy::handle_approve_draft_chunk(
+            &state,
+            authed_request(openshell_core::proto::ApproveDraftChunkRequest {
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                chunk_id: "chunk-1".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("child sandboxes use their parent's policy"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn attaching_a_provider_the_parent_lacks_to_a_child_is_refused() {
+        let state = child_sandboxes_state().await;
+        put_lead_and_worker(&state).await;
+
+        let err = handle_attach_sandbox_provider(
+            &state,
+            authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                provider: "work-github".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("provider 'work-github' is not attached to parent 'lead'"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]
