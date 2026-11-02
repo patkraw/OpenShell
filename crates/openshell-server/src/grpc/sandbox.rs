@@ -615,6 +615,64 @@ async fn resolve_create_parent(
     }))
 }
 
+/// Under the child-create lock, re-read the parent and check that it can take
+/// one more child. Every existing child counts, whatever its state.
+async fn check_parent_has_room(
+    state: &ServerState,
+    workspace: &str,
+    parent: &openshell_core::proto::SandboxParent,
+) -> Result<(), Status> {
+    let current = state
+        .store
+        .get_message::<Sandbox>(&parent.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?;
+    let usable = current.as_ref().is_some_and(|current| {
+        current.parent.is_none()
+            && current
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.deletion_time.is_none())
+    });
+    if !usable {
+        return Err(Status::failed_precondition(format!(
+            "parent sandbox '{}' is no longer available",
+            parent.name
+        )));
+    }
+    let limit = state.config.max_concurrent_children;
+    let children = count_children(state, workspace, &parent.id).await?;
+    if children >= limit as usize {
+        return Err(Status::resource_exhausted(format!(
+            "sandbox '{}' has reached its limit of {limit} children",
+            parent.name
+        )));
+    }
+    Ok(())
+}
+
+/// Count the children of a parent by scanning its workspace.
+async fn count_children(
+    state: &ServerState,
+    workspace: &str,
+    parent_id: &str,
+) -> Result<usize, Status> {
+    let sandboxes = state
+        .store
+        .collect_messages::<Sandbox>(ObjectListQuery::Workspace(workspace))
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    Ok(sandboxes
+        .iter()
+        .filter(|sandbox| {
+            sandbox
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.id == parent_id)
+        })
+        .count())
+}
+
 async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
@@ -701,11 +759,20 @@ async fn handle_create_sandbox_inner(
     } else {
         request.name.clone()
     };
-    let (sandbox_lifecycle_guard, mutation_guard) = state
-        .compute
-        .sandbox_create_guards(&workspace, &id)
-        .await
+    let guards = match &parent {
+        Some(parent) => {
+            state
+                .compute
+                .child_sandbox_create_guards(&workspace, &id, &parent.id)
+                .await
+        }
+        None => state.compute.sandbox_create_guards(&workspace, &id).await,
+    };
+    let (sandbox_lifecycle_guard, mutation_guard) = guards
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
+    if let Some(parent) = &parent {
+        check_parent_has_room(state, &workspace, parent).await?;
+    }
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -7195,11 +7262,14 @@ mod tests {
     }
 
     async fn child_sandboxes_state() -> Arc<ServerState> {
+        child_sandboxes_state_with_limit(10).await
+    }
+
+    async fn child_sandboxes_state_with_limit(limit: u32) -> Arc<ServerState> {
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state)
-            .unwrap()
-            .config
-            .enable_child_sandboxes = true;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.enable_child_sandboxes = true;
+        config.max_concurrent_children = limit;
         state
     }
 
@@ -7269,6 +7339,88 @@ mod tests {
                 id: lead_id,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_stops_at_the_limit() {
+        let state = child_sandboxes_state_with_limit(2).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        put_parent_record(&state, "other-lead", &[], None, false).await;
+
+        for name in ["worker1", "worker2"] {
+            handle_create_sandbox(
+                &state,
+                authed_request(child_request(name, "lead", SandboxSpec::default())),
+            )
+            .await
+            .expect("a child under the limit is created");
+        }
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker3", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message()
+                .contains("sandbox 'lead' has reached its limit of 2 children"),
+            "{}",
+            err.message()
+        );
+
+        // Each parent has its own limit.
+        handle_create_sandbox(
+            &state,
+            authed_request(child_request(
+                "worker4",
+                "other-lead",
+                SandboxSpec::default(),
+            )),
+        )
+        .await
+        .expect("another parent's children do not count");
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_with_zero_limit_is_refused() {
+        let state = child_sandboxes_state_with_limit(0).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn concurrent_child_creates_never_exceed_the_limit() {
+        let state = child_sandboxes_state_with_limit(3).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let creates = (0..8).map(|index| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                handle_create_sandbox(
+                    &state,
+                    authed_request(child_request(
+                        &format!("worker{index}"),
+                        "lead",
+                        SandboxSpec::default(),
+                    )),
+                )
+                .await
+            })
+        });
+        let successes = future::join_all(creates)
+            .await
+            .into_iter()
+            .filter_map(|joined| joined.expect("create task").ok())
+            .count();
+        assert_eq!(successes, 3);
     }
 
     #[tokio::test]

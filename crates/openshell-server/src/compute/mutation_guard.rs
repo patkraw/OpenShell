@@ -52,6 +52,13 @@ pub enum MutationScope<'a> {
         workspace: &'a str,
         sandbox_id: &'a str,
     },
+    /// Creation of a child sandbox. Also excludes other writers of the parent,
+    /// so concurrent creates under one parent count its children in turn.
+    ChildSandbox {
+        workspace: &'a str,
+        sandbox_id: &'a str,
+        parent_id: &'a str,
+    },
 }
 
 impl<'a> MutationScope<'a> {
@@ -83,6 +90,7 @@ impl<'a> MutationScope<'a> {
     /// - `Sandbox`: S(global) S(workspace) X(sandbox). A legacy sandbox with
     ///   an empty workspace locks the default workspace, where its providers
     ///   resolve.
+    /// - `ChildSandbox`: S(global) S(workspace) X(parent) X(sandbox).
     pub(crate) fn lock_set(&self) -> MutationLockSet {
         let mut set = MutationLockSet::default();
         match *self {
@@ -110,6 +118,19 @@ impl<'a> MutationScope<'a> {
                 );
                 set.insert(MutationLockKey::Sandbox(sandbox_id), LockMode::Exclusive);
             }
+            Self::ChildSandbox {
+                workspace,
+                sandbox_id,
+                parent_id,
+            } => {
+                set.insert(MutationLockKey::Global, LockMode::Shared);
+                set.insert(
+                    MutationLockKey::Workspace(sandbox_workspace_key(workspace)),
+                    LockMode::Shared,
+                );
+                set.insert(MutationLockKey::Sandbox(parent_id), LockMode::Exclusive);
+                set.insert(MutationLockKey::Sandbox(sandbox_id), LockMode::Exclusive);
+            }
         }
         set
     }
@@ -120,7 +141,7 @@ impl<'a> MutationScope<'a> {
             Self::Global => LockScope::Global,
             Self::Workspace(workspace) if workspace.is_empty() => LockScope::Global,
             Self::Workspace(_) => LockScope::Workspace,
-            Self::Sandbox { .. } => LockScope::Sandbox,
+            Self::Sandbox { .. } | Self::ChildSandbox { .. } => LockScope::Sandbox,
         }
     }
 }
@@ -425,6 +446,25 @@ impl ComputeRuntime {
         let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
         let mutation_guard = self
             .mutation_guard(MutationScope::sandbox(workspace, sandbox_id))
+            .await?;
+        Ok((lifecycle_guard, mutation_guard))
+    }
+
+    /// Lifecycle gate, then the child-create mutation guard, for a new child
+    /// of `parent_id`. Callers must re-read the parent after locking.
+    pub(crate) async fn child_sandbox_create_guards(
+        &self,
+        workspace: &str,
+        sandbox_id: &str,
+        parent_id: &str,
+    ) -> PersistenceResult<(SandboxLifecycleGuard, MutationGuard)> {
+        let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
+        let mutation_guard = self
+            .mutation_guard(MutationScope::ChildSandbox {
+                workspace,
+                sandbox_id,
+                parent_id,
+            })
             .await?;
         Ok((lifecycle_guard, mutation_guard))
     }
