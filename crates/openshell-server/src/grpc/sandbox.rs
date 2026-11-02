@@ -20,6 +20,7 @@ use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
 };
+use crate::policy_store::PolicyStoreExt;
 use crate::tracing_bus::CursoredEvent;
 use crate::watch_cursor::WatchCursor;
 use futures::future;
@@ -679,6 +680,89 @@ async fn check_parent_has_room(
     Ok(())
 }
 
+/// Policy-revision provenance naming the parent a child's policy was copied
+/// from. Gateway-owned: the `internal.openshell.ai/` prefix is reserved.
+const COPIED_FROM_PARENT_ID: &str = "internal.openshell.ai/copied-from-parent-id";
+/// The parent policy version a child's policy revision was copied from.
+const COPIED_FROM_PARENT_VERSION: &str = "internal.openshell.ai/copied-from-parent-version";
+
+/// Under the child-create lock, read the policy the parent is enforcing: its
+/// newest loaded revision, not a pending or failed one. Returns the policy and
+/// the provenance to record on the child's first revision.
+async fn copy_parent_policy(
+    state: &ServerState,
+    parent: &openshell_core::proto::SandboxParent,
+) -> Result<
+    (
+        openshell_core::proto::SandboxPolicy,
+        HashMap<String, String>,
+    ),
+    Status,
+> {
+    let record = state
+        .store
+        .get_latest_loaded_policy(&parent.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent policy failed: {e}")))?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "parent sandbox '{}' has no policy yet; try again once it is running",
+                parent.name
+            ))
+        })?;
+    if state.config.policy_validation_failure_mode
+        == openshell_core::PolicyValidationFailureMode::FailClosed
+        && parent_rejected_a_newer_policy(state, &parent.id, record.version).await?
+    {
+        return Err(Status::failed_precondition(format!(
+            "parent sandbox '{}' rejected its latest policy; fix it before creating children",
+            parent.name
+        )));
+    }
+    let (policy, _) = super::policy::canonical_policy_record_identity(&record)?;
+    let provenance = HashMap::from([
+        (COPIED_FROM_PARENT_ID.to_string(), parent.id.clone()),
+        (
+            COPIED_FROM_PARENT_VERSION.to_string(),
+            record.version.to_string(),
+        ),
+    ]);
+    Ok((policy, provenance))
+}
+
+/// Whether a revision newer than the parent's loaded one failed. Under
+/// `fail_closed` such a parent denies all new egress, so its loaded revision
+/// would give a child more access than the parent has.
+async fn parent_rejected_a_newer_policy(
+    state: &ServerState,
+    parent_id: &str,
+    loaded_version: i64,
+) -> Result<bool, Status> {
+    const PAGE_SIZE: u32 = 100;
+    let mut before_version = None;
+    loop {
+        let page = state
+            .store
+            .list_policies_before(parent_id, PAGE_SIZE, before_version)
+            .await
+            .map_err(|e| Status::internal(format!("list parent policies failed: {e}")))?;
+        for record in &page {
+            if record.version <= loaded_version {
+                return Ok(false);
+            }
+            if record.status == "failed" {
+                return Ok(true);
+            }
+        }
+        match page.last() {
+            Some(last) if page.len() == PAGE_SIZE as usize => {
+                before_version = Some(last.version);
+            }
+            _ => return Ok(false),
+        }
+    }
+}
+
 /// Count the children of a parent by scanning its workspace.
 async fn count_children(
     state: &ServerState,
@@ -798,9 +882,14 @@ async fn handle_create_sandbox_inner(
     };
     let (sandbox_lifecycle_guard, mutation_guard) = guards
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
-    if let Some(parent) = &parent {
+    let initial_policy_provenance = if let Some(parent) = &parent {
         check_parent_has_room(state, &workspace, parent, &spec.providers).await?;
-    }
+        let (policy, provenance) = copy_parent_policy(state, parent).await?;
+        spec.policy = Some(policy);
+        provenance
+    } else {
+        HashMap::new()
+    };
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -931,6 +1020,7 @@ async fn handle_create_sandbox_inner(
     // their revisions cannot change before the sandbox's launch is committed.
     let mut runtime_inputs =
         super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
+    runtime_inputs.initial_policy_provenance = initial_policy_provenance;
 
     state
         .compute
@@ -7334,7 +7424,89 @@ mod tests {
             })
             .await
             .unwrap();
+        put_policy_revision_with_status(
+            state,
+            &id,
+            1,
+            &openshell_policy::restrictive_default_policy(),
+            "loaded",
+        )
+        .await;
         id
+    }
+
+    async fn put_policy_revision_with_status(
+        state: &ServerState,
+        sandbox_id: &str,
+        version: i64,
+        policy: &openshell_core::proto::SandboxPolicy,
+        status: &str,
+    ) {
+        state
+            .store
+            .put_policy_revision(
+                &uuid::Uuid::new_v4().to_string(),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &openshell_core::policy_identity::deterministic_policy_hash(policy),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .update_policy_status(
+                sandbox_id,
+                version,
+                status,
+                None,
+                (status == "loaded").then(current_time_ms),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn lead_policy(advisor_proposed: bool) -> openshell_core::proto::SandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "api".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    advisor_proposed,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    async fn latest_policy(
+        state: &ServerState,
+        sandbox_id: &str,
+    ) -> crate::persistence::PolicyRecord {
+        state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("policy revision")
+    }
+
+    async fn create_child(state: &Arc<ServerState>, name: &str, parent: &str) -> Sandbox {
+        handle_create_sandbox(
+            state,
+            authed_request(child_request(name, parent, SandboxSpec::default())),
+        )
+        .await
+        .expect("child sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox")
     }
 
     fn child_request(name: &str, parent: &str, spec: SandboxSpec) -> CreateSandboxRequest {
@@ -7385,6 +7557,14 @@ mod tests {
         .into_inner()
         .sandbox
         .expect("created sandbox");
+        put_policy_revision_with_status(
+            &state,
+            root.object_id(),
+            1,
+            &openshell_policy::restrictive_default_policy(),
+            "loaded",
+        )
+        .await;
         let child = handle_create_sandbox(
             &state,
             authed_request(child_request("worker1", "lead", SandboxSpec::default())),
@@ -7448,6 +7628,151 @@ mod tests {
         check_parent_has_room(&state, "default", &parent, &["a".to_string()])
             .await
             .expect("providers the lead still has are accepted");
+    }
+
+    #[tokio::test]
+    async fn child_copies_the_policy_its_parent_enforces() {
+        let state = child_sandboxes_state().await;
+        let lead = handle_create_sandbox(
+            &state,
+            authed_request(child_request(
+                "lead",
+                "",
+                SandboxSpec {
+                    policy: Some(lead_policy(false)),
+                    ..Default::default()
+                },
+            )),
+        )
+        .await
+        .expect("root sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+        let lead_id = lead.object_id().to_string();
+        state
+            .store
+            .update_policy_status(&lead_id, 1, "loaded", None, Some(current_time_ms()))
+            .await
+            .unwrap();
+
+        let child = create_child(&state, "worker1", "lead").await;
+
+        let lead_record = latest_policy(&state, &lead_id).await;
+        let child_record = latest_policy(&state, child.object_id()).await;
+        assert_eq!(child_record.version, 1);
+        assert_eq!(
+            super::super::policy::canonical_policy_record_identity(&child_record).unwrap(),
+            super::super::policy::canonical_policy_record_identity(&lead_record).unwrap(),
+        );
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_ID),
+            Some(&lead_id)
+        );
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn child_copies_the_parent_loaded_revision_not_a_newer_one() {
+        let mut state = child_sandboxes_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .policy_validation_failure_mode =
+            openshell_core::PolicyValidationFailureMode::RetainLastValid;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
+
+        let child = create_child(&state, "worker1", "lead").await;
+
+        let child_record = latest_policy(&state, child.object_id()).await;
+        let (child_policy, _) =
+            super::super::policy::canonical_policy_record_identity(&child_record).unwrap();
+        assert!(
+            child_policy.network_policies.is_empty(),
+            "the child must not get the failed or pending revision"
+        );
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn child_of_a_fail_closed_parent_that_rejected_its_policy_is_refused() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("parent sandbox 'lead' rejected its latest policy"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_of_a_parent_with_no_loaded_policy_is_refused() {
+        let state = child_sandboxes_state().await;
+        handle_create_sandbox(
+            &state,
+            authed_request(child_request(
+                "lead",
+                "",
+                SandboxSpec {
+                    policy: Some(lead_policy(false)),
+                    ..Default::default()
+                },
+            )),
+        )
+        .await
+        .expect("root sandbox is created");
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("parent sandbox 'lead' has no policy yet"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_keeps_advisor_markers_from_an_approved_proposal() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        // An approved proposal leaves its endpoints marked as advisor-proposed.
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(true), "loaded").await;
+
+        let child = create_child(&state, "worker1", "lead").await;
+
+        let child_record = latest_policy(&state, child.object_id()).await;
+        let (child_policy, _) =
+            super::super::policy::canonical_policy_record_identity(&child_record).unwrap();
+        assert!(child_policy.network_policies["api"].endpoints[0].advisor_proposed);
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
+            Some(&"2".to_string())
+        );
     }
 
     #[tokio::test]
