@@ -4222,6 +4222,19 @@ pub(super) async fn handle_update_config(
     result
 }
 
+/// Why a child sandbox's own policy cannot be changed.
+const CHILD_POLICY_WRITE_REFUSED: &str =
+    "child sandboxes use their parent's policy; change the parent's policy instead";
+
+/// Refuse a caller's policy change on a child sandbox. Gateway-internal writes,
+/// such as copying the parent's policy, do not pass through here.
+fn refuse_child_policy_write(sandbox: &Sandbox) -> Result<(), Status> {
+    if sandbox.parent.is_some() {
+        return Err(Status::failed_precondition(CHILD_POLICY_WRITE_REFUSED));
+    }
+    Ok(())
+}
+
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
@@ -4486,6 +4499,11 @@ async fn handle_update_config_inner(
     }
 
     let sandbox = sandbox.expect("non-global config update resolves a sandbox");
+    // The child's own supervisor may still write back startup paths until
+    // its policy source is reported as the parent's.
+    if !sandbox_caller && (has_policy || has_merge_ops) {
+        refuse_child_policy_write(&sandbox)?;
+    }
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
@@ -5600,6 +5618,20 @@ pub(super) async fn handle_submit_policy_analysis(
             accepted_chunk_ids: Vec::new(),
         }));
     }
+    // A child's proposals are rejected before they are stored, so no route
+    // can approve them later.
+    if sandbox.parent.is_some() {
+        return Ok(Response::new(SubmitPolicyAnalysisResponse {
+            accepted_chunks: 0,
+            rejected_chunks: u32::try_from(req.proposed_chunks.len()).unwrap_or(u32::MAX),
+            rejection_reasons: req
+                .proposed_chunks
+                .iter()
+                .map(|chunk| format!("chunk '{}': {CHILD_POLICY_WRITE_REFUSED}", chunk.rule_name))
+                .collect(),
+            accepted_chunk_ids: Vec::new(),
+        }));
+    }
 
     // `current_policy` is captured ONCE at the top of the batch and frozen
     // for every chunk's delta computation, even if an earlier chunk in the
@@ -6100,6 +6132,7 @@ async fn handle_approve_draft_chunk_inner(
 
     require_no_global_policy(state).await?;
 
+    refuse_child_policy_write(&sandbox)?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -6351,6 +6384,7 @@ async fn handle_approve_all_draft_chunks_inner(
 
     require_no_global_policy(state).await?;
 
+    refuse_child_policy_write(&sandbox)?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -6732,6 +6766,7 @@ async fn handle_undo_draft_chunk_inner(
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
+    refuse_child_policy_write(&sandbox)?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
