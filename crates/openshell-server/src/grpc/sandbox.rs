@@ -553,6 +553,68 @@ fn sandbox_create_telemetry_attrs(
     }
 }
 
+/// Check the parent named in a create request and return the link to store on
+/// the new child. Returns `None` when no parent is named, for a root sandbox.
+async fn resolve_create_parent(
+    state: &ServerState,
+    workspace: &str,
+    parent_name: &str,
+    spec: &SandboxSpec,
+) -> Result<Option<openshell_core::proto::SandboxParent>, Status> {
+    if parent_name.is_empty() {
+        return Ok(None);
+    }
+    if !state.config.enable_child_sandboxes {
+        return Err(Status::failed_precondition(
+            "child sandboxes are disabled on this gateway",
+        ));
+    }
+    let parent = state
+        .store
+        .get_message_by_name::<Sandbox>(workspace, parent_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!("parent sandbox '{parent_name}' not found"))
+        })?;
+    if parent
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
+    {
+        return Err(Status::failed_precondition(format!(
+            "parent sandbox '{parent_name}' is being deleted"
+        )));
+    }
+    if parent.parent.is_some() {
+        return Err(Status::failed_precondition(
+            "only one level of child sandboxes is supported",
+        ));
+    }
+    if spec.policy.is_some() {
+        return Err(Status::invalid_argument(
+            "a child sandbox uses its parent's policy; omit the policy",
+        ));
+    }
+    let parent_providers = parent
+        .spec
+        .as_ref()
+        .map_or(&[][..], |parent_spec| parent_spec.providers.as_slice());
+    if let Some(provider) = spec
+        .providers
+        .iter()
+        .find(|provider| !parent_providers.contains(provider))
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider}' is not attached to parent '{parent_name}'"
+        )));
+    }
+    Ok(Some(openshell_core::proto::SandboxParent {
+        name: parent.object_name().to_string(),
+        id: parent.object_id().to_string(),
+    }))
+}
+
 async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
@@ -617,6 +679,8 @@ async fn handle_create_sandbox_inner(
     if spec.command.is_empty() {
         spec.tty = true;
     }
+
+    let parent = resolve_create_parent(state, &workspace, &request.parent, &spec).await?;
 
     // Validate field sizes before any create-side effects.
     validate_sandbox_spec(&request.name, &spec)?;
@@ -719,7 +783,7 @@ async fn handle_create_sandbox_inner(
         spec: Some(spec),
         status: None,
         created_from_workload_template,
-        parent: None,
+        parent,
         created_by: String::new(),
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
@@ -7132,6 +7196,170 @@ mod tests {
             response.sandbox.expect("created sandbox").object_name(),
             "user-catalog"
         );
+    }
+
+    async fn child_sandboxes_state() -> Arc<ServerState> {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .enable_child_sandboxes = true;
+        state
+    }
+
+    async fn put_parent_record(
+        state: &ServerState,
+        name: &str,
+        providers: &[&str],
+        parent: Option<openshell_core::proto::SandboxParent>,
+        deleting: bool,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: id.clone(),
+                    name: name.to_string(),
+                    workspace: "default".to_string(),
+                    deletion_time: deleting.then(|| {
+                        openshell_core::time::timestamp_from_millis(current_time_ms()).unwrap()
+                    }),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    providers: providers.iter().map(ToString::to_string).collect(),
+                    ..Default::default()
+                }),
+                parent,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    fn child_request(name: &str, parent: &str, spec: SandboxSpec) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            parent: parent.to_string(),
+            name: name.to_string(),
+            spec: Some(spec),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_records_its_parent() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+
+        let child = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .expect("a child of a root sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+
+        assert_eq!(
+            child.parent,
+            Some(openshell_core::proto::SandboxParent {
+                name: "lead".to_string(),
+                id: lead_id,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_is_refused_when_disabled() {
+        let state = test_server_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("child sandboxes are disabled"));
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_refuses_an_invalid_parent_or_request() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &["work-github"], None, false).await;
+        put_parent_record(
+            &state,
+            "worker1",
+            &[],
+            Some(openshell_core::proto::SandboxParent {
+                name: "lead".to_string(),
+                id: lead_id,
+            }),
+            false,
+        )
+        .await;
+        put_parent_record(&state, "leaving", &[], None, true).await;
+
+        let cases = [
+            (
+                "missing",
+                SandboxSpec::default(),
+                tonic::Code::FailedPrecondition,
+                "parent sandbox 'missing' not found",
+            ),
+            (
+                "leaving",
+                SandboxSpec::default(),
+                tonic::Code::FailedPrecondition,
+                "parent sandbox 'leaving' is being deleted",
+            ),
+            (
+                "worker1",
+                SandboxSpec::default(),
+                tonic::Code::FailedPrecondition,
+                "only one level of child sandboxes is supported",
+            ),
+            (
+                "lead",
+                SandboxSpec {
+                    policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                    ..Default::default()
+                },
+                tonic::Code::InvalidArgument,
+                "a child sandbox uses its parent's policy",
+            ),
+            (
+                "lead",
+                SandboxSpec {
+                    providers: vec!["work-slack".to_string()],
+                    ..Default::default()
+                },
+                tonic::Code::FailedPrecondition,
+                "provider 'work-slack' is not attached to parent 'lead'",
+            ),
+        ];
+        for (parent, spec, code, message) in cases {
+            let err = handle_create_sandbox(
+                &state,
+                authed_request(child_request("nested", parent, spec)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), code, "{parent}: {}", err.message());
+            assert!(
+                err.message().contains(message),
+                "{parent}: {}",
+                err.message()
+            );
+        }
     }
 
     #[tokio::test]
