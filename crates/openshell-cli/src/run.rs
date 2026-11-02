@@ -673,6 +673,7 @@ pub async fn sandbox_create(
         );
     }
     let request = CreateSandboxRequest {
+        parent: String::new(),
         request_id: String::new(),
         spec: Some(SandboxSpec {
             resource_requirements,

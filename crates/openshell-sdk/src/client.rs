@@ -1481,6 +1481,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
     proto::CreateSandboxRequest {
+        parent: String::new(),
         request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             environment,
@@ -1525,6 +1526,7 @@ fn create_sandbox_from_template_request(
         service_exposures,
     } = spec;
     proto::CreateSandboxRequest {
+        parent: String::new(),
         request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             providers,
