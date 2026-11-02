@@ -7926,6 +7926,75 @@ mod tests {
         .expect("a child's settings can still be changed");
     }
 
+    /// A sandbox's own supervisor writing back its policy with one extra
+    /// read-only path, as startup path enrichment does.
+    fn supervisor_write_back(
+        sandbox_id: &str,
+        name: &str,
+    ) -> Request<openshell_core::proto::UpdateConfigRequest> {
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy
+            .filesystem
+            .get_or_insert_with(Default::default)
+            .read_only
+            .push("/app".to_string());
+        let mut request = Request::new(openshell_core::proto::UpdateConfigRequest {
+            sandbox: name.to_string(),
+            workspace_scope: Some(default_scope()),
+            policy: Some(policy),
+            ..Default::default()
+        });
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                    auth_epoch: None,
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        request
+    }
+
+    #[tokio::test]
+    async fn a_child_supervisor_write_back_is_accepted_and_dropped() {
+        let state = child_sandboxes_state().await;
+        let worker_id = put_lead_and_worker(&state).await;
+        let before = latest_policy(&state, &worker_id).await;
+
+        let response = super::super::policy::handle_update_config(
+            &state,
+            supervisor_write_back(&worker_id, "worker1"),
+        )
+        .await
+        .expect("the child's supervisor is answered OK")
+        .into_inner();
+
+        let after = latest_policy(&state, &worker_id).await;
+        assert_eq!(after.version, before.version, "no revision is written");
+        assert_eq!(after.policy_payload, before.policy_payload);
+        assert_eq!(i64::from(response.version), before.version);
+        assert_eq!(response.policy_hash, before.policy_hash);
+    }
+
+    #[tokio::test]
+    async fn a_root_supervisor_write_back_is_still_stored() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let before = latest_policy(&state, &lead_id).await;
+
+        super::super::policy::handle_update_config(&state, supervisor_write_back(&lead_id, "lead"))
+            .await
+            .expect("a root's supervisor write-back is stored");
+
+        assert_eq!(
+            latest_policy(&state, &lead_id).await.version,
+            before.version + 1
+        );
+    }
+
     #[tokio::test]
     async fn child_proposals_are_rejected_and_not_stored() {
         let state = child_sandboxes_state().await;

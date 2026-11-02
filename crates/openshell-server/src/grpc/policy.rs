@@ -4188,6 +4188,34 @@ fn refuse_child_policy_write(sandbox: &Sandbox) -> Result<(), Status> {
     Ok(())
 }
 
+/// Accept and drop a policy write from a child's own supervisor. The
+/// supervisor re-reads the stored policy after writing, so the child keeps
+/// exactly its parent's copy.
+async fn ignore_child_supervisor_policy_write(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<Response<UpdateConfigResponse>, Status> {
+    debug!(
+        sandbox_id = %sandbox.object_id(),
+        "UpdateConfig: dropped startup policy write from child sandbox"
+    );
+    let latest = state
+        .store
+        .get_latest_policy(sandbox.object_id())
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+    let (version, hash) = latest.map_or((0, String::new()), |record| {
+        (record.version, record.policy_hash)
+    });
+    Ok(update_config_response(
+        u32::try_from(version).unwrap_or(0),
+        hash,
+        0,
+        false,
+        HashMap::new(),
+    ))
+}
+
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
@@ -4452,9 +4480,13 @@ async fn handle_update_config_inner(
     }
 
     let sandbox = sandbox.expect("non-global config update resolves a sandbox");
-    // The child's own supervisor may still write back startup paths until
-    // its policy source is reported as the parent's.
-    if !sandbox_caller && (has_policy || has_merge_ops) {
+    if has_policy || has_merge_ops {
+        // A child's supervisor writes back its startup paths like any other
+        // sandbox. Accept and drop the write so the child keeps exactly its
+        // parent's policy.
+        if sandbox_caller && sandbox.parent.is_some() {
+            return ignore_child_supervisor_policy_write(state, &sandbox).await;
+        }
         refuse_child_policy_write(&sandbox)?;
     }
     let sandbox_id = sandbox.object_id().to_string();
