@@ -113,6 +113,8 @@ use provisioning_operation::ProvisioningOperationError;
 pub struct SandboxCreateRuntimeInputs {
     pub effective_policy: Option<ProtoSandboxPolicy>,
     pub launch_authentication: Option<Vec<u8>>,
+    /// Gateway-owned provenance for the sandbox's version-one policy revision.
+    pub initial_policy_provenance: HashMap<String, String>,
 }
 
 impl SandboxCreateRuntimeInputs {
@@ -121,6 +123,7 @@ impl SandboxCreateRuntimeInputs {
         Self {
             effective_policy: Some(effective_policy),
             launch_authentication: None,
+            initial_policy_provenance: HashMap::new(),
         }
     }
 }
@@ -1593,10 +1596,12 @@ impl ComputeRuntime {
         sandbox: Sandbox,
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
-        runtime_inputs: SandboxCreateRuntimeInputs,
+        mut runtime_inputs: SandboxCreateRuntimeInputs,
         lifecycle_guard: SandboxLifecycleGuard,
         mutation_guard: MutationGuard,
     ) -> Result<Sandbox, Status> {
+        let initial_policy_provenance =
+            std::mem::take(&mut runtime_inputs.initial_policy_provenance);
         // Defend the internal create path too, before consuming a staged archive
         // or persisting the sandbox. The gRPC handler checks before driver validation.
         self.validate_launch_signer_configured(
@@ -1716,6 +1721,7 @@ impl ComputeRuntime {
             self.store.as_ref(),
             &sandbox,
             crate::grpc::policy::InitialPolicyHistoryStatus::Pending,
+            initial_policy_provenance,
         ))
         .await
         {

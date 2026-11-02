@@ -3157,6 +3157,7 @@ pub async fn initialize_policy_history(
     store: &Store,
     sandbox: &Sandbox,
     status: InitialPolicyHistoryStatus,
+    provenance: HashMap<String, String>,
 ) -> Result<bool, Status> {
     let Some(policy) = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()) else {
         return Ok(false);
@@ -3183,7 +3184,7 @@ pub async fn initialize_policy_history(
                 load_error: None,
                 created_at_ms: current_time_ms(),
                 loaded_at_ms: None,
-                provenance: HashMap::new(),
+                provenance,
             },
             sandbox.object_workspace(),
         )
@@ -3221,6 +3222,7 @@ pub async fn backfill_legacy_policy_history(state: &Arc<ServerState>) -> Result<
                 state.store.as_ref(),
                 &sandbox,
                 InitialPolicyHistoryStatus::Loaded,
+                HashMap::new(),
             )
             .await
             {
@@ -6867,7 +6869,7 @@ pub(super) async fn handle_get_draft_history(
 /// `PolicyRecord::policy_hash` is persisted metadata and cannot prove what the
 /// payload contains. Decode and validate every record before using its identity
 /// so legacy encodings deduplicate semantically and damaged rows fail closed.
-fn canonical_policy_record_identity(
+pub(super) fn canonical_policy_record_identity(
     record: &PolicyRecord,
 ) -> Result<(ProtoSandboxPolicy, String), Status> {
     let decoded = decode_stored_policy(record.policy_payload.as_slice())
