@@ -906,6 +906,61 @@ pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> 
     Ok(())
 }
 
+/// Bring every root's children up to the root's policy, for syncs lost while
+/// the gateway was down or published by a replica the child is not on.
+pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
+    let parent_ids: std::collections::BTreeSet<String> = state
+        .store
+        .collect_messages::<Sandbox>(ObjectListQuery::AllWorkspaces)
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+        .iter()
+        .filter_map(|sandbox| sandbox.parent.as_ref().map(|parent| parent.id.clone()))
+        .collect();
+    let mut failed = 0_usize;
+    for parent_id in parent_ids {
+        if let Err(error) = sync_children(state, &parent_id).await {
+            warn!(parent_id, error = %error, "failed to sync child sandbox policies");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        return Err(Status::unavailable(format!(
+            "the children of {failed} parent sandboxes were not all synced"
+        )));
+    }
+    Ok(())
+}
+
+/// Bring one child's policy up to its parent's, for a child that may have
+/// missed a sync. The child-sandbox lock set includes the parent, so the
+/// parent's policy is read and the copy written under one guard.
+pub async fn sync_one_child(
+    state: &Arc<ServerState>,
+    child: &Sandbox,
+) -> Result<(), Status> {
+    let Some(parent) = child.parent.as_ref() else {
+        return Ok(());
+    };
+    let workspace = child.object_workspace();
+    let _guard = state
+        .compute
+        .mutation_guard(MutationScope::ChildSandbox {
+            workspace,
+            sandbox_id: child.object_id(),
+            parent_id: &parent.id,
+        })
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
+    // A parent with nothing loaded has nothing to copy, and a blocked one
+    // has its children refused at delivery.
+    let Some((loaded, None)) = parent_policy_revisions(state, &parent.id).await? else {
+        return Ok(());
+    };
+    let copy = ParentPolicyCopy::of(&loaded, &parent.id)?;
+    copy_into_child(state, workspace, &parent.id, child.object_id(), &copy).await
+}
+
 /// Copy the parent's policy into one child if it is behind. Takes the same
 /// lock set as a provider attach on that child, so the parent's lock is never
 /// held while waiting for a child's.
@@ -925,6 +980,19 @@ async fn sync_child(
         })
         .await
         .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
+    copy_into_child(state, workspace, parent_id, child_id, copy).await
+}
+
+/// Write `copy` as a child's next revision unless the child is gone or
+/// already holds this parent version or a newer one. The caller holds the
+/// child-sandbox lock set.
+async fn copy_into_child(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    parent_id: &str,
+    child_id: &str,
+    copy: &ParentPolicyCopy,
+) -> Result<(), Status> {
     let child = state
         .store
         .get_message::<Sandbox>(child_id)
@@ -8386,6 +8454,69 @@ mod tests {
                 .await
                 .configuration_admitted
         );
+    }
+
+    #[tokio::test]
+    async fn a_child_that_missed_a_sync_catches_up_on_its_own() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let worker = create_child(&state, "worker1", "lead").await;
+        let worker_id = worker.object_id().to_string();
+        // The parent loaded v2, but the sync that would copy it was lost.
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+        // A nested wait on the parent's lock would time out and fail here.
+        state
+            .compute
+            .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+
+        sync_one_child(&state, &worker).await.unwrap();
+
+        let child_record = latest_policy(&state, &worker_id).await;
+        assert_eq!(child_record.version, 2);
+        assert_eq!(copied_version(&child_record), Some("2"));
+        sync_one_child(&state, &worker).await.unwrap();
+        assert_eq!(
+            latest_policy(&state, &worker_id).await.version,
+            2,
+            "a second sync writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_parents_child_copies_nothing_on_its_own() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let worker = create_child(&state, "worker1", "lead").await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+
+        sync_one_child(&state, &worker).await.unwrap();
+
+        assert_eq!(latest_policy(&state, worker.object_id()).await.version, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_sync_catches_up_the_children_of_every_root() {
+        let state = child_sandboxes_state().await;
+        let mut children = Vec::new();
+        for (lead, worker) in [("lead", "worker1"), ("lead2", "worker2")] {
+            let lead_id = put_parent_record(&state, lead, &[], None, false).await;
+            let worker_id = create_child(&state, worker, lead)
+                .await
+                .object_id()
+                .to_string();
+            put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded")
+                .await;
+            children.push(worker_id);
+        }
+
+        sync_all_children(&state).await.unwrap();
+
+        for worker_id in children {
+            assert_eq!(
+                copied_version(&latest_policy(&state, &worker_id).await),
+                Some("2")
+            );
+        }
     }
 
     #[tokio::test]
