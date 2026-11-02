@@ -682,6 +682,10 @@ async fn check_parent_has_room(
 
 /// Policy-revision provenance naming the parent a child's policy was copied
 /// from. Gateway-owned: the `internal.openshell.ai/` prefix is reserved.
+/// How long a provider detach on a root waits for its children to lose the
+/// provider too. Each child's lock wait can take the full mutation lock
+/// timeout; children not reached in time catch up on connect or restart.
+const DETACH_CHILD_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const COPIED_FROM_PARENT_ID: &str = "internal.openshell.ai/copied-from-parent-id";
 /// The parent policy version a child's policy revision was copied from.
 const COPIED_FROM_PARENT_VERSION: &str = "internal.openshell.ai/copied-from-parent-version";
@@ -833,10 +837,10 @@ fn copied_parent_version(record: &crate::persistence::PolicyRecord, parent_id: &
         .unwrap_or(0)
 }
 
-/// Copy the policy a root has loaded into each of its live children that is
-/// behind, then push every child. Safe to run again: a child already holding
-/// this version or a newer one is left alone. A blocked root's revisions are
-/// not copied; its children are refused at delivery until it loads a fix.
+/// Bring each live child of a root up to it, then push every child: remove
+/// providers the root no longer has, and copy the policy the root has loaded
+/// into a child that is behind. Safe to run again. A blocked root's revisions
+/// are not copied; its children are refused at delivery until it loads a fix.
 pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> Result<(), Status> {
     let Some(parent) = state
         .store
@@ -860,11 +864,7 @@ pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> 
             .mutation_guard(MutationScope::sandbox(&workspace, parent_id))
             .await
             .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
-        let copy = match parent_policy_revisions(state, parent_id).await? {
-            None => return Ok(()),
-            Some((_, Some(_))) => None,
-            Some((loaded, None)) => Some(ParentPolicyCopy::of(&loaded, parent_id)?),
-        };
+        let copy = parent_policy_copy(state, parent_id).await?;
         let children: Vec<String> = state
             .store
             .collect_messages::<Sandbox>(ObjectListQuery::Workspace(&workspace))
@@ -886,10 +886,9 @@ pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> 
     // others: log it, carry on, and report it at the end.
     let mut failed = 0_usize;
     for child_id in children {
-        if let Some(copy) = &copy
-            && let Err(error) = sync_child(state, &workspace, parent_id, &child_id, copy).await
+        if let Err(error) = sync_child(state, &workspace, parent_id, &child_id, copy.as_ref()).await
         {
-            warn!(parent_id, child_id, error = %error, "failed to sync child sandbox policy");
+            warn!(parent_id, child_id, error = %error, "failed to sync child sandbox");
             failed += 1;
         }
         // Push every child, copied or not: the parent can become blocked or
@@ -899,15 +898,27 @@ pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> 
     }
     if failed > 0 {
         return Err(Status::unavailable(format!(
-            "{failed} child sandbox policies of '{}' were not synced",
+            "{failed} child sandboxes of '{}' were not synced",
             parent.object_name()
         )));
     }
     Ok(())
 }
 
-/// Bring every root's children up to the root's policy, for syncs lost while
-/// the gateway was down or published by a replica the child is not on.
+/// The copy of the policy a parent has loaded, or none when it has nothing
+/// loaded or is blocked: a blocked parent's children are refused at delivery.
+async fn parent_policy_copy(
+    state: &ServerState,
+    parent_id: &str,
+) -> Result<Option<ParentPolicyCopy>, Status> {
+    match parent_policy_revisions(state, parent_id).await? {
+        Some((loaded, None)) => ParentPolicyCopy::of(&loaded, parent_id).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Bring every root's children up to the root, for syncs lost while the
+/// gateway was down or published by a replica the child is not on.
 pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
     let parent_ids: std::collections::BTreeSet<String> = state
         .store
@@ -920,7 +931,7 @@ pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
     let mut failed = 0_usize;
     for parent_id in parent_ids {
         if let Err(error) = sync_children(state, &parent_id).await {
-            warn!(parent_id, error = %error, "failed to sync child sandbox policies");
+            warn!(parent_id, error = %error, "failed to sync child sandboxes");
             failed += 1;
         }
     }
@@ -932,13 +943,10 @@ pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
     Ok(())
 }
 
-/// Bring one child's policy up to its parent's, for a child that may have
-/// missed a sync. The child-sandbox lock set includes the parent, so the
-/// parent's policy is read and the copy written under one guard.
-pub async fn sync_one_child(
-    state: &Arc<ServerState>,
-    child: &Sandbox,
-) -> Result<(), Status> {
+/// Bring one child up to its parent, for a child that may have missed a
+/// sync. The child-sandbox lock set includes the parent, so the parent is
+/// read and the child written under one guard.
+pub async fn sync_one_child(state: &Arc<ServerState>, child: &Sandbox) -> Result<(), Status> {
     let Some(parent) = child.parent.as_ref() else {
         return Ok(());
     };
@@ -952,24 +960,26 @@ pub async fn sync_one_child(
         })
         .await
         .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
-    // A parent with nothing loaded has nothing to copy, and a blocked one
-    // has its children refused at delivery.
-    let Some((loaded, None)) = parent_policy_revisions(state, &parent.id).await? else {
-        return Ok(());
-    };
-    let copy = ParentPolicyCopy::of(&loaded, &parent.id)?;
-    copy_into_child(state, workspace, &parent.id, child.object_id(), &copy).await
+    let copy = parent_policy_copy(state, &parent.id).await?;
+    sync_child_locked(
+        state,
+        workspace,
+        &parent.id,
+        child.object_id(),
+        copy.as_ref(),
+    )
+    .await
 }
 
-/// Copy the parent's policy into one child if it is behind. Takes the same
-/// lock set as a provider attach on that child, so the parent's lock is never
-/// held while waiting for a child's.
+/// Bring one child up to its parent. Takes the same lock set as a provider
+/// attach on that child, so the parent's lock is never held while waiting
+/// for a child's.
 async fn sync_child(
     state: &Arc<ServerState>,
     workspace: &str,
     parent_id: &str,
     child_id: &str,
-    copy: &ParentPolicyCopy,
+    copy: Option<&ParentPolicyCopy>,
 ) -> Result<(), Status> {
     let _guard = state
         .compute
@@ -980,32 +990,64 @@ async fn sync_child(
         })
         .await
         .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
-    copy_into_child(state, workspace, parent_id, child_id, copy).await
+    sync_child_locked(state, workspace, parent_id, child_id, copy).await
 }
 
-/// Write `copy` as a child's next revision unless the child is gone or
-/// already holds this parent version or a newer one. The caller holds the
-/// child-sandbox lock set.
-async fn copy_into_child(
+/// Detach from a live child every provider its parent no longer has, then
+/// write `copy` as its next revision unless it already holds this parent
+/// version or a newer one. Providers are removed whatever the parent's
+/// policy state: losing one is a revocation. The caller holds the
+/// child-sandbox lock set, so the parent's providers read here are current.
+async fn sync_child_locked(
     state: &Arc<ServerState>,
     workspace: &str,
     parent_id: &str,
     child_id: &str,
-    copy: &ParentPolicyCopy,
+    copy: Option<&ParentPolicyCopy>,
 ) -> Result<(), Status> {
-    let child = state
+    let Some(child) = state
         .store
         .get_message::<Sandbox>(child_id)
         .await
-        .map_err(|e| Status::internal(format!("fetch child sandbox failed: {e}")))?;
-    if child.as_ref().is_none_or(|child| {
-        child
-            .metadata
-            .as_ref()
-            .is_some_and(|meta| meta.deletion_time.is_some())
-    }) {
+        .map_err(|e| Status::internal(format!("fetch child sandbox failed: {e}")))?
+    else {
+        return Ok(());
+    };
+    if child
+        .metadata
+        .as_ref()
+        .is_some_and(|meta| meta.deletion_time.is_some())
+    {
         return Ok(());
     }
+    let parent_providers = state
+        .store
+        .get_message::<Sandbox>(parent_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .and_then(|parent| parent.spec.map(|spec| spec.providers));
+    if let Some(parent_providers) = parent_providers {
+        let lost: Vec<String> = child
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|name| !parent_providers.contains(name))
+            .cloned()
+            .collect();
+        for provider in lost {
+            detach_provider_locked(state, child_id, 0, &provider).await?;
+            info!(
+                parent_id,
+                child_id, provider, "detached a provider its parent lost from child sandbox"
+            );
+        }
+    }
+
+    let Some(copy) = copy else {
+        return Ok(());
+    };
     let parent_version = copy.parent_version();
     let latest = state
         .store
@@ -2236,7 +2278,7 @@ pub(super) async fn handle_detach_sandbox_provider(
         )));
     }
 
-    let _mutation_guard = state
+    let mutation_guard = state
         .compute
         .mutation_guard(MutationScope::sandbox(
             sandbox.object_workspace(),
@@ -2270,57 +2312,14 @@ pub(super) async fn handle_detach_sandbox_provider(
     )
     .await?;
 
-    let provider_name = request.provider.clone();
-    let detached = Arc::new(AtomicBool::new(false));
-    let detached_clone = detached.clone();
-    let mutation_id = uuid::Uuid::new_v4().to_string();
-
-    let sandbox = update_sandbox_cas(
+    let (sandbox, detached, receipt) = detach_provider_locked(
         state,
         &sandbox_id,
         request.expected_resource_version,
-        |sandbox| {
-            detached_clone.store(false, Ordering::Relaxed);
-            let Some(ref mut spec) = sandbox.spec else {
-                // Spec should always exist post-creation; if missing, fail CAS to surface error
-                return;
-            };
-
-            if spec.provider_attachment_epoch.is_empty() {
-                spec.provider_attachment_epoch.clone_from(&mutation_id);
-            }
-
-            let before_len = spec.providers.len();
-            spec.providers.retain(|name| name != &provider_name);
-            if spec.providers.len() != before_len {
-                spec.provider_attachment_epoch.clone_from(&mutation_id);
-                detached_clone.store(true, Ordering::Relaxed);
-                // Only dedupe after making a change
-                dedupe_provider_names(&mut spec.providers);
-                crate::compute::provisioning_deadline::attachments_changed(
-                    sandbox,
-                    current_time_ms(),
-                );
-            }
-        },
-    )
-    .await
-    .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
-
-    let detached = detached.load(Ordering::Relaxed);
-    if detached {
-        crate::config_delivery::publish_sandbox(state, &sandbox_id);
-        state.sandbox_watch_bus.notify(&sandbox_id);
-    }
-    let receipt = super::provider_readiness::record_provider_mutation(
-        state,
-        &sandbox,
         &request.provider,
-        ProviderMutationKind::Detach,
-        None,
-        &mutation_id,
     )
     .await?;
+    drop(mutation_guard);
 
     info!(
         sandbox_name = %sandbox_name,
@@ -2329,11 +2328,92 @@ pub(super) async fn handle_detach_sandbox_provider(
         "DetachSandboxProvider request completed successfully"
     );
 
+    // A root's children lose what it loses. A child whose sync is cut short
+    // or fails catches up when it next connects or the gateway restarts.
+    if detached && sandbox.parent.is_none() {
+        match tokio::time::timeout(
+            DETACH_CHILD_SYNC_TIMEOUT,
+            Box::pin(sync_children(state, &sandbox_id)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(sandbox_name = %sandbox_name, error = %error, "child sandbox sync after provider detach failed");
+            }
+            Err(_) => {
+                warn!(sandbox_name = %sandbox_name, "child sandbox sync after provider detach timed out");
+            }
+        }
+    }
+
     Ok(Response::new(DetachSandboxProviderResponse {
         sandbox: Some(sandbox),
         detached,
         receipt: Some(receipt),
     }))
+}
+
+/// Detach `provider` from a sandbox: bump its attachment epoch so its
+/// supervisor drops the credential, push the change, and record the
+/// readiness receipt. The caller holds the sandbox's mutation lock.
+async fn detach_provider_locked(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    provider: &str,
+) -> Result<
+    (
+        Sandbox,
+        bool,
+        openshell_core::proto::ProviderMutationReceipt,
+    ),
+    Status,
+> {
+    let provider_name = provider.to_string();
+    let detached = Arc::new(AtomicBool::new(false));
+    let detached_clone = detached.clone();
+    let mutation_id = uuid::Uuid::new_v4().to_string();
+
+    let sandbox = update_sandbox_cas(state, sandbox_id, expected_resource_version, |sandbox| {
+        detached_clone.store(false, Ordering::Relaxed);
+        let Some(ref mut spec) = sandbox.spec else {
+            // Spec should always exist post-creation; if missing, fail CAS to surface error
+            return;
+        };
+
+        if spec.provider_attachment_epoch.is_empty() {
+            spec.provider_attachment_epoch.clone_from(&mutation_id);
+        }
+
+        let before_len = spec.providers.len();
+        spec.providers.retain(|name| name != &provider_name);
+        if spec.providers.len() != before_len {
+            spec.provider_attachment_epoch.clone_from(&mutation_id);
+            detached_clone.store(true, Ordering::Relaxed);
+            // Only dedupe after making a change
+            dedupe_provider_names(&mut spec.providers);
+            crate::compute::provisioning_deadline::attachments_changed(sandbox, current_time_ms());
+        }
+    })
+    .await
+    .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
+
+    let detached = detached.load(Ordering::Relaxed);
+    if detached {
+        crate::config_delivery::publish_sandbox(state, sandbox_id);
+        state.sandbox_watch_bus.notify(sandbox_id);
+    }
+    let receipt = super::provider_readiness::record_provider_mutation(
+        state,
+        &sandbox,
+        provider,
+        ProviderMutationKind::Detach,
+        None,
+        &mutation_id,
+    )
+    .await?;
+    Ok((sandbox, detached, receipt))
 }
 
 pub(super) async fn handle_delete_sandbox(
@@ -8164,6 +8244,108 @@ mod tests {
 
     fn default_scope() -> openshell_core::proto::WorkspaceSelector {
         openshell_core::proto::workspace_selector("default".to_string())
+    }
+
+    /// A root `lead` with provider `work-github` and a child `worker1` created
+    /// through the API, so the child has the provider and a current copy of
+    /// the lead's v1. Returns both ids.
+    async fn lead_and_child_sharing_a_provider(state: &Arc<ServerState>) -> (String, String) {
+        state
+            .store
+            .put_message(&test_provider_with_credential_key(
+                "work-github",
+                "github",
+                "GITHUB_TOKEN",
+            ))
+            .await
+            .unwrap();
+        let lead_id = put_parent_record(state, "lead", &["work-github"], None, false).await;
+        let worker = create_child(state, "worker1", "lead").await;
+        assert_eq!(worker.spec.as_ref().unwrap().providers, vec!["work-github"]);
+        (lead_id, worker.object_id().to_string())
+    }
+
+    async fn sandbox_spec(state: &ServerState, sandbox_id: &str) -> SandboxSpec {
+        state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .unwrap()
+    }
+
+    async fn detach_from_lead(state: &Arc<ServerState>, provider: &str) {
+        let response = handle_detach_sandbox_provider(
+            state,
+            authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: "lead".to_string(),
+                workspace_scope: Some(default_scope()),
+                provider: provider.to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.detached);
+    }
+
+    #[tokio::test]
+    async fn detaching_a_provider_from_a_parent_detaches_it_from_its_children() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        let before = sandbox_spec(&state, &worker_id).await;
+
+        detach_from_lead(&state, "work-github").await;
+
+        // The parent's policy did not change, so the child's copy is current
+        // and only the provider is removed, as a detach removes it.
+        let after = sandbox_spec(&state, &worker_id).await;
+        assert!(after.providers.is_empty());
+        assert_ne!(
+            after.provider_attachment_epoch, before.provider_attachment_epoch,
+            "the supervisor must see a new attachment epoch to drop the credential"
+        );
+        assert_eq!(latest_policy(&state, &worker_id).await.version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_parents_children_still_lose_its_lost_provider() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+
+        detach_from_lead(&state, "work-github").await;
+
+        assert!(sandbox_spec(&state, &worker_id).await.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_child_that_missed_a_provider_detach_loses_it_on_its_own() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        // The lead lost the provider, but the sync that would follow was lost.
+        let mut lead = state
+            .store
+            .get_message::<Sandbox>(&lead_id)
+            .await
+            .unwrap()
+            .unwrap();
+        lead.spec.as_mut().unwrap().providers.clear();
+        state.store.put_message(&lead).await.unwrap();
+        let worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        sync_one_child(&state, &worker).await.unwrap();
+
+        assert!(sandbox_spec(&state, &worker_id).await.providers.is_empty());
     }
 
     #[tokio::test]
