@@ -7775,6 +7775,71 @@ mod tests {
         );
     }
 
+    fn delete_request(name: &str) -> DeleteSandboxRequest {
+        DeleteSandboxRequest {
+            request_id: String::new(),
+            allow_missing: false,
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_parent_with_live_children_is_refused() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        put_parent_record(&state, "worker1", &[], Some(link.clone()), false).await;
+        put_parent_record(&state, "worker2", &[], Some(link), false).await;
+
+        let err = handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("sandbox 'lead' has 2 child sandboxes; delete them first"),
+            "{}",
+            err.message()
+        );
+        let lead = state
+            .store
+            .get_message::<Sandbox>(&lead_id)
+            .await
+            .unwrap()
+            .expect("the refused parent still exists");
+        assert!(
+            lead.metadata.unwrap().deletion_time.is_none(),
+            "a refused delete must not mark the parent as deleting"
+        );
+    }
+
+    #[tokio::test]
+    async fn children_already_being_deleted_do_not_block_the_parent() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_parent_record(
+            &state,
+            "worker1",
+            &[],
+            Some(openshell_core::proto::SandboxParent {
+                name: "lead".to_string(),
+                id: lead_id,
+            }),
+            true,
+        )
+        .await;
+
+        handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
+            .await
+            .expect("only deleting children remain, so the parent can be deleted");
+    }
+
     #[tokio::test]
     async fn create_child_sandbox_stops_at_the_limit() {
         let state = child_sandboxes_state_with_limit(2).await;

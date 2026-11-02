@@ -3432,6 +3432,28 @@ impl ComputeRuntime {
         })?
     }
 
+    /// Count a root's children that are not already being deleted.
+    async fn live_child_count(&self, parent: &Sandbox) -> Result<usize, Status> {
+        let sandboxes = self
+            .store
+            .collect_messages::<Sandbox>(ObjectListQuery::Workspace(parent.object_workspace()))
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        Ok(sandboxes
+            .iter()
+            .filter(|sandbox| {
+                sandbox
+                    .parent
+                    .as_ref()
+                    .is_some_and(|link| link.id == parent.object_id())
+                    && sandbox
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_time.is_none())
+            })
+            .count())
+    }
+
     async fn delete_sandbox_inner(
         &self,
         target: SandboxDeleteTarget,
@@ -3475,6 +3497,23 @@ impl ComputeRuntime {
             return Err(Status::aborted(
                 "sandbox resource version changed before delete mutation",
             ));
+        }
+        // Checked under the sandbox's lock, which a child create also takes on
+        // its parent, so a child cannot be added between this check and the
+        // delete. Children already being deleted do not block.
+        if current.parent.is_none() {
+            let live_children = self.live_child_count(&current).await?;
+            if live_children > 0 {
+                let noun = if live_children == 1 {
+                    "child sandbox"
+                } else {
+                    "child sandboxes"
+                };
+                return Err(Status::failed_precondition(format!(
+                    "sandbox '{}' has {live_children} {noun}; delete them first",
+                    target.sandbox_name
+                )));
+            }
         }
 
         // `Started` carries both sides of the CAS transition: the durable
