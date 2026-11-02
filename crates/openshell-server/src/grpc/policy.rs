@@ -2866,12 +2866,22 @@ pub fn unadmitted_sandbox_config(
             .and_then(|status| status.configuration_admission.as_ref())
             .map_or_else(String::new, |admission| admission.instance_id.clone()),
         workspace: sandbox.object_workspace().to_string(),
-        policy_validation_failure_mode: state
-            .config
-            .policy_validation_failure_mode
-            .as_str()
-            .to_string(),
+        policy_validation_failure_mode: policy_failure_mode(state, sandbox).as_str().to_string(),
         ..Default::default()
+    }
+}
+
+/// The failure mode a sandbox's supervisor applies when it rejects a policy.
+/// Children always fail closed: a child keeping its previous copy could keep
+/// access its parent just lost.
+fn policy_failure_mode(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> openshell_core::PolicyValidationFailureMode {
+    if sandbox.parent.is_some() {
+        openshell_core::PolicyValidationFailureMode::FailClosed
+    } else {
+        state.config.policy_validation_failure_mode
     }
 }
 
@@ -2930,6 +2940,17 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
     let global_settings = &inputs.global_settings;
+
+    // A child is not admitted while its parent denies all new egress, so it
+    // fails closed with the parent instead of keeping its copy's access.
+    if let Some(parent) = sandbox.parent.as_ref()
+        && super::sandbox::parent_is_blocked(state, &parent.id).await?
+    {
+        return Err(Status::failed_precondition(format!(
+            "parent sandbox '{}' rejected its latest policy",
+            parent.name
+        )));
+    }
 
     let global_policy = decode_policy_from_global_settings(global_settings)?;
     let mut global_policy_version: u32 = 0;
@@ -3064,7 +3085,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         &settings,
         policy_source,
         &supervisor_middleware_services,
-        state.config.policy_validation_failure_mode,
+        policy_failure_mode(state, sandbox),
         state.extension_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
@@ -3118,11 +3139,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         provider_env_revision,
         supervisor_middleware_services,
         workspace,
-        policy_validation_failure_mode: state
-            .config
-            .policy_validation_failure_mode
-            .as_str()
-            .to_string(),
+        policy_validation_failure_mode: policy_failure_mode(state, sandbox).as_str().to_string(),
         extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
         provider_attachment_epoch: sandbox
             .spec
@@ -5099,7 +5116,9 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     let message = error.message();
-    if message.contains("middleware") {
+    if message.starts_with("parent sandbox ") {
+        "The parent sandbox rejected its latest policy; fix the parent's policy"
+    } else if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
     } else if message.contains("credential") || message.contains("provider") {
         "Effective provider configuration is invalid; repair credential bindings, attached providers, or their policy layers"
@@ -5332,6 +5351,18 @@ pub(super) async fn handle_report_policy_status(
     Ok(Response::new(ReportPolicyStatusResponse {}))
 }
 
+/// Sync a root's children in the background, so the root's report is not
+/// held up by them.
+fn spawn_child_policy_sync(state: &Arc<ServerState>, sandbox_id: &str) {
+    let state = Arc::clone(state);
+    let parent_id = sandbox_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = super::sandbox::sync_children(&state, &parent_id).await {
+            warn!(parent_id, error = %error, "failed to sync child sandbox policies");
+        }
+    });
+}
+
 /// Persist the exact sandbox policy revision attempted by a supervisor.
 /// Unary rollout reports and stream acknowledgements share this path.
 pub async fn record_policy_apply_result(
@@ -5377,7 +5408,7 @@ pub async fn record_policy_apply_result(
         return Err(Status::not_found("policy revision not found"));
     }
     if loaded {
-        let newest_loaded = {
+        let (newest_loaded, is_root) = {
             let Some(_mutation_guard) = state
                 .compute
                 .sandbox_mutation_guard_by_id(sandbox_id)
@@ -5394,8 +5425,9 @@ pub async fn record_policy_apply_result(
                 .await
                 .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let is_root = sandbox.parent.is_none();
             let current_version = sandbox.current_policy_version();
-            if current_version > version {
+            let newest_loaded = if current_version > version {
                 // A result can arrive after a newer revision loaded, such as
                 // one queued by a replaced supervisor session. The newer
                 // policy stays active, and so does its endpoint inventory.
@@ -5428,7 +5460,8 @@ pub async fn record_policy_apply_result(
                 state.sandbox_index.update_from_sandbox(&updated);
                 state.sandbox_watch_bus.notify(sandbox_id);
                 updated.current_policy_version()
-            }
+            };
+            (newest_loaded, is_root)
         };
         // Supersede below the newest loaded revision, after the current
         // version settles. Of two results racing, the one finishing last then
@@ -5438,6 +5471,17 @@ pub async fn record_policy_apply_result(
             .store
             .supersede_older_policies(sandbox_id, i64::from(newest_loaded))
             .await;
+        // A root now enforces a new policy: copy it into its children.
+        if is_root {
+            spawn_child_policy_sync(state, sandbox_id);
+        }
+    } else if state.config.policy_validation_failure_mode
+        == openshell_core::PolicyValidationFailureMode::FailClosed
+    {
+        // A root that rejects a revision under fail_closed denies all new
+        // egress; push its children so they are refused too. The sync ignores
+        // a child's own report.
+        spawn_child_policy_sync(state, sandbox_id);
     }
     info!(
         sandbox_id,
