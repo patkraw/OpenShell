@@ -2912,6 +2912,9 @@ async fn handle_delete_sandbox_inner(
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
+    if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+        return delete_caller_child(state, caller, &req).await;
+    }
     let name = req.name;
     if name.is_empty() {
         return Err(Status::invalid_argument("sandbox is required"));
@@ -2955,6 +2958,88 @@ async fn handle_delete_sandbox_inner(
         outcome: result.outcome.into(),
         sandbox_id: result.sandbox_id,
     }))
+}
+
+/// A sandbox caller (only through `/mcp`) deleting one of its own children.
+/// The delete is bound to the id that was checked, so a name reused in the
+/// meantime is never deleted in its place.
+async fn delete_caller_child(
+    state: &Arc<ServerState>,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    request: &DeleteSandboxRequest,
+) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("allow_missing", request.allow_missing),
+        ("request_id", !request.request_id.is_empty()),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    if *request
+        != (DeleteSandboxRequest {
+            name: request.name.clone(),
+            ..Default::default()
+        })
+    {
+        return Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ));
+    }
+    let child = resolve_caller_child(state, caller, &request.name).await?;
+    let preconditions = SandboxDeletePreconditions {
+        expected_sandbox_id: Some(child.object_id().to_string()),
+        ..Default::default()
+    };
+    let result = match state
+        .compute
+        .delete_sandbox_allow_missing_with_preconditions(
+            child.object_workspace(),
+            child.object_name(),
+            false,
+            preconditions,
+        )
+        .await
+    {
+        Ok(result) => result,
+        // The checked child is gone when its name no longer resolves to it;
+        // any other conflict is reported as it is.
+        Err(status) if status.code() == tonic::Code::Aborted => {
+            return Err(aborted_child_delete(
+                state,
+                caller,
+                &request.name,
+                child.object_id(),
+                status,
+            )
+            .await);
+        }
+        Err(status) => return Err(status),
+    };
+    state.telemetry.end_sandbox_session(&result.sandbox_id);
+    info!(sandbox_name = %request.name, "DeleteSandbox request completed successfully");
+    Ok(Response::new(DeleteSandboxResponse {
+        outcome: result.outcome.into(),
+        sandbox_id: result.sandbox_id,
+    }))
+}
+
+/// An aborted delete means the checked child is gone when its name no longer
+/// resolves to it (a name reused in the meantime); any other conflict is
+/// reported as it is.
+async fn aborted_child_delete(
+    state: &ServerState,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    name: &str,
+    checked_id: &str,
+    status: Status,
+) -> Status {
+    match resolve_caller_child(state, caller, name).await {
+        Ok(current) if current.object_id() == checked_id => status,
+        _ => Status::not_found(format!("sandbox '{name}' not found")),
+    }
 }
 
 pub(super) async fn handle_stop_sandbox(
@@ -9496,6 +9581,139 @@ mod tests {
                 format!("field '{field}' is not allowed for sandbox callers")
             );
         }
+    }
+
+    fn sandbox_principal_for(sandbox_id: &str) -> crate::auth::principal::SandboxPrincipal {
+        let request = sandbox_request(sandbox_id, ());
+        match request
+            .extensions()
+            .get::<crate::auth::principal::Principal>()
+        {
+            Some(crate::auth::principal::Principal::Sandbox(principal)) => principal.clone(),
+            _ => unreachable!("sandbox_request sets a sandbox principal"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_deletes_only_its_own_children() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        for (name, parent, id) in [("mine", "lead", &lead_id), ("theirs", "other", &other_id)] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            put_parent_record(&state, name, &[], Some(link), false).await;
+        }
+        let delete = |name: &str| DeleteSandboxRequest {
+            name: name.to_string(),
+            ..Default::default()
+        };
+
+        for name in ["theirs", "other", "lead", "missing"] {
+            let err = handle_delete_sandbox(&state, sandbox_request(&lead_id, delete(name)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::NotFound, "{name}");
+            assert_eq!(err.message(), format!("sandbox '{name}' not found"));
+        }
+        for (request, field) in [
+            (
+                DeleteSandboxRequest {
+                    allow_missing: true,
+                    ..delete("mine")
+                },
+                "allow_missing",
+            ),
+            (
+                DeleteSandboxRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    ..delete("mine")
+                },
+                "workspace_scope",
+            ),
+        ] {
+            let err = handle_delete_sandbox(&state, sandbox_request(&lead_id, request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
+
+        handle_delete_sandbox(&state, sandbox_request(&lead_id, delete("mine")))
+            .await
+            .expect("its own child is deleted");
+        // Deleting a root with children is refused for users; "other" still
+        // has its child, so the sandbox caller's delete reached only "mine".
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "theirs")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_name_is_not_deleted_in_place_of_the_checked_child() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        let checked_id = put_parent_record(&state, "w", &[], Some(link), false).await;
+        let caller = sandbox_principal_for(&lead_id);
+
+        // While the checked child still holds the name, a conflict is
+        // reported as it is.
+        let conflict = Status::aborted("some other conflict");
+        let status =
+            aborted_child_delete(&state, &caller, "w", &checked_id, conflict.clone()).await;
+        assert_eq!(status.code(), tonic::Code::Aborted);
+
+        // The name now belongs to another root: the delete bound to the
+        // checked id is refused and the new sandbox survives.
+        state
+            .store
+            .delete(Sandbox::object_type(), &checked_id)
+            .await
+            .unwrap();
+        let reused_id = put_parent_record(&state, "w", &[], None, false).await;
+        let err = state
+            .compute
+            .delete_sandbox_allow_missing_with_preconditions(
+                "default",
+                "w",
+                false,
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some(checked_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>(&reused_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // ...and the agent is told its child is gone.
+        let status = aborted_child_delete(&state, &caller, "w", &checked_id, err).await;
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "sandbox 'w' not found");
     }
 
     #[tokio::test]

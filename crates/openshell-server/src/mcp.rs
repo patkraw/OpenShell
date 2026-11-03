@@ -23,8 +23,8 @@ use axum::routing::post;
 use openshell_core::ObjectName;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    CreateSandboxRequest, ExecSandboxRequest, ListSandboxesRequest, Sandbox, SandboxPhase,
-    SandboxSpec,
+    CreateSandboxRequest, DeleteSandboxRequest, ExecSandboxRequest, ListSandboxesRequest, Sandbox,
+    SandboxPhase, SandboxSpec,
 };
 use serde_json::{Value, json};
 use tower::util::BoxCloneSyncService;
@@ -208,6 +208,7 @@ async fn handle(
             let result = match name {
                 "create_sandbox" => create_child(&connection, &headers, &arguments).await,
                 "exec" => exec_in_child(&connection, &headers, &arguments).await,
+                "delete" => delete_child(&connection, &headers, &arguments).await,
                 "list" => caller_children(&connection, &headers)
                     .await
                     .map(|children| json!({"sandboxes": children.iter().map(child_summary).collect::<Vec<_>>()})),
@@ -257,7 +258,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "delete",
-        description: "Delete a child sandbox and everything running in it.",
+        description: "Delete a child sandbox and everything running in it. Deletion finishes in the background; a later not_found for the same name means the child is gone.",
     },
     Tool {
         name: "logs",
@@ -292,6 +293,12 @@ fn tool_definitions() -> Vec<Value> {
                         "background": {"type": "boolean"},
                     },
                     "required": ["name", "command"],
+                    "additionalProperties": false,
+                }),
+                "delete" => json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "description": "Child sandbox to delete."}},
+                    "required": ["name"],
                     "additionalProperties": false,
                 }),
                 _ => json!({"type": "object"}),
@@ -573,9 +580,6 @@ fn utf8_start_after_partial(bytes: &[u8]) -> usize {
 /// What the audit event records about a tool call: for `exec`, the target,
 /// the argument list (capped) and the working directory; never stdin.
 fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
-    if tool != "exec" {
-        return Vec::new();
-    }
     let text = |key| {
         arguments
             .get(key)
@@ -583,6 +587,12 @@ fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
             .unwrap_or_default()
             .to_string()
     };
+    if tool == "delete" {
+        return vec![("target", text("name"))];
+    }
+    if tool != "exec" {
+        return Vec::new();
+    }
     let argv = arguments
         .get("command")
         .and_then(Value::as_array)
@@ -618,6 +628,40 @@ fn arguments_object(arguments: &Value) -> Result<serde_json::Map<String, Value>,
         Value::Object(args) => Ok(args.clone()),
         _ => Err(ToolError::invalid("arguments must be an object")),
     }
+}
+
+/// Delete one of the caller's children. Returns at once; deletion finishes in
+/// the background.
+async fn delete_child(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let name = required_name(&arguments_object(arguments)?, &["name"])?;
+    let request = DeleteSandboxRequest {
+        name: name.clone(),
+        ..Default::default()
+    };
+    let mut client = OpenShellClient::new(connection.grpc.clone());
+    let call: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.delete_sandbox(mcp_request(request, headers)));
+    call.await.map_err(ToolError::from_status)?;
+    Ok(json!({"name": name, "deleting": true}))
+}
+
+/// Refuse arguments outside `allowed`, and return the required `name`.
+fn required_name(
+    args: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<String, ToolError> {
+    if let Some(key) = args.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
+    }
+    args.get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ToolError::invalid("'name' is required"))
 }
 
 /// `create_sandbox` arguments a user may send but a sandbox may not.
@@ -1265,6 +1309,30 @@ mod tests {
             let result = &reply.unwrap()["result"];
             assert_eq!(result["isError"], true);
             assert_eq!(result["structuredContent"]["error"], error);
+            assert_eq!(result["structuredContent"]["message"], message);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_unknown_arguments() {
+        for (arguments, message) in [
+            (
+                json!({"name": "w", "force": true}),
+                "unknown argument 'force'",
+            ),
+            (json!({}), "'name' is required"),
+        ] {
+            let (_, reply) = post_mcp(
+                connection(Some(sandbox_principal("lead"))),
+                &[],
+                rpc(
+                    "tools/call",
+                    json!({"name": "delete", "arguments": arguments}),
+                ),
+            )
+            .await;
+            let result = &reply.unwrap()["result"];
+            assert_eq!(result["structuredContent"]["error"], "invalid_argument");
             assert_eq!(result["structuredContent"]["message"], message);
         }
     }
