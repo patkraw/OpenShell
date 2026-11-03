@@ -1336,10 +1336,13 @@ impl CallerAuthenticator {
     }
 }
 
+/// Subject of the built-in user on gateways that allow unauthenticated users.
+pub const UNAUTHENTICATED_DEV_SUBJECT: &str = "unauthenticated-local-dev";
+
 fn unauthenticated_dev_user_principal() -> Principal {
     Principal::User(UserPrincipal {
         identity: Identity {
-            subject: "unauthenticated-local-dev".to_string(),
+            subject: UNAUTHENTICATED_DEV_SUBJECT.to_string(),
             display_name: Some("Unauthenticated Local Dev".to_string()),
             roles: vec!["openshell-user".to_string(), "openshell-admin".to_string()],
             scopes: vec!["openshell:all".to_string()],

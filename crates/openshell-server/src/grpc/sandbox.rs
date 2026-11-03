@@ -565,7 +565,6 @@ fn sandbox_create_telemetry_attrs(
 
 /// Check the parent named in a create request and return the link to store on
 /// the new child. Returns `None` when no parent is named, for a root sandbox.
-/// A child that names no providers gets all of its parent's providers.
 async fn resolve_create_parent(
     state: &ServerState,
     workspace: &str,
@@ -575,11 +574,7 @@ async fn resolve_create_parent(
     if parent_name.is_empty() {
         return Ok(None);
     }
-    if !state.config.enable_child_sandboxes {
-        return Err(Status::failed_precondition(
-            "child sandboxes are disabled on this gateway",
-        ));
-    }
+    ensure_child_sandboxes_enabled(state)?;
     let parent = state
         .store
         .get_message_by_name::<Sandbox>(workspace, parent_name)
@@ -588,6 +583,27 @@ async fn resolve_create_parent(
         .ok_or_else(|| {
             Status::failed_precondition(format!("parent sandbox '{parent_name}' not found"))
         })?;
+    check_create_parent(&parent, spec).map(Some)
+}
+
+fn ensure_child_sandboxes_enabled(state: &ServerState) -> Result<(), Status> {
+    if state.config.enable_child_sandboxes {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(
+            "child sandboxes are disabled on this gateway",
+        ))
+    }
+}
+
+/// Check that `parent` can take a child with `spec`, and return the link to
+/// store on the child. A child that names no providers gets all of its
+/// parent's providers. Users and sandbox callers share these checks.
+fn check_create_parent(
+    parent: &Sandbox,
+    spec: &mut SandboxSpec,
+) -> Result<openshell_core::proto::SandboxParent, Status> {
+    let parent_name = parent.object_name();
     if parent
         .metadata
         .as_ref()
@@ -623,10 +639,167 @@ async fn resolve_create_parent(
     if spec.providers.is_empty() {
         spec.providers = parent_providers.to_vec();
     }
-    Ok(Some(openshell_core::proto::SandboxParent {
-        name: parent.object_name().to_string(),
+    Ok(openshell_core::proto::SandboxParent {
+        name: parent_name.to_string(),
         id: parent.object_id().to_string(),
-    }))
+    })
+}
+
+/// A sandbox caller (only through `/mcp`) creating a child of itself: read its
+/// own record and check the request and its creator. The child always goes in
+/// the caller's workspace with the caller as its parent.
+async fn sandbox_caller_create(
+    state: &ServerState,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    request: &CreateSandboxRequest,
+) -> Result<Sandbox, Status> {
+    refuse_fields_for_sandbox_caller(request)?;
+    ensure_child_sandboxes_enabled(state)?;
+    let caller = state
+        .store
+        .get_message::<Sandbox>(&caller.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if caller.parent.is_some() {
+        return Err(Status::failed_precondition(
+            "only root sandboxes can create child sandboxes",
+        ));
+    }
+    check_creator_has_access(state, &caller).await?;
+    Ok(caller)
+}
+
+/// A sandbox caller may set only `name`, `workload_template` and
+/// `spec.providers`; the gateway decides everything else.
+fn refuse_fields_for_sandbox_caller(request: &CreateSandboxRequest) -> Result<(), Status> {
+    let spec = request.spec.clone().unwrap_or_default();
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("parent", !request.parent.is_empty()),
+        ("labels", !request.labels.is_empty()),
+        ("annotations", !request.annotations.is_empty()),
+        (
+            "await_main_process_attachment",
+            request.await_main_process_attachment,
+        ),
+        ("request_id", !request.request_id.is_empty()),
+        ("service_exposures", !request.service_exposures.is_empty()),
+        ("spec.log_level", !spec.log_level.is_empty()),
+        ("spec.environment", !spec.environment.is_empty()),
+        ("spec.template", spec.template.is_some()),
+        ("spec.policy", spec.policy.is_some()),
+        (
+            "spec.resource_requirements",
+            spec.resource_requirements.is_some(),
+        ),
+        ("spec.command", !spec.command.is_empty()),
+        ("spec.tty", spec.tty),
+        (
+            "spec.provider_attachment_epoch",
+            !spec.provider_attachment_epoch.is_empty(),
+        ),
+        ("spec.restart_policy", spec.restart_policy != 0),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    refuse_unlisted_fields_for_sandbox_caller(request)
+}
+
+/// Backstop for fields the named checks above do not list, such as ones added
+/// to the request later: anything beyond what a sandbox caller may send.
+fn refuse_unlisted_fields_for_sandbox_caller(request: &CreateSandboxRequest) -> Result<(), Status> {
+    let allowed = CreateSandboxRequest {
+        name: request.name.clone(),
+        workload_template: request.workload_template.clone(),
+        spec: request.spec.as_ref().map(|spec| SandboxSpec {
+            providers: spec.providers.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    if *request == allowed {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ))
+    }
+}
+
+/// The user who created a root must still be a workspace member with at least
+/// the user role for the root to create children. A root with no recorded
+/// creator fails closed. Checked on every create.
+async fn check_creator_has_access(state: &ServerState, caller: &Sandbox) -> Result<(), Status> {
+    let creator = caller.created_by.as_str();
+    if creator.is_empty() {
+        return Err(Status::failed_precondition(
+            "this sandbox was not started by a workspace user, so it cannot create children",
+        ));
+    }
+    // Development gateways create roots as the built-in local user, which has
+    // no membership; it counts only while such users are still allowed.
+    if state.config.auth.allow_unauthenticated_users
+        && creator == crate::multiplex::UNAUTHENTICATED_DEV_SUBJECT
+    {
+        return Ok(());
+    }
+    if !crate::auth::workspace_authz::subject_has_workspace_role(
+        &state.store,
+        caller.object_workspace(),
+        creator,
+        MinWorkspaceRole::User,
+    )
+    .await?
+    {
+        return Err(Status::permission_denied(
+            "the user who started this sandbox no longer has access",
+        ));
+    }
+    Ok(())
+}
+
+/// The spec a sandbox caller's child gets without a template: the caller's
+/// image, CPU and memory, and the named providers. Nothing else is copied.
+fn spec_copied_from_caller(caller: &Sandbox, providers: Vec<String>) -> SandboxSpec {
+    let template = caller.spec.as_ref().and_then(|spec| spec.template.as_ref());
+    SandboxSpec {
+        template: Some(SandboxTemplate {
+            image: template.map(|t| t.image.clone()).unwrap_or_default(),
+            resources: template.and_then(|t| t.resources.clone()),
+            ..Default::default()
+        }),
+        providers,
+        ..Default::default()
+    }
+}
+
+/// Agents may create children only from templates an administrator marked
+/// for them, and never from one with driver configuration.
+fn check_agent_usable_template(template: &SandboxWorkloadTemplate) -> Result<(), Status> {
+    let labelled = template
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.labels.get(AGENT_USABLE_TEMPLATE_LABEL))
+        .is_some_and(|value| value == "true");
+    let has_driver_config = template
+        .spec
+        .as_ref()
+        .is_some_and(|spec| spec.driver_config.is_some());
+    if labelled && !has_driver_config {
+        Ok(())
+    } else {
+        Err(template_not_available(template.object_name()))
+    }
+}
+
+const AGENT_USABLE_TEMPLATE_LABEL: &str = "openshell.ai/agent-usable";
+
+fn template_not_available(name: &str) -> Status {
+    Status::failed_precondition(format!("template '{name}' is not available to agents"))
 }
 
 /// Under the child-create lock, re-read the parent and check that it can take
@@ -1248,22 +1421,44 @@ async fn handle_create_sandbox_inner(
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
-        MinWorkspaceRole::User,
-    )
-    .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+    // `authorize_workspace` admits a sandbox caller to any workspace, so a
+    // sandbox caller's workspace comes from its own record instead.
+    let caller = match &principal {
+        crate::auth::principal::Principal::Sandbox(caller) => {
+            Some(sandbox_caller_create(state, caller, &request).await?)
+        }
+        _ => None,
+    };
+    let workspace = match &caller {
+        Some(caller) => caller.object_workspace().to_string(),
+        None => {
+            authorize_workspace(
+                &state.store,
+                &state.admin_role,
+                &principal,
+                crate::auth::workspace_authz::selected_workspace_name(
+                    request.workspace_scope.as_ref(),
+                )?,
+                MinWorkspaceRole::User,
+            )
+            .await?
+            .workspace
+        }
+    };
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &workspace)
         .await?
         .ensure_active()?;
 
     let (mut spec, created_from_workload_template) = if workload_template_name.is_empty() {
-        let spec = request
-            .spec
-            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        let spec = match &caller {
+            Some(caller) => spec_copied_from_caller(
+                caller,
+                request.spec.map(|spec| spec.providers).unwrap_or_default(),
+            ),
+            None => request
+                .spec
+                .ok_or_else(|| Status::invalid_argument("spec is required"))?,
+        };
         (spec, None)
     } else {
         let governance_spec = request.spec.unwrap_or_default();
@@ -1271,8 +1466,16 @@ async fn handle_create_sandbox_inner(
             .store
             .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
             .await
-            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?;
+        let template = match (template, &caller) {
+            (Some(template), Some(_)) => {
+                check_agent_usable_template(&template)?;
+                template
+            }
+            (Some(template), None) => template,
+            (None, Some(_)) => return Err(template_not_available(&workload_template_name)),
+            (None, None) => return Err(Status::not_found("sandbox template not found")),
+        };
         let provenance = SandboxWorkloadTemplateProvenance {
             name: template.object_name().to_string(),
             resource_version: template.get_resource_version().to_string(),
@@ -1302,7 +1505,10 @@ async fn handle_create_sandbox_inner(
         spec.tty = true;
     }
 
-    let parent = resolve_create_parent(state, &workspace, &request.parent, &mut spec).await?;
+    let parent = match &caller {
+        Some(caller) => Some(check_create_parent(caller, &mut spec)?),
+        None => resolve_create_parent(state, &workspace, &request.parent, &mut spec).await?,
+    };
 
     // Validate field sizes before any create-side effects.
     validate_sandbox_spec(&request.name, &spec)?;
@@ -8718,23 +8924,21 @@ mod tests {
         assert_eq!(listed_names(&listed), ["w1", "w2"]);
     }
 
-    #[tokio::test]
-    async fn mcp_list_reaches_the_handler_through_the_grpc_stack() {
+    /// Call an MCP tool as the sandbox `caller_id`, through the real gRPC
+    /// stack and handlers, and return the tool result.
+    async fn call_mcp_tool(
+        state: &Arc<ServerState>,
+        caller_id: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
         use crate::auth::authenticator::test_support::MockAuthenticator;
         use crate::auth::authenticator::{Authentication, AuthenticatorChain};
         use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
         use tower::ServiceExt;
 
-        let state = child_sandboxes_state().await;
-        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
-        let link = openshell_core::proto::SandboxParent {
-            name: "lead".to_string(),
-            id: lead_id.clone(),
-        };
-        put_parent_record(&state, "w1", &[], Some(link), false).await;
-
-        let lead = Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: lead_id,
+        let caller = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: caller_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
                 auth_epoch: None,
@@ -8742,7 +8946,7 @@ mod tests {
             trust_domain: Some("openshell".to_string()),
         });
         let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
-            Authentication::Accepted(lead),
+            Authentication::Accepted(caller),
         )))]);
         let stack = crate::multiplex::AuthGrpcRouter::new(
             openshell_core::proto::open_shell_server::OpenShellServer::new(
@@ -8751,10 +8955,11 @@ mod tests {
             Some(chain),
             None,
         );
-        let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack);
+        let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack)
+            .with_short_create_wait();
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "list", "arguments": {}},
+            "params": {"name": tool, "arguments": arguments},
         });
         let response = crate::mcp::router()
             .layer(axum::Extension(connection))
@@ -8774,8 +8979,21 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let result = &reply["result"];
-        assert_eq!(result["isError"], false, "{reply}");
+        reply["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn mcp_list_reaches_the_handler_through_the_grpc_stack() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        put_parent_record(&state, "w1", &[], Some(link), false).await;
+
+        let result = call_mcp_tool(&state, &lead_id, "list", serde_json::json!({})).await;
+        assert_eq!(result["isError"], false, "{result}");
         let names: Vec<_> = result["structuredContent"]["sandboxes"]
             .as_array()
             .unwrap()
@@ -8783,6 +9001,441 @@ mod tests {
             .map(|child| child["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, ["w1"]);
+    }
+
+    /// Record `subject` as the creator of sandbox `id`.
+    async fn set_creator(state: &ServerState, id: &str, subject: &str) {
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(id)
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.created_by = subject.to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    async fn put_member(state: &ServerState, subject: &str) {
+        state
+            .store
+            .put_message(&openshell_core::proto::WorkspaceMember {
+                metadata: Some(ObjectMeta {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: subject.to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                principal_subject: subject.to_string(),
+                role: openshell_core::proto::WorkspaceRole::User.into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A root created by a workspace member, ready to create children.
+    async fn member_root(state: &Arc<ServerState>, name: &str, providers: &[&str]) -> String {
+        let id = put_parent_record(state, name, providers, None, false).await;
+        put_member(state, "alice").await;
+        set_creator(state, &id, "alice").await;
+        id
+    }
+
+    fn sandbox_child_request(name: &str) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            name: name.to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_child_copies_image_cpu_and_memory_only() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let mut lead = state
+            .store
+            .get_message::<Sandbox>(&lead_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let resources = template_resource_struct(&SandboxResources {
+            cpu: "2".to_string(),
+            memory: "4Gi".to_string(),
+            gpu: None,
+        });
+        let spec = lead.spec.as_mut().unwrap();
+        spec.template = Some(SandboxTemplate {
+            image: "registry.example.com/lead:1".to_string(),
+            resources: resources.clone(),
+            ..Default::default()
+        });
+        spec.resource_requirements = Some(ResourceRequirements {
+            gpu: Some(GpuResourceRequirements { count: Some(1) }),
+        });
+        spec.environment = HashMap::from([("SECRET_MODE".to_string(), "on".to_string())]);
+        lead.metadata.as_mut().unwrap().labels =
+            HashMap::from([("team".to_string(), "a".to_string())]);
+        state.store.put_message(&lead).await.unwrap();
+
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, sandbox_child_request("worker")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+
+        assert_eq!(child.parent.as_ref().unwrap().id, lead_id);
+        assert_eq!(child.object_workspace(), "default");
+        let spec = child.spec.as_ref().unwrap();
+        let template = spec.template.as_ref().unwrap();
+        assert_eq!(template.image, "registry.example.com/lead:1");
+        assert_eq!(template.resources, resources);
+        assert!(spec.resource_requirements.is_none(), "no GPU is copied");
+        assert!(spec.environment.is_empty());
+        assert!(child.metadata.as_ref().unwrap().labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_may_set_only_name_template_and_providers() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let with_spec = |spec: SandboxSpec| CreateSandboxRequest {
+            spec: Some(spec),
+            ..sandbox_child_request("worker")
+        };
+        for (request, field) in [
+            (
+                CreateSandboxRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "other".to_string(),
+                    )),
+                    ..sandbox_child_request("worker")
+                },
+                "workspace_scope",
+            ),
+            (
+                CreateSandboxRequest {
+                    parent: "lead".to_string(),
+                    ..sandbox_child_request("worker")
+                },
+                "parent",
+            ),
+            (
+                CreateSandboxRequest {
+                    labels: HashMap::from([("a".to_string(), "b".to_string())]),
+                    ..sandbox_child_request("worker")
+                },
+                "labels",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        image: "evil".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                "spec.template",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    environment: HashMap::from([("A".to_string(), "b".to_string())]),
+                    ..Default::default()
+                }),
+                "spec.environment",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    command: vec!["sh".to_string()],
+                    ..Default::default()
+                }),
+                "spec.command",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    policy: Some(openshell_policy::restrictive_default_policy()),
+                    ..Default::default()
+                }),
+                "spec.policy",
+            ),
+        ] {
+            let err = handle_create_sandbox(&state, sandbox_request(&lead_id, request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
+    }
+
+    #[test]
+    fn the_backstop_refuses_fields_the_named_checks_miss() {
+        // Checked on its own, as for a field added to the request later.
+        let allowed = CreateSandboxRequest {
+            spec: Some(SandboxSpec {
+                providers: vec!["github".to_string()],
+                ..Default::default()
+            }),
+            workload_template: "agents".to_string(),
+            ..sandbox_child_request("worker")
+        };
+        refuse_unlisted_fields_for_sandbox_caller(&allowed).unwrap();
+        for request in [
+            CreateSandboxRequest {
+                request_id: "r1".to_string(),
+                ..allowed.clone()
+            },
+            CreateSandboxRequest {
+                spec: Some(SandboxSpec {
+                    resource_requirements: Some(ResourceRequirements {
+                        gpu: Some(GpuResourceRequirements { count: Some(1) }),
+                    }),
+                    ..Default::default()
+                }),
+                ..allowed
+            },
+        ] {
+            let err = refuse_unlisted_fields_for_sandbox_caller(&request).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                "the request sets fields that are not allowed for sandbox callers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_uses_only_templates_made_available_to_agents() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let put_template = |name: &str, labelled: bool, driver_config: bool| {
+            let mut template = test_workload_template(name);
+            let metadata = template.metadata.as_mut().unwrap();
+            metadata.id = uuid::Uuid::new_v4().to_string();
+            metadata.workspace = "default".to_string();
+            if labelled {
+                metadata
+                    .labels
+                    .insert(AGENT_USABLE_TEMPLATE_LABEL.to_string(), "true".to_string());
+            }
+            if driver_config {
+                template.spec.as_mut().unwrap().driver_config = Some(Struct::default());
+            }
+            let state = state.clone();
+            async move { state.store.put_message(&template).await.unwrap() }
+        };
+        put_template("agents", true, false).await;
+        put_template("unlabelled", false, false).await;
+        put_template("driver", true, true).await;
+        let from_template = |name: &str, template: &str| CreateSandboxRequest {
+            workload_template: template.to_string(),
+            ..sandbox_child_request(name)
+        };
+
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, from_template("w1", "agents")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        let template = child.spec.as_ref().unwrap().template.as_ref().unwrap();
+        assert_eq!(template.image, "registry.example.com/agent:latest");
+
+        for name in ["unlabelled", "driver", "missing"] {
+            let err =
+                handle_create_sandbox(&state, sandbox_request(&lead_id, from_template("w2", name)))
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{name}");
+            assert_eq!(
+                err.message(),
+                format!("template '{name}' is not available to agents")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_child_may_not_take_a_provider_its_parent_lacks() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &["github"]).await;
+        let request = CreateSandboxRequest {
+            spec: Some(SandboxSpec {
+                providers: vec!["gitlab".to_string()],
+                ..Default::default()
+            }),
+            ..sandbox_child_request("worker")
+        };
+        let err = handle_create_sandbox(&state, sandbox_request(&lead_id, request))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "provider 'gitlab' is not attached to parent 'lead'"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_needs_a_creator_who_still_has_access() {
+        let mut state = child_sandboxes_state().await;
+        let create = |state: Arc<ServerState>, id: String, name: &'static str| async move {
+            handle_create_sandbox(&state, sandbox_request(&id, sandbox_child_request(name))).await
+        };
+
+        let no_creator = put_parent_record(&state, "no-creator", &[], None, false).await;
+        let err = create(state.clone(), no_creator, "w1").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "this sandbox was not started by a workspace user, so it cannot create children"
+        );
+
+        let lost = put_parent_record(&state, "lost", &[], None, false).await;
+        set_creator(&state, &lost, "bob").await;
+        let err = create(state.clone(), lost, "w2").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "the user who started this sandbox no longer has access"
+        );
+
+        let member = member_root(&state, "member", &[]).await;
+        create(state.clone(), member, "w3").await.unwrap();
+
+        // The built-in development user counts only while such users are
+        // allowed, checked at each create.
+        let dev = put_parent_record(&state, "dev", &[], None, false).await;
+        set_creator(&state, &dev, crate::multiplex::UNAUTHENTICATED_DEV_SUBJECT).await;
+        let err = create(state.clone(), dev.clone(), "w4").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .auth
+            .allow_unauthenticated_users = true;
+        create(state.clone(), dev, "w5").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_sandbox_cannot_create_children() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+        let child_id = put_parent_record(&state, "child", &[], Some(link), false).await;
+        set_creator(&state, &child_id, "alice").await;
+        let err = handle_create_sandbox(
+            &state,
+            sandbox_request(&child_id, sandbox_child_request("grandchild")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "only root sandboxes can create child sandboxes"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_create_retry_returns_the_child_even_at_the_limit() {
+        let state = child_sandboxes_state_with_limit(1).await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+
+        // The child never becomes ready here, so the short wait times out,
+        // and that is not an error.
+        let first = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "w1"}),
+        )
+        .await;
+        assert_eq!(first["isError"], false, "{first}");
+        let reply = &first["structuredContent"];
+        assert_eq!(reply["name"], "w1");
+        assert_eq!(reply["already_existed"], false);
+        assert_eq!(reply["timed_out"], true);
+
+        let retry = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "w1"}),
+        )
+        .await;
+        assert_eq!(retry["isError"], false, "{retry}");
+        assert_eq!(retry["structuredContent"]["already_existed"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_create_refuses_a_name_that_is_not_the_callers_child() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        put_parent_record(&state, "other-root", &[], None, false).await;
+
+        let result = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "other-root"}),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["error"], "already_exists");
+        assert_eq!(
+            result["structuredContent"]["message"],
+            "a sandbox named 'other-root' already exists in this workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_create_reports_a_failed_child() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        let child_id = put_parent_record(&state, "w1", &[], Some(link), false).await;
+        let mut child = state
+            .store
+            .get_message::<Sandbox>(&child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        child.set_phase(SandboxPhase::Error as i32);
+        child.status.get_or_insert_with(Default::default).conditions =
+            vec![openshell_core::proto::SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                message: "image pull failed".to_string(),
+                ..Default::default()
+            }];
+        state.store.put_message(&child).await.unwrap();
+
+        let result = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "w1"}),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["structuredContent"]["message"],
+            "child sandbox 'w1' failed: image pull failed"
+        );
     }
 
     #[tokio::test]
