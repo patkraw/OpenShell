@@ -4363,6 +4363,27 @@ impl ComputeRuntime {
                 failed += 1;
                 continue;
             }
+            // A child whose parent record is gone is never started again; the
+            // startup child sync stops it. Read by id; a store error only
+            // skips the check, so a brief outage cannot strand every child.
+            if let Some(parent) = sandbox.parent.as_ref() {
+                match self.store.get_message::<Sandbox>(&parent.id).await {
+                    Ok(None) => {
+                        warn!(
+                            sandbox_id,
+                            parent_id = %parent.id,
+                            "Not starting child sandbox whose parent no longer exists"
+                        );
+                        continue;
+                    }
+                    Ok(Some(_)) => {}
+                    Err(err) => warn!(
+                        sandbox_id,
+                        error = %err,
+                        "Failed to check child sandbox's parent during gateway startup"
+                    ),
+                }
+            }
             if is_automatic_restart_transition(&sandbox) {
                 // The restart loop resumes both scheduled and claimed
                 // attempts. It always stops the old runtime before starting
@@ -8233,6 +8254,18 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
             }
         }
     }
+}
+
+/// Ends the message for a child whose parent record is gone.
+pub const ORPHANED_CHILD_SUFFIX: &str = "no longer exists; delete this child sandbox";
+
+/// Why an orphaned child is refused configuration and starts. Names the
+/// parent by id too: a root created later under the same name is not it.
+pub fn orphaned_child_message(parent: &openshell_core::proto::SandboxParent) -> String {
+    format!(
+        "parent sandbox '{}' (id {}) {ORPHANED_CHILD_SUFFIX}",
+        parent.name, parent.id
+    )
 }
 
 /// Phases for which a sandbox should have a running compute resource.

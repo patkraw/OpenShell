@@ -2632,7 +2632,16 @@ pub async fn handle_connect_supervisor(
         )
         .await
         {
-            Ok(Ok(())) => {}
+            Ok(Ok(crate::grpc::ChildSync::Done)) => {}
+            Ok(Ok(crate::grpc::ChildSync::Orphaned)) => {
+                // Stopping waits on this very session, so it runs apart from
+                // it. Delivery refuses the orphan configuration meanwhile.
+                let state = Arc::clone(state);
+                let sandbox = sandbox.clone();
+                tokio::spawn(async move {
+                    crate::grpc::stop_orphaned_child(&state, &sandbox).await;
+                });
+            }
             Ok(Err(error)) => {
                 warn!(sandbox_id = %sandbox_id, error = %error, "child sandbox policy sync on connect failed");
             }

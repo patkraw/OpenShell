@@ -2943,13 +2943,19 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
 
     // A child is not admitted while its parent denies all new egress, so it
     // fails closed with the parent instead of keeping its copy's access.
-    if let Some(parent) = sandbox.parent.as_ref()
-        && super::sandbox::parent_is_blocked(state, &parent.id).await?
-    {
-        return Err(Status::failed_precondition(format!(
-            "parent sandbox '{}' rejected its latest policy",
-            parent.name
-        )));
+    // An orphaned child is refused too, until it is stopped and deleted.
+    if let Some(parent) = sandbox.parent.as_ref() {
+        if super::sandbox::parent_is_missing(state, &parent.id).await? {
+            return Err(Status::failed_precondition(
+                crate::compute::orphaned_child_message(parent),
+            ));
+        }
+        if super::sandbox::parent_is_blocked(state, &parent.id).await? {
+            return Err(Status::failed_precondition(format!(
+                "parent sandbox '{}' rejected its latest policy",
+                parent.name
+            )));
+        }
     }
 
     let global_policy = decode_policy_from_global_settings(global_settings)?;
@@ -5116,7 +5122,11 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     let message = error.message();
-    if message.starts_with("parent sandbox ") {
+    if message.starts_with("parent sandbox ")
+        && message.ends_with(crate::compute::ORPHANED_CHILD_SUFFIX)
+    {
+        "The parent sandbox no longer exists; delete this child sandbox"
+    } else if message.starts_with("parent sandbox ") {
         "The parent sandbox rejected its latest policy; fix the parent's policy"
     } else if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
