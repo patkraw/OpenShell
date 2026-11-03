@@ -89,6 +89,7 @@ struct SandboxState {
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
     gateway_config_requests: Arc<AtomicUsize>,
     providers: Arc<Mutex<Vec<Provider>>>,
+    provider_create_requests: Arc<AtomicUsize>,
     template_create_requests: Arc<Mutex<Vec<CreateSandboxTemplateRequest>>>,
     template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
     template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
@@ -576,6 +577,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        self.state
+            .provider_create_requests
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(ProviderResponse::default()))
     }
 
@@ -1995,6 +1999,89 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
                 Some("2Gi")
             );
             assert!(!resources.fields.contains_key("requests"));
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn child_create_sends_provider_names_without_creating_providers() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    // Local credentials a root create would turn into a new provider.
+    test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("ANTHROPIC_API_KEY", "sk-test".to_string())],
+    )
+    .run_async(async {
+        let tls = test_tls(&server);
+        install_fake_ssh(&fake_ssh_dir);
+
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("worker"),
+                parent: Some("lead"),
+                providers: &["anthropic".into()],
+                auto_providers_override: Some(true),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        )
+        .await
+        .expect("sandbox create should succeed");
+
+        assert_eq!(
+            server
+                .openshell
+                .state
+                .provider_create_requests
+                .load(Ordering::SeqCst),
+            0
+        );
+        let requests = create_requests(&server).await;
+        assert_eq!(requests[0].parent, "lead");
+        let spec = requests[0].spec.as_ref().unwrap();
+        assert_eq!(spec.providers, vec!["anthropic".to_string()]);
+        assert!(spec.policy.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn child_create_refuses_a_policy_before_sending() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            let error = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("worker"),
+                    parent: Some("lead"),
+                    policy: Some("policy.yaml"),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a child create with a policy should be refused");
+
+            assert_eq!(
+                error.to_string(),
+                "child sandboxes use their parent's policy; omit --policy"
+            );
+            assert!(create_requests(&server).await.is_empty());
         })
         .await;
 }

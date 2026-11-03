@@ -504,6 +504,9 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `Sandbox` carries `SandboxCommands::Create`; see the note there on why
+// boxing one allocation per parse isn't worth it.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -1453,6 +1456,12 @@ enum SandboxCommands {
         /// Create the sandbox from a named sandbox template.
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
+
+        /// Create the sandbox as a child of this root sandbox.
+        /// The child uses the parent's policy, and `--provider` picks from
+        /// the parent's providers (all of them when omitted).
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        parent: Option<String>,
 
         /// Sandbox source: a rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`)
         /// or a container image reference (e.g., `myregistry.com/img:tag`).
@@ -3383,6 +3392,7 @@ async fn run_async() -> Result<()> {
                 SandboxCommands::Create {
                     name,
                     template,
+                    parent,
                     from,
                     upload,
                     no_git_ignore,
@@ -3473,6 +3483,7 @@ async fn run_async() -> Result<()> {
                         run::SandboxCreateConfig {
                             name: name.as_deref(),
                             template: template.as_deref(),
+                            parent: parent.as_deref(),
                             from: from.as_deref(),
                             uploads: &upload_specs,
                             keep,
@@ -6615,6 +6626,34 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(template.as_deref(), Some("gpu-kata"));
+                assert_eq!(providers, vec!["github".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_parent_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--parent",
+            "lead",
+            "--provider",
+            "github",
+        ])
+        .expect("sandbox create parent flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        parent, providers, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(parent.as_deref(), Some("lead"));
                 assert_eq!(providers, vec!["github".to_string()]);
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),

@@ -434,6 +434,7 @@ async fn finalize_sandbox_create_session(
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
     pub template: Option<&'a str>,
+    pub parent: Option<&'a str>,
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
     pub keep: bool,
@@ -465,6 +466,7 @@ impl Default for SandboxCreateConfig<'_> {
         Self {
             name: None,
             template: None,
+            parent: None,
             from: None,
             uploads: &[],
             keep: false,
@@ -504,6 +506,7 @@ pub async fn sandbox_create(
     let SandboxCreateConfig {
         name,
         template,
+        parent,
         from,
         uploads,
         keep,
@@ -547,6 +550,11 @@ pub async fn sandbox_create(
     }
     if expose == Some(0) {
         return Err(miette::miette!("--expose port must be in 1..=65535"));
+    }
+    if parent.is_some() && policy.is_some() {
+        return Err(miette::miette!(
+            "child sandboxes use their parent's policy; omit --policy"
+        ));
     }
 
     // Plan every upload before provisioning so a rejected one leaves no sandbox.
@@ -614,11 +622,23 @@ pub async fn sandbox_create(
             None => (None, None),
         }
     };
-    let configured_providers =
+    // A child's providers must already be on its parent, which the gateway
+    // checks, so `--parent` never creates one from local credentials.
+    let configured_providers = if parent.is_some() {
+        providers.to_vec()
+    } else {
         ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
-            .await?;
+            .await?
+    };
 
-    let policy = load_sandbox_policy(policy)?;
+    let (policy, policy_note) = create_request_policy(
+        parent,
+        policy,
+        std::env::var("OPENSHELL_SANDBOX_POLICY").ok().as_deref(),
+    )?;
+    if let Some(note) = policy_note {
+        eprintln!("{note}");
+    }
     let resource_limits = if template.is_none() {
         build_sandbox_resource_limits(cpu, memory)?
     } else {
@@ -673,7 +693,7 @@ pub async fn sandbox_create(
         );
     }
     let request = CreateSandboxRequest {
-        parent: String::new(),
+        parent: parent.unwrap_or_default().to_string(),
         request_id: String::new(),
         spec: Some(SandboxSpec {
             resource_requirements,
@@ -1529,6 +1549,31 @@ fn merge_rootfs_tar_driver_config(
 /// to apply its own default.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     openshell_policy::load_sandbox_policy(cli_path)
+}
+
+const IGNORED_POLICY_ENV_NOTE: &str =
+    "note: OPENSHELL_SANDBOX_POLICY is ignored; child sandboxes use their parent's policy";
+
+/// The policy a create request sends, from `--policy` or else the
+/// `OPENSHELL_SANDBOX_POLICY` value. A child uses its parent's policy, so with
+/// `--parent` no source is read; the note says so when the variable is set.
+fn create_request_policy(
+    parent: Option<&str>,
+    cli_path: Option<&str>,
+    env_path: Option<&str>,
+) -> Result<(Option<SandboxPolicy>, Option<&'static str>)> {
+    if parent.is_some() {
+        return Ok((None, env_path.map(|_| IGNORED_POLICY_ENV_NOTE)));
+    }
+    let Some(path) = cli_path.or(env_path) else {
+        return Ok((None, None));
+    };
+    Ok((
+        Some(openshell_policy::parse_sandbox_policy_file(Path::new(
+            path,
+        ))?),
+        None,
+    ))
 }
 
 /// Sync files to or from a sandbox.
@@ -7135,6 +7180,24 @@ mod tests {
         service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn a_child_create_ignores_the_policy_env_var_with_a_note() {
+        use super::{IGNORED_POLICY_ENV_NOTE, create_request_policy};
+
+        // The path does not exist, so any attempt to read it fails.
+        let missing = "/nonexistent/openshell-policy.yaml";
+        let (policy, note) = create_request_policy(Some("lead"), None, Some(missing))
+            .expect("a child create never reads the env policy");
+        assert!(policy.is_none());
+        assert_eq!(note, Some(IGNORED_POLICY_ENV_NOTE));
+
+        assert!(create_request_policy(None, None, Some(missing)).is_err());
+        assert_eq!(
+            create_request_policy(Some("lead"), None, None).unwrap().1,
+            None
+        );
+    }
 
     #[test]
     fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {
