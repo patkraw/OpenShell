@@ -918,19 +918,39 @@ async fn parent_policy_copy(
 }
 
 /// Bring every root's children up to the root, for syncs lost while the
-/// gateway was down or published by a replica the child is not on.
+/// gateway was down or published by a replica the child is not on, and stop
+/// every child whose parent record is gone.
 pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
-    let parent_ids: std::collections::BTreeSet<String> = state
+    let mut children_by_parent: std::collections::BTreeMap<String, Vec<Sandbox>> =
+        std::collections::BTreeMap::new();
+    for sandbox in state
         .store
         .collect_messages::<Sandbox>(ObjectListQuery::AllWorkspaces)
         .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-        .iter()
-        .filter_map(|sandbox| sandbox.parent.as_ref().map(|parent| parent.id.clone()))
-        .collect();
+    {
+        if let Some(parent_id) = sandbox.parent.as_ref().map(|parent| parent.id.clone()) {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(sandbox);
+        }
+    }
     let mut failed = 0_usize;
-    for parent_id in parent_ids {
-        if let Err(error) = sync_children(state, &parent_id).await {
+    for (parent_id, children) in children_by_parent {
+        // Only a parent read as not found makes orphans: a store error means
+        // the scan cannot tell, so it leaves these children alone.
+        let result = match parent_is_missing(state, &parent_id).await {
+            Ok(true) => {
+                for child in &children {
+                    stop_orphaned_child(state, child).await;
+                }
+                Ok(())
+            }
+            Ok(false) => sync_children(state, &parent_id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             warn!(parent_id, error = %error, "failed to sync child sandboxes");
             failed += 1;
         }
@@ -943,12 +963,91 @@ pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
     Ok(())
 }
 
+/// Whether a child's parent record is gone. Read by id, so a root created
+/// later under the same name is never taken for it. A store error is
+/// returned, never taken as missing.
+pub(super) async fn parent_is_missing(
+    state: &ServerState,
+    parent_id: &str,
+) -> Result<bool, Status> {
+    Ok(state
+        .store
+        .get_message::<Sandbox>(parent_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .is_none())
+}
+
+/// Stop a child whose parent record is gone. Delivery already refuses it
+/// configuration, which ends new egress; stopping it ends the connections
+/// its supervisor still holds open. Its record and files are kept for
+/// inspection and deletion, and it cannot be started again.
+pub async fn stop_orphaned_child(state: &Arc<ServerState>, child: &Sandbox) {
+    let child_id = child.object_id();
+    // Stop works by name: skip if the orphan was deleted and the name reused.
+    let current = state
+        .store
+        .get_message_by_name::<Sandbox>(child.object_workspace(), child.object_name())
+        .await;
+    if !matches!(&current, Ok(Some(sandbox)) if sandbox.object_id() == child_id) {
+        warn!(
+            child_id,
+            "not stopping orphaned child sandbox: its record is gone, replaced or unreadable"
+        );
+        return;
+    }
+    match state
+        .compute
+        .stop_sandbox(child.object_workspace(), child.object_name())
+        .await
+    {
+        Ok(_) => warn!(
+            child_id,
+            parent_id = child
+                .parent
+                .as_ref()
+                .map_or("", |parent| parent.id.as_str()),
+            "stopped child sandbox whose parent no longer exists"
+        ),
+        Err(error) => warn!(
+            child_id,
+            error = %error,
+            "failed to stop child sandbox whose parent no longer exists"
+        ),
+    }
+}
+
+/// Refuse to start or resume a child whose parent record is gone. A parent
+/// is never recreated under the same id, so no lock is needed.
+async fn refuse_orphaned_child(state: &ServerState, sandbox: &Sandbox) -> Result<(), Status> {
+    if let Some(parent) = sandbox.parent.as_ref()
+        && parent_is_missing(state, &parent.id).await?
+    {
+        return Err(Status::failed_precondition(
+            crate::compute::orphaned_child_message(parent),
+        ));
+    }
+    Ok(())
+}
+
+/// What a connecting child's sync found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChildSync {
+    /// Not a child, or brought up to its parent.
+    Done,
+    /// The parent record is gone; the caller stops the child.
+    Orphaned,
+}
+
 /// Bring one child up to its parent, for a child that may have missed a
 /// sync. The child-sandbox lock set includes the parent, so the parent is
 /// read and the child written under one guard.
-pub async fn sync_one_child(state: &Arc<ServerState>, child: &Sandbox) -> Result<(), Status> {
+pub async fn sync_one_child(
+    state: &Arc<ServerState>,
+    child: &Sandbox,
+) -> Result<ChildSync, Status> {
     let Some(parent) = child.parent.as_ref() else {
-        return Ok(());
+        return Ok(ChildSync::Done);
     };
     let workspace = child.object_workspace();
     let _guard = state
@@ -960,6 +1059,9 @@ pub async fn sync_one_child(state: &Arc<ServerState>, child: &Sandbox) -> Result
         })
         .await
         .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
+    if parent_is_missing(state, &parent.id).await? {
+        return Ok(ChildSync::Orphaned);
+    }
     let copy = parent_policy_copy(state, &parent.id).await?;
     sync_child_locked(
         state,
@@ -968,7 +1070,8 @@ pub async fn sync_one_child(state: &Arc<ServerState>, child: &Sandbox) -> Result
         child.object_id(),
         copy.as_ref(),
     )
-    .await
+    .await?;
+    Ok(ChildSync::Done)
 }
 
 /// Bring one child up to its parent. Takes the same lock set as a provider
@@ -2556,6 +2659,7 @@ async fn handle_start_sandbox_inner(
         MinWorkspaceRole::User,
     )
     .await?;
+    refuse_orphaned_child(state, &resolved).await?;
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -2652,6 +2756,7 @@ async fn handle_resume_sandbox_inner(
         MinWorkspaceRole::User,
     )
     .await?;
+    refuse_orphaned_child(state, &resolved).await?;
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -8291,6 +8396,129 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(response.detached);
+    }
+
+    /// A root `lead` with a child `worker1` whose `lead` record is then
+    /// removed, as a downgraded gateway or a stalled delete can leave it.
+    /// Returns both ids.
+    async fn orphaned_child(state: &Arc<ServerState>) -> (String, String) {
+        let (lead_id, worker_id) = lead_with_copied_child(state).await;
+        state
+            .store
+            .delete(Sandbox::object_type(), &lead_id)
+            .await
+            .unwrap();
+        (lead_id, worker_id)
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_child_is_refused_configuration() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = orphaned_child(&state).await;
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(!config.configuration_admitted);
+        assert!(
+            config
+                .configuration_error
+                .contains("parent sandbox no longer exists"),
+            "{}",
+            config.configuration_error
+        );
+        assert_eq!(config.policy_validation_failure_mode, "fail_closed");
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_child_cannot_be_started_or_resumed() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, _) = orphaned_child(&state).await;
+
+        let start = handle_start_sandbox(
+            &state,
+            authed_request(StartSandboxRequest {
+                request_id: String::new(),
+                name: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        let resume = handle_resume_sandbox(
+            &state,
+            authed_request(ResumeSandboxRequest {
+                name: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        for err in [start, resume] {
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                err.message().contains(&lead_id)
+                    && err.message().contains("delete this child sandbox"),
+                "{}",
+                err.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_startup_scan_stops_an_orphaned_child_and_keeps_it() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = orphaned_child(&state).await;
+        let mut running = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        running.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&running).await.unwrap();
+
+        sync_all_children(&state).await.unwrap();
+
+        let worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .expect("the orphan's record is kept");
+        assert_eq!(
+            SandboxPhase::try_from(worker.phase()).unwrap(),
+            SandboxPhase::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_root_under_the_old_name_does_not_adopt_an_orphan() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = orphaned_child(&state).await;
+        let before = latest_policy(&state, &worker_id).await;
+        let new_lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_policy_revision_with_status(&state, &new_lead_id, 2, &lead_policy(false), "loaded")
+            .await;
+        let worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            sync_one_child(&state, &worker).await.unwrap(),
+            ChildSync::Orphaned
+        );
+        sync_all_children(&state).await.unwrap();
+
+        let after = latest_policy(&state, &worker_id).await;
+        assert_eq!(after.version, before.version, "nothing is copied");
+        assert!(
+            !child_config(&state, &worker_id)
+                .await
+                .configuration_admitted
+        );
     }
 
     #[tokio::test]
