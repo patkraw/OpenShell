@@ -9713,6 +9713,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sandbox_caller_reads_only_its_own_childs_own_lines() {
+        use openshell_core::proto::{GetSandboxLogsRequest, SandboxLogLine};
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        let mut child_id = String::new();
+        for (name, parent, id) in [("mine", "lead", &lead_id), ("theirs", "other", &other_id)] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            let id = put_parent_record(&state, name, &[], Some(link), false).await;
+            if name == "mine" {
+                child_id = id;
+            }
+        }
+        let logs = |name: &str, lines: u32| GetSandboxLogsRequest {
+            sandbox: name.to_string(),
+            lines,
+            ..Default::default()
+        };
+
+        for name in ["theirs", "other", "lead", "missing"] {
+            let err = crate::grpc::policy::handle_get_sandbox_logs(
+                &state,
+                sandbox_request(&lead_id, logs(name, 10)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::NotFound, "{name}");
+        }
+        for (request, field) in [
+            (
+                GetSandboxLogsRequest {
+                    sources: vec!["gateway".to_string()],
+                    ..logs("mine", 10)
+                },
+                "sources",
+            ),
+            (
+                GetSandboxLogsRequest {
+                    min_level: "ERROR".to_string(),
+                    ..logs("mine", 10)
+                },
+                "min_level",
+            ),
+        ] {
+            let err = crate::grpc::policy::handle_get_sandbox_logs(
+                &state,
+                sandbox_request(&lead_id, request),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
+
+        // The child is not ready; its newest sandbox lines still come back,
+        // counted after the gateway lines between them are dropped.
+        for i in 0..6 {
+            for source in ["sandbox", "gateway"] {
+                state.tracing_log_bus.publish_external(SandboxLogLine {
+                    sandbox_id: child_id.clone(),
+                    level: "INFO".to_string(),
+                    message: format!("{source} {i}"),
+                    source: source.to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        let reply = crate::grpc::policy::handle_get_sandbox_logs(
+            &state,
+            sandbox_request(&lead_id, logs("mine", 4)),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let messages: Vec<_> = reply.logs.iter().map(|log| log.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["sandbox 2", "sandbox 3", "sandbox 4", "sandbox 5"]
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_create_retry_returns_the_child_even_at_the_limit() {
         let state = child_sandboxes_state_with_limit(1).await;
         let lead_id = member_root(&state, "lead", &[]).await;
