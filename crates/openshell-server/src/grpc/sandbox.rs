@@ -277,6 +277,72 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     Ok(sandbox)
 }
 
+/// Resolve `name` for a sandbox caller (only through `/mcp`): one of its own
+/// children, in its own workspace. Everything else, the caller itself
+/// included, reads as missing.
+pub(super) async fn resolve_caller_child(
+    state: &ServerState,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    name: &str,
+) -> Result<Sandbox, Status> {
+    let not_found = || Status::not_found(format!("sandbox '{name}' not found"));
+    let caller = state
+        .store
+        .get_message::<Sandbox>(&caller.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(not_found)?;
+    let child = state
+        .store
+        .get_message_by_name::<Sandbox>(caller.object_workspace(), name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(not_found)?;
+    if child
+        .parent
+        .as_ref()
+        .is_some_and(|parent| parent.id == caller.object_id())
+    {
+        Ok(child)
+    } else {
+        Err(not_found())
+    }
+}
+
+/// A sandbox caller's exec may set only the target, command, working
+/// directory, stdin and timeout.
+fn refuse_exec_fields_for_sandbox_caller(request: &ExecSandboxRequest) -> Result<(), Status> {
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("environment", !request.environment.is_empty()),
+        ("tty", request.tty),
+        ("cols", request.cols != 0),
+        ("rows", request.rows != 0),
+        ("no_login_shell", request.no_login_shell),
+        ("request_id", !request.request_id.is_empty()),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    let allowed = ExecSandboxRequest {
+        sandbox: request.sandbox.clone(),
+        command: request.command.clone(),
+        workdir: request.workdir.clone(),
+        stdin: request.stdin.clone(),
+        execution_timeout: request.execution_timeout,
+        ..Default::default()
+    };
+    if *request == allowed {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ))
+    }
+}
+
 fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
     match SandboxPhase::try_from(sandbox.phase()).ok() {
         Some(SandboxPhase::Ready) => Ok(()),
@@ -3781,14 +3847,21 @@ pub(super) async fn handle_exec_sandbox(
     let req = request.into_inner();
     validate_exec_start(&req)?;
 
-    let sandbox = resolve_and_authorize_sandbox_name(
-        state,
-        &principal,
-        &req.sandbox,
-        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    // Only `/mcp` lets a sandbox caller reach this method, and it may act on
+    // its own children only, never on itself.
+    let sandbox = if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+        refuse_exec_fields_for_sandbox_caller(&req)?;
+        resolve_caller_child(state, caller, &req.sandbox).await?
+    } else {
+        resolve_and_authorize_sandbox_name(
+            state,
+            &principal,
+            &req.sandbox,
+            crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+            MinWorkspaceRole::User,
+        )
+        .await?
+    };
 
     if let Some(completion) = &completion {
         completion.ensure_target(sandbox.object_id())?;
@@ -9349,6 +9422,80 @@ mod tests {
             err.message(),
             "only root sandboxes can create child sandboxes"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_execs_only_in_its_own_children() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        for (name, parent, id) in [("mine", "lead", &lead_id), ("theirs", "other", &other_id)] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            put_parent_record(&state, name, &[], Some(link), false).await;
+        }
+        let exec = |name: &str| ExecSandboxRequest {
+            sandbox: name.to_string(),
+            command: vec!["ls".to_string()],
+            ..Default::default()
+        };
+
+        for name in ["theirs", "other", "lead", "missing"] {
+            let err = handle_exec_sandbox(&state, sandbox_request(&lead_id, exec(name)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::NotFound, "{name}");
+            assert_eq!(err.message(), format!("sandbox '{name}' not found"));
+        }
+
+        // Its own child is found; this one is not ready yet.
+        let err = handle_exec_sandbox(&state, sandbox_request(&lead_id, exec("mine")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.message(), "sandbox is not ready");
+
+        for (request, field) in [
+            (
+                ExecSandboxRequest {
+                    environment: HashMap::from([("A".to_string(), "b".to_string())]),
+                    ..exec("mine")
+                },
+                "environment",
+            ),
+            (
+                ExecSandboxRequest {
+                    tty: true,
+                    ..exec("mine")
+                },
+                "tty",
+            ),
+            (
+                ExecSandboxRequest {
+                    cols: 80,
+                    ..exec("mine")
+                },
+                "cols",
+            ),
+            (
+                ExecSandboxRequest {
+                    rows: 24,
+                    ..exec("mine")
+                },
+                "rows",
+            ),
+        ] {
+            let err = handle_exec_sandbox(&state, sandbox_request(&lead_id, request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
     }
 
     #[tokio::test]
