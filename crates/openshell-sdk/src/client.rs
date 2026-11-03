@@ -340,6 +340,7 @@ impl OpenShellClient {
                             page_size: opts.page_size,
                             page_token,
                             label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            parent: String::new(),
                             workspace_scope: Some(proto::workspace_selector("default")),
                         };
                         async move { grpc.list_sandboxes(request).await }
@@ -530,6 +531,7 @@ impl OpenShellClient {
                             page_size: opts.page_size,
                             page_token,
                             label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            parent: String::new(),
                             workspace_scope: Some(proto::all_workspaces_selector()),
                         };
                         async move { grpc.list_sandboxes(request).await }
@@ -1155,6 +1157,7 @@ impl WorkspaceScopedClient {
                             page_size: opts.page_size,
                             page_token,
                             label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            parent: String::new(),
                             workspace_scope: Some(proto::workspace_selector(&workspace)),
                         };
                         async move { grpc.list_sandboxes(request).await }

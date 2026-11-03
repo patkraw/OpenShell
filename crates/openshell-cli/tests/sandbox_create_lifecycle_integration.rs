@@ -90,6 +90,8 @@ struct SandboxState {
     gateway_config_requests: Arc<AtomicUsize>,
     providers: Arc<Mutex<Vec<Provider>>>,
     provider_create_requests: Arc<AtomicUsize>,
+    list_requests: Arc<Mutex<Vec<ListSandboxesRequest>>>,
+    list_response: Arc<Mutex<Vec<Sandbox>>>,
     template_create_requests: Arc<Mutex<Vec<CreateSandboxTemplateRequest>>>,
     template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
     template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
@@ -295,9 +297,17 @@ impl OpenShell for TestOpenShell {
 
     async fn list_sandboxes(
         &self,
-        _request: tonic::Request<ListSandboxesRequest>,
+        request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Ok(Response::new(ListSandboxesResponse::default()))
+        self.state
+            .list_requests
+            .lock()
+            .await
+            .push(request.into_inner());
+        Ok(Response::new(ListSandboxesResponse {
+            sandboxes: self.state.list_response.lock().await.clone(),
+            next_page_token: String::new(),
+        }))
     }
 
     async fn create_sandbox_template(
@@ -4363,4 +4373,52 @@ async fn rejected_suspend_preserves_active_forwards() {
             forward.kill().await.unwrap();
         })
         .await;
+}
+
+fn listed_child(name: &str, parent: &str, parent_id: &str) -> Sandbox {
+    Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        parent: Some(openshell_core::proto::SandboxParent {
+            name: parent.to_string(),
+            id: parent_id.to_string(),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn sandbox_list_sends_the_parent_filter_and_labels_children() {
+    let server = run_server().await;
+    // The mock answers GetSandbox("lead") with id "id-lead", so worker1's
+    // parent is live and worker2's ("gone-id") was deleted.
+    *server.openshell.state.list_response.lock().await = vec![
+        listed_child("worker1", "lead", "id-lead"),
+        listed_child("worker2", "lead", "gone-id"),
+    ];
+    let tls = test_tls(&server);
+
+    run::sandbox_list(
+        &server.endpoint,
+        100,
+        "",
+        false,
+        false,
+        None,
+        Some("lead"),
+        "table",
+        "default",
+        false,
+        &tls,
+    )
+    .await
+    .expect("sandbox list should succeed");
+
+    let requests = server.openshell.state.list_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parent, "lead");
 }

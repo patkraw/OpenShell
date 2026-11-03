@@ -2905,6 +2905,7 @@ pub async fn sandbox_list(
     ids_only: bool,
     names_only: bool,
     label_selector: Option<&str>,
+    parent: Option<&str>,
     output: &str,
     workspace: &str,
     all_workspaces: bool,
@@ -2917,6 +2918,7 @@ pub async fn sandbox_list(
             page_size,
             page_token: page_token.to_string(),
             label_selector: label_selector.unwrap_or("").to_string(),
+            parent: parent.unwrap_or_default().to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
             } else {
@@ -2985,26 +2987,53 @@ pub async fn sandbox_list(
         0
     };
 
-    // Print header
-    if all_workspaces {
-        println!(
-            "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}",
-            "WORKSPACE".bold(),
-            "NAME".bold(),
-            "CREATED".bold(),
-            "PHASE".bold(),
-        );
+    // A PARENT column only when the page holds a child, so lists without
+    // children look as before.
+    let parent_labels = if sandboxes.iter().any(|s| s.parent.is_some()) {
+        Some(parent_column_labels(&mut client, &sandboxes).await)
     } else {
-        println!(
-            "{:<name_width$}  {:<created_width$}  {}",
-            "NAME".bold(),
-            "CREATED".bold(),
-            "PHASE".bold(),
-        );
-    }
+        None
+    };
+    let parent_cell = |sandbox: &Sandbox| -> String {
+        sandbox.parent.as_ref().map_or_else(
+            || "-".to_string(),
+            |parent| {
+                parent_labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(&parent.id).cloned())
+                    .unwrap_or_else(|| parent.name.clone())
+            },
+        )
+    };
+    let parent_width = parent_labels.as_ref().map_or(0, |_| {
+        sandboxes
+            .iter()
+            .map(|s| parent_cell(s).len())
+            .max()
+            .unwrap_or(6)
+            .max(6)
+    });
+
+    // Print header
+    let ws_header = if all_workspaces {
+        format!("{:<ws_width$}  ", "WORKSPACE".bold())
+    } else {
+        String::new()
+    };
+    let parent_header = if parent_labels.is_some() {
+        format!("{:<parent_width$}  ", "PARENT".bold())
+    } else {
+        String::new()
+    };
+    println!(
+        "{ws_header}{:<name_width$}  {parent_header}{:<created_width$}  {}",
+        "NAME".bold(),
+        "CREATED".bold(),
+        "PHASE".bold(),
+    );
 
     // Print rows
-    for sandbox in sandboxes {
+    for sandbox in &sandboxes {
         let phase = phase_name(sandbox.phase());
         let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
             Ok(SandboxPhase::Ready | SandboxPhase::Completed) => phase.green().to_string(),
@@ -3027,22 +3056,22 @@ pub async fn sandbox_list(
                 .as_ref()
                 .map_or(0, |m| proto_timestamp_ms(m.created_time.as_ref())),
         );
-        if all_workspaces {
-            println!(
-                "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}",
-                sandbox.object_workspace().to_string(),
-                sandbox.object_name().to_string(),
-                created,
-                phase_colored,
-            );
+        let ws_cell = if all_workspaces {
+            format!("{:<ws_width$}  ", sandbox.object_workspace())
         } else {
-            println!(
-                "{:<name_width$}  {:<created_width$}  {}",
-                sandbox.object_name().to_string(),
-                created,
-                phase_colored,
-            );
-        }
+            String::new()
+        };
+        let parent_cell = if parent_labels.is_some() {
+            format!("{:<parent_width$}  ", parent_cell(sandbox))
+        } else {
+            String::new()
+        };
+        println!(
+            "{ws_cell}{:<name_width$}  {parent_cell}{:<created_width$}  {}",
+            sandbox.object_name(),
+            created,
+            phase_colored,
+        );
     }
 
     Ok(())
@@ -3172,7 +3201,64 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "configuration_admission": admission,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
+        "parent": sandbox.parent.as_ref().map(|parent| serde_json::json!({
+            "name": parent.name,
+            "id": parent.id,
+        })),
     })
+}
+
+/// The PARENT column for one parent id, given the sandbox currently holding
+/// the parent's name, or the error from looking it up. Only "not found" or a
+/// different id means the parent was deleted; any other error keeps the
+/// recorded name.
+fn parent_column_label(
+    parent: &openshell_core::proto::SandboxParent,
+    lookup: Result<Option<&str>, Code>,
+) -> String {
+    match lookup {
+        Ok(Some(id)) if id == parent.id => parent.name.clone(),
+        Ok(_) | Err(Code::NotFound) => format!("deleted ({})", parent.id),
+        Err(_) => parent.name.clone(),
+    }
+}
+
+/// PARENT column labels by parent id. A parent listed in the same response
+/// needs no lookup; any other is looked up once by name.
+async fn parent_column_labels(
+    client: &mut crate::tls::GrpcClient,
+    sandboxes: &[Sandbox],
+) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    for sandbox in sandboxes {
+        let Some(parent) = sandbox.parent.as_ref() else {
+            continue;
+        };
+        if labels.contains_key(&parent.id) {
+            continue;
+        }
+        let label = if sandboxes.iter().any(|s| s.object_id() == parent.id) {
+            parent.name.clone()
+        } else {
+            let lookup = client
+                .get_sandbox(GetSandboxRequest {
+                    name: parent.name.clone(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        sandbox.object_workspace(),
+                    )),
+                })
+                .await;
+            match lookup {
+                Ok(response) => {
+                    let current = response.into_inner().sandbox;
+                    parent_column_label(parent, Ok(current.as_ref().map(ObjectId::object_id)))
+                }
+                Err(status) => parent_column_label(parent, Err(status.code())),
+            }
+        };
+        labels.insert(parent.id.clone(), label);
+    }
+    labels
 }
 
 fn sandbox_condition_to_json(condition: &SandboxCondition) -> serde_json::Value {
@@ -4051,6 +4137,7 @@ pub async fn sandbox_delete(
                     page_size: 1000,
                     page_token,
                     label_selector: String::new(),
+                    parent: String::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
                 })
                 .await
@@ -7180,6 +7267,51 @@ mod tests {
         service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn the_parent_column_shows_deleted_only_when_the_parent_is_gone() {
+        use super::parent_column_label;
+        use tonic::Code;
+
+        let parent = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: "lead-id".to_string(),
+        };
+        assert_eq!(parent_column_label(&parent, Ok(Some("lead-id"))), "lead");
+        // A new root under the old name is not this child's parent.
+        assert_eq!(
+            parent_column_label(&parent, Ok(Some("new-id"))),
+            "deleted (lead-id)"
+        );
+        assert_eq!(
+            parent_column_label(&parent, Err(Code::NotFound)),
+            "deleted (lead-id)"
+        );
+        assert_eq!(parent_column_label(&parent, Err(Code::Unavailable)), "lead");
+        assert_eq!(
+            parent_column_label(&parent, Err(Code::PermissionDenied)),
+            "lead"
+        );
+    }
+
+    #[test]
+    fn sandbox_json_includes_the_parent() {
+        use openshell_core::proto::{Sandbox, SandboxParent};
+
+        let root = Sandbox::default();
+        assert!(super::sandbox_to_json(&root)["parent"].is_null());
+
+        let child = Sandbox {
+            parent: Some(SandboxParent {
+                name: "lead".to_string(),
+                id: "lead-id".to_string(),
+            }),
+            ..Default::default()
+        };
+        let json = super::sandbox_to_json(&child);
+        assert_eq!(json["parent"]["name"], "lead");
+        assert_eq!(json["parent"]["id"], "lead-id");
+    }
 
     #[test]
     fn a_child_create_ignores_the_policy_env_var_with_a_note() {

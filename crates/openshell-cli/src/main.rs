@@ -1686,6 +1686,10 @@ enum SandboxCommands {
         #[arg(long)]
         selector: Option<String>,
 
+        /// List only the child sandboxes of this root sandbox.
+        #[arg(long, conflicts_with = "all_workspaces", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        parent: Option<String>,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["ids", "names"])]
         output: OutputFormat,
@@ -3592,6 +3596,7 @@ async fn run_async() -> Result<()> {
                             ids,
                             names,
                             selector,
+                            parent,
                             output,
                             all_workspaces,
                         } => {
@@ -3602,6 +3607,7 @@ async fn run_async() -> Result<()> {
                                 ids,
                                 names,
                                 selector.as_deref(),
+                                parent.as_deref(),
                                 output.as_str(),
                                 &cli.workspace,
                                 all_workspaces,
@@ -6630,6 +6636,29 @@ mod tests {
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_list_parent_flag_parses_and_needs_one_workspace() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "--parent", "lead"])
+            .expect("sandbox list parent flag should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List { parent: Some(ref parent), .. }),
+            }) if parent == "lead"
+        ));
+
+        let err = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "list",
+            "--parent",
+            "lead",
+            "--all-workspaces",
+        ])
+        .expect_err("--parent needs a single workspace");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
