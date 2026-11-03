@@ -4601,6 +4601,9 @@ type ListSandboxesRequest struct {
 	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Optional label selector for filtering (format: "key1=value1,key2=value2").
 	LabelSelector string `protobuf:"bytes,3,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
+	// Optional name of a root sandbox; lists only its children. Needs a named
+	// workspace scope. A child of a deleted root of the same name is not listed.
+	Parent        string `protobuf:"bytes,5,opt,name=parent,proto3" json:"parent,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4659,6 +4662,13 @@ func (x *ListSandboxesRequest) GetPageToken() string {
 func (x *ListSandboxesRequest) GetLabelSelector() string {
 	if x != nil {
 		return x.LabelSelector
+	}
+	return ""
+}
+
+func (x *ListSandboxesRequest) GetParent() string {
+	if x != nil {
+		return x.Parent
 	}
 	return ""
 }
@@ -20092,13 +20102,14 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fexpiration_time\x18h \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\x04\x10\x05R\rexpires_at_ms\"{\n" +
 	"\x11GetSandboxRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x02 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"\xcd\x01\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"\xe5\x01\n" +
 	"\x14ListSandboxesRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
-	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\"\xc7\x01\n" +
+	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\x12\x16\n" +
+	"\x06parent\x18\x05 \x01(\tR\x06parent\"\xc7\x01\n" +
 	"\x1bListSandboxProvidersRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x02 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1b\n" +
