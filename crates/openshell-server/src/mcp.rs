@@ -22,7 +22,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use openshell_core::ObjectName;
 use openshell_core::proto::open_shell_client::OpenShellClient;
-use openshell_core::proto::{ListSandboxesRequest, Sandbox, SandboxPhase};
+use openshell_core::proto::{
+    CreateSandboxRequest, ListSandboxesRequest, Sandbox, SandboxPhase, SandboxSpec,
+};
 use serde_json::{Value, json};
 use tower::util::BoxCloneSyncService;
 use tracing::warn;
@@ -62,6 +64,26 @@ pub fn is_sandbox_tool_method(path: &str) -> bool {
 pub struct McpConnection {
     auth: CallerAuthenticator,
     grpc: GrpcStack,
+    create_wait: CreateWait,
+}
+
+/// How long `create_sandbox` waits for a child to become ready, and how often
+/// it looks.
+#[derive(Clone, Copy)]
+struct CreateWait {
+    limit: std::time::Duration,
+    first_poll: std::time::Duration,
+    poll: std::time::Duration,
+}
+
+impl Default for CreateWait {
+    fn default() -> Self {
+        Self {
+            limit: std::time::Duration::from_secs(45),
+            first_poll: std::time::Duration::from_secs(1),
+            poll: std::time::Duration::from_secs(2),
+        }
+    }
 }
 
 impl McpConnection {
@@ -81,7 +103,19 @@ impl McpConnection {
         Self {
             auth,
             grpc: BoxCloneSyncService::new(grpc.map_err(Into::into)),
+            create_wait: CreateWait::default(),
         }
+    }
+
+    /// Shorten the create wait so tests need not sleep for real.
+    #[cfg(test)]
+    pub fn with_short_create_wait(mut self) -> Self {
+        self.create_wait = CreateWait {
+            limit: std::time::Duration::from_millis(50),
+            first_poll: std::time::Duration::from_millis(5),
+            poll: std::time::Duration::from_millis(10),
+        };
+        self
     }
 }
 
@@ -169,8 +203,12 @@ async fn handle(
             if !TOOLS.iter().any(|tool| tool.name == name) {
                 return rpc_error(&id, -32602, &format!("unknown tool '{name}'"));
             }
+            let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
             let result = match name {
-                "list" => list_children(&connection, &headers).await,
+                "create_sandbox" => create_child(&connection, &headers, &arguments).await,
+                "list" => caller_children(&connection, &headers)
+                    .await
+                    .map(|children| json!({"sandboxes": children.iter().map(child_summary).collect::<Vec<_>>()})),
                 _ => Err(ToolError::not_available(name)),
             };
             let origin = RequestOrigin::new(connection.auth.connection_source(), &headers);
@@ -222,20 +260,199 @@ fn tool_definitions() -> Vec<Value> {
     TOOLS
         .iter()
         .map(|tool| {
-            json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": {"type": "object"},
-            })
+            let schema = match tool.name {
+                "create_sandbox" => json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Name of the child sandbox."},
+                        "template": {"type": "string", "description": "Optional sandbox template made available to agents."},
+                        "providers": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of this sandbox's providers; all of them when omitted."},
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false,
+                }),
+                _ => json!({"type": "object"}),
+            };
+            json!({"name": tool.name, "description": tool.description, "inputSchema": schema})
         })
         .collect()
 }
 
-/// Every child of the calling sandbox, following page tokens to the end.
-async fn list_children(
+/// `create_sandbox` arguments a user may send but a sandbox may not.
+const USER_ONLY_CREATE_ARGUMENTS: [&str; 8] = [
+    "image", "cpu", "memory", "env", "labels", "command", "policy", "parent",
+];
+
+struct CreateArgs {
+    name: String,
+    template: String,
+    providers: Vec<String>,
+}
+
+fn parse_create_args(arguments: &Value) -> Result<CreateArgs, ToolError> {
+    let empty = serde_json::Map::new();
+    let args = match arguments {
+        Value::Null => &empty,
+        Value::Object(args) => args,
+        _ => return Err(ToolError::invalid("arguments must be an object")),
+    };
+    for key in args.keys() {
+        if USER_ONLY_CREATE_ARGUMENTS.contains(&key.as_str()) {
+            return Err(ToolError::invalid(&format!(
+                "'{key}' is only available to users"
+            )));
+        }
+        if !["name", "template", "providers"].contains(&key.as_str()) {
+            return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
+        }
+    }
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ToolError::invalid("'name' is required"))?;
+    let template = match args.get("template") {
+        None => "",
+        Some(Value::String(template)) => template,
+        Some(_) => return Err(ToolError::invalid("'template' must be a string")),
+    };
+    let providers = match args.get("providers") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ToolError::invalid("'providers' must be a list of names"))?,
+        Some(_) => return Err(ToolError::invalid("'providers' must be a list of names")),
+    };
+    Ok(CreateArgs {
+        name: name.to_string(),
+        template: template.to_string(),
+        providers,
+    })
+}
+
+/// Create a child, or return the caller's existing child of that name, then
+/// wait for it. The name is looked up first so a retry still works when the
+/// parent is at its child limit.
+async fn create_child(
     connection: &McpConnection,
     headers: &HeaderMap,
+    arguments: &Value,
 ) -> Result<Value, ToolError> {
+    let args = parse_create_args(arguments)?;
+    if find_child(connection, headers, &args.name).await?.is_some() {
+        return wait_until_ready(connection, headers, &args.name, true).await;
+    }
+    let request = CreateSandboxRequest {
+        name: args.name.clone(),
+        workload_template: args.template,
+        spec: Some(SandboxSpec {
+            providers: args.providers,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut client = OpenShellClient::new(connection.grpc.clone());
+    let call: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.create_sandbox(mcp_request(request, headers)));
+    match call.await {
+        Ok(_) => wait_until_ready(connection, headers, &args.name, false).await,
+        // A create racing the lookup above.
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {
+            if find_child(connection, headers, &args.name).await?.is_some() {
+                wait_until_ready(connection, headers, &args.name, true).await
+            } else {
+                Err(ToolError::Refused(Refusal {
+                    code: "already_exists",
+                    message: format!(
+                        "a sandbox named '{}' already exists in this workspace",
+                        args.name
+                    ),
+                    retryable: false,
+                }))
+            }
+        }
+        Err(status) => Err(ToolError::from_status(status)),
+    }
+}
+
+/// Poll the caller's children until `name` is ready or failed, for at most
+/// the create wait. Still provisioning at the end is not an error.
+async fn wait_until_ready(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    name: &str,
+    already_existed: bool,
+) -> Result<Value, ToolError> {
+    let wait = connection.create_wait;
+    let deadline = tokio::time::Instant::now() + wait.limit;
+    let mut pause = wait.first_poll;
+    loop {
+        let Some(child) = find_child(connection, headers, name).await? else {
+            return Err(ToolError::Refused(Refusal {
+                code: "not_found",
+                message: format!("sandbox '{name}' not found"),
+                retryable: false,
+            }));
+        };
+        let mut reply = child_summary(&child);
+        reply["already_existed"] = json!(already_existed);
+        match SandboxPhase::try_from(child.phase()).unwrap_or(SandboxPhase::Unknown) {
+            SandboxPhase::Ready => return Ok(reply),
+            SandboxPhase::Error => {
+                return Err(ToolError::Refused(Refusal {
+                    code: "failed_precondition",
+                    message: format!("child sandbox '{name}' failed: {}", failure_message(&child)),
+                    retryable: false,
+                }));
+            }
+            _ => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            reply["ready"] = json!(false);
+            reply["timed_out"] = json!(true);
+            reply["message"] =
+                json!("call create_sandbox again with the same name to keep waiting");
+            return Ok(reply);
+        }
+        tokio::time::sleep(pause.min(deadline - now)).await;
+        pause = wait.poll;
+    }
+}
+
+fn failure_message(sandbox: &Sandbox) -> String {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| {
+            status
+                .conditions
+                .iter()
+                .find(|condition| condition.r#type == "Ready")
+        })
+        .map(|condition| condition.message.clone())
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| "no reason was recorded".to_string())
+}
+
+async fn find_child(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<Option<Sandbox>, ToolError> {
+    Ok(caller_children(connection, headers)
+        .await?
+        .into_iter()
+        .find(|child| child.object_name() == name))
+}
+
+/// Every child of the calling sandbox, following page tokens to the end.
+async fn caller_children(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+) -> Result<Vec<Sandbox>, ToolError> {
     let mut client = OpenShellClient::new(connection.grpc.clone());
     let mut children = Vec::new();
     let mut page_token = String::new();
@@ -250,13 +467,13 @@ async fn list_children(
         let call: futures::future::BoxFuture<'_, _> =
             Box::pin(client.list_sandboxes(mcp_request(request, headers)));
         let page = call.await.map_err(ToolError::from_status)?.into_inner();
-        children.extend(page.sandboxes.iter().map(child_summary));
+        children.extend(page.sandboxes);
         if page.next_page_token.is_empty() {
             break;
         }
         page_token = page.next_page_token;
     }
-    Ok(json!({"sandboxes": children}))
+    Ok(children)
 }
 
 fn child_summary(sandbox: &Sandbox) -> Value {
@@ -308,6 +525,14 @@ impl Refusal {
 }
 
 impl ToolError {
+    fn invalid(message: &str) -> Self {
+        Self::Refused(Refusal {
+            code: "invalid_argument",
+            message: message.to_string(),
+            retryable: false,
+        })
+    }
+
     fn not_available(name: &str) -> Self {
         Self::Refused(Refusal {
             code: "not_available",
@@ -560,6 +785,36 @@ mod tests {
         assert_eq!(event["status_detail"], "not_available");
         assert!(!event.to_string().contains("canary-secret-token"));
         openshell_ocsf_validate::validate_event(event).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_refuses_user_only_and_unknown_arguments() {
+        for (arguments, message) in [
+            (
+                json!({"name": "w", "image": "x"}),
+                "'image' is only available to users",
+            ),
+            (
+                json!({"name": "w", "parent": "x"}),
+                "'parent' is only available to users",
+            ),
+            (json!({"name": "w", "size": 3}), "unknown argument 'size'"),
+            (json!({}), "'name' is required"),
+        ] {
+            let (_, reply) = post_mcp(
+                connection(Some(sandbox_principal("lead"))),
+                &[],
+                rpc(
+                    "tools/call",
+                    json!({"name": "create_sandbox", "arguments": arguments}),
+                ),
+            )
+            .await;
+            let result = &reply.unwrap()["result"];
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["error"], "invalid_argument");
+            assert_eq!(result["structuredContent"]["message"], message);
+        }
     }
 
     #[test]
