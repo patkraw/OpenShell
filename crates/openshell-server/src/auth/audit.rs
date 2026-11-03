@@ -537,9 +537,22 @@ pub fn emit_mcp_tool_call(
     principal: &Principal,
     tool: &str,
     refused: Option<&str>,
+    details: &[(&str, String)],
 ) {
+    ocsf_emit!(mcp_tool_call_event(
+        origin, principal, tool, refused, details
+    ));
+}
+
+pub fn mcp_tool_call_event(
+    origin: &RequestOrigin,
+    principal: &Principal,
+    tool: &str,
+    refused: Option<&str>,
+    details: &[(&str, String)],
+) -> openshell_ocsf::OcsfEvent {
     let ctx = crate::gateway_ocsf::context("", "");
-    let builder = ApiActivityBuilder::new(&ctx, tool)
+    let mut builder = ApiActivityBuilder::new(&ctx, tool)
         .actor_user(principal_user(principal))
         .src_endpoint(origin.source.map_or_else(
             || Endpoint::from_name("unknown"),
@@ -547,6 +560,9 @@ pub fn emit_mcp_tool_call(
         ))
         .api_service(Service::new("mcp"))
         .http_request(post("/mcp"));
+    for (key, value) in details {
+        builder = builder.unmapped(key, value.clone());
+    }
     let builder = match refused {
         None => builder
             .action(ActionId::Allowed)
@@ -562,7 +578,7 @@ pub fn emit_mcp_tool_call(
             .status_detail(code)
             .message(format!("mcp tool call {tool}: refused ({code})")),
     };
-    ocsf_emit!(builder.build());
+    builder.build()
 }
 
 /// Emit an API Activity denial for a gRPC request to `path`, paired with a
