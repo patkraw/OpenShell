@@ -5509,19 +5509,36 @@ pub(super) async fn handle_get_sandbox_logs(
     request: Request<GetSandboxLogsRequest>,
 ) -> Result<Response<GetSandboxLogsResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let req = request.into_inner();
-    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
-        state,
-        &principal,
-        &req.sandbox,
-        selected_workspace_name(req.workspace_scope.as_ref())?,
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let mut req = request.into_inner();
+    // A sandbox caller (only through `/mcp`) reads one of its own children,
+    // ready or not, and only the child's own output: gateway lines about it
+    // can carry audit and internal detail.
+    let sandbox_caller = matches!(principal, Principal::Sandbox(_));
+    let sandbox = if let Principal::Sandbox(caller) = &principal {
+        refuse_log_fields_for_sandbox_caller(&req)?;
+        req.sources = vec!["sandbox".to_string()];
+        super::sandbox::resolve_caller_child(state, caller, &req.sandbox).await?
+    } else {
+        super::sandbox::resolve_and_authorize_sandbox_name(
+            state,
+            &principal,
+            &req.sandbox,
+            selected_workspace_name(req.workspace_scope.as_ref())?,
+            MinWorkspaceRole::User,
+        )
+        .await?
+    };
     let sandbox_id = sandbox.object_id();
 
     let lines = if req.lines == 0 { 2000 } else { req.lines };
-    let tail = state.tracing_log_bus.tail(sandbox_id, lines as usize);
+    // A sandbox caller's line count applies after its source filter, so
+    // dropped gateway lines do not shrink the reply.
+    let tail_len = if sandbox_caller {
+        usize::MAX
+    } else {
+        lines as usize
+    };
+    let tail = state.tracing_log_bus.tail(sandbox_id, tail_len);
 
     let buffer_total = tail.len() as u32;
 
@@ -5557,8 +5574,43 @@ pub(super) async fn handle_get_sandbox_logs(
             }
         })
         .collect();
+    let logs = if sandbox_caller {
+        let mut logs: Vec<SandboxLogLine> = logs;
+        let keep_from = logs.len().saturating_sub(lines as usize);
+        logs.split_off(keep_from)
+    } else {
+        logs
+    };
 
     Ok(Response::new(GetSandboxLogsResponse { logs, buffer_total }))
+}
+
+/// A sandbox caller's log request may set only the child, the line count and
+/// a start time.
+fn refuse_log_fields_for_sandbox_caller(request: &GetSandboxLogsRequest) -> Result<(), Status> {
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("sources", !request.sources.is_empty()),
+        ("min_level", !request.min_level.is_empty()),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    let allowed = GetSandboxLogsRequest {
+        sandbox: request.sandbox.clone(),
+        lines: request.lines,
+        since_time: request.since_time,
+        ..Default::default()
+    };
+    if *request == allowed {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ))
+    }
 }
 
 pub(super) async fn handle_push_sandbox_logs(

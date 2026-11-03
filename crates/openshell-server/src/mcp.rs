@@ -209,10 +209,11 @@ async fn handle(
                 "create_sandbox" => create_child(&connection, &headers, &arguments).await,
                 "exec" => exec_in_child(&connection, &headers, &arguments).await,
                 "delete" => delete_child(&connection, &headers, &arguments).await,
+                "logs" => child_logs(&connection, &headers, &arguments).await,
                 "list" => caller_children(&connection, &headers)
                     .await
                     .map(|children| json!({"sandboxes": children.iter().map(child_summary).collect::<Vec<_>>()})),
-                _ => Err(ToolError::not_available(name)),
+                _ => unreachable!("tool names are checked against TOOLS above"),
             };
             let origin = RequestOrigin::new(connection.auth.connection_source(), &headers);
             let details = audit_details(name, &arguments);
@@ -262,7 +263,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "logs",
-        description: "Read a child sandbox's recent logs.",
+        description: "Read a child sandbox's own recent log lines (its output and policy denials), newest kept.",
     },
 ];
 
@@ -298,6 +299,16 @@ fn tool_definitions() -> Vec<Value> {
                 "delete" => json!({
                     "type": "object",
                     "properties": {"name": {"type": "string", "description": "Child sandbox to delete."}},
+                    "required": ["name"],
+                    "additionalProperties": false,
+                }),
+                "logs" => json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Child sandbox to read."},
+                        "lines": {"type": "integer", "minimum": 1, "maximum": MAX_LOG_LINES},
+                        "since": {"type": "string", "description": "Only lines at or after this RFC 3339 time."},
+                    },
                     "required": ["name"],
                     "additionalProperties": false,
                 }),
@@ -590,6 +601,13 @@ fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
     if tool == "delete" {
         return vec![("target", text("name"))];
     }
+    if tool == "logs" {
+        let lines = arguments
+            .get("lines")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_LOG_LINES);
+        return vec![("target", text("name")), ("lines", lines.to_string())];
+    }
     if tool != "exec" {
         return Vec::new();
     }
@@ -647,6 +665,75 @@ async fn delete_child(
         Box::pin(client.delete_sandbox(mcp_request(request, headers)));
     call.await.map_err(ToolError::from_status)?;
     Ok(json!({"name": name, "deleting": true}))
+}
+
+const DEFAULT_LOG_LINES: u64 = 200;
+const MAX_LOG_LINES: u64 = 2000;
+/// Largest log reply; the newest lines are kept.
+const MAX_LOG_BYTES: usize = 64 * 1024;
+
+/// A child's own recent output, newest lines kept within the reply cap.
+async fn child_logs(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let args = arguments_object(arguments)?;
+    let name = required_name(&args, &["name", "lines", "since"])?;
+    let lines = match args.get("lines") {
+        None => DEFAULT_LOG_LINES,
+        Some(value) => value
+            .as_u64()
+            .filter(|lines| (1..=MAX_LOG_LINES).contains(lines))
+            .ok_or_else(|| ToolError::invalid("'lines' must be between 1 and 2000"))?,
+    };
+    let since_time = match args.get("since") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(|since| since.parse::<prost_types::Timestamp>().ok())
+                .ok_or_else(|| ToolError::invalid("'since' must be an RFC 3339 time"))?,
+        ),
+    };
+    let request = openshell_core::proto::GetSandboxLogsRequest {
+        sandbox: name,
+        lines: u32::try_from(lines).unwrap_or(u32::MAX),
+        since_time,
+        ..Default::default()
+    };
+    let mut client = OpenShellClient::new(connection.grpc.clone());
+    let call: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.get_sandbox_logs(mcp_request(request, headers)));
+    let logs = call
+        .await
+        .map_err(ToolError::from_status)?
+        .into_inner()
+        .logs;
+    let (lines, truncated) = newest_log_lines(&logs);
+    Ok(json!({"lines": lines, "truncated": truncated}))
+}
+
+/// The newest lines that fit in the reply cap, oldest first. A single line
+/// over the cap keeps its start, cut on a character boundary.
+fn newest_log_lines(logs: &[openshell_core::proto::SandboxLogLine]) -> (Vec<Value>, bool) {
+    let mut kept = Vec::new();
+    let mut bytes = 0;
+    let mut truncated = false;
+    for log in logs.iter().rev() {
+        let room = MAX_LOG_BYTES.saturating_sub(bytes);
+        if room == 0 {
+            truncated = true;
+            break;
+        }
+        let message = truncate_at_char_boundary(&log.message, room);
+        truncated |= message.len() < log.message.len();
+        bytes += message.len();
+        let time = log.event_time.as_ref().map(ToString::to_string);
+        kept.push(json!({"time": time, "level": log.level, "message": message}));
+    }
+    kept.reverse();
+    (kept, truncated)
 }
 
 /// Refuse arguments outside `allowed`, and return the required `name`.
@@ -914,14 +1001,6 @@ impl ToolError {
         })
     }
 
-    fn not_available(name: &str) -> Self {
-        Self::Refused(Refusal {
-            code: "not_available",
-            message: format!("'{name}' is not available yet"),
-            retryable: false,
-        })
-    }
-
     /// Map a gRPC status to the agent-facing error. Internal errors can carry
     /// store or driver detail, so their text is logged, not returned.
     fn from_status(status: tonic::Status) -> Self {
@@ -1134,13 +1213,6 @@ mod tests {
 
         let (_, reply) = post_mcp(lead(), &[], rpc("tools/call", json!({"name": "rm"}))).await;
         assert_eq!(reply.unwrap()["error"]["code"], -32602);
-
-        let (status, reply) =
-            post_mcp(lead(), &[], rpc("tools/call", json!({"name": "logs"}))).await;
-        assert_eq!(status, StatusCode::OK);
-        let result = &reply.unwrap()["result"];
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["structuredContent"]["error"], "not_available");
     }
 
     #[test]
@@ -1328,6 +1400,75 @@ mod tests {
                 rpc(
                     "tools/call",
                     json!({"name": "delete", "arguments": arguments}),
+                ),
+            )
+            .await;
+            let result = &reply.unwrap()["result"];
+            assert_eq!(result["structuredContent"]["error"], "invalid_argument");
+            assert_eq!(result["structuredContent"]["message"], message);
+        }
+    }
+
+    #[test]
+    fn logs_keep_the_newest_lines_within_the_cap() {
+        let line = |message: String| openshell_core::proto::SandboxLogLine {
+            message,
+            ..Default::default()
+        };
+        let small: Vec<_> = (0..3).map(|i| line(format!("line {i}"))).collect();
+        let (kept, truncated) = newest_log_lines(&small);
+        assert_eq!(kept.len(), 3);
+        assert!(!truncated);
+
+        // Three 30 KiB lines: only the newest two fit, the second-newest cut.
+        let big: Vec<_> = (0..3)
+            .map(|i| line(format!("{i}{}", "x".repeat(30 * 1024))))
+            .collect();
+        let (kept, truncated) = newest_log_lines(&big);
+        assert!(truncated);
+        assert_eq!(kept.len(), 3);
+        assert!(
+            kept.last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .starts_with('2')
+        );
+        let total: usize = kept
+            .iter()
+            .map(|l| l["message"].as_str().unwrap().len())
+            .sum();
+        assert!(total <= MAX_LOG_BYTES);
+
+        // One line over the cap made of two-byte characters is cut on a
+        // character boundary.
+        let (kept, truncated) = newest_log_lines(&[line("é".repeat(MAX_LOG_BYTES))]);
+        assert!(truncated);
+        let message = kept[0]["message"].as_str().unwrap();
+        assert!(message.len() <= MAX_LOG_BYTES && message.chars().all(|c| c == 'é'));
+    }
+
+    #[tokio::test]
+    async fn logs_refuses_unknown_arguments() {
+        for (arguments, message) in [
+            (
+                json!({"name": "w", "sources": ["gateway"]}),
+                "unknown argument 'sources'",
+            ),
+            (
+                json!({"name": "w", "lines": 2001}),
+                "'lines' must be between 1 and 2000",
+            ),
+            (
+                json!({"name": "w", "since": "yesterday"}),
+                "'since' must be an RFC 3339 time",
+            ),
+        ] {
+            let (_, reply) = post_mcp(
+                connection(Some(sandbox_principal("lead"))),
+                &[],
+                rpc(
+                    "tools/call",
+                    json!({"name": "logs", "arguments": arguments}),
                 ),
             )
             .await;
