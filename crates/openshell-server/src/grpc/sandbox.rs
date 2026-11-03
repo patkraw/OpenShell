@@ -1770,48 +1770,66 @@ pub(super) async fn handle_list_sandboxes(
 ) -> Result<Response<ListSandboxesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let scope = authorize_list_workspace_selector(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        request.workspace_scope.as_ref(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
     if !request.label_selector.is_empty() {
         crate::grpc::validation::validate_label_selector(&request.label_selector)?;
     }
-    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
-        None
-    } else {
-        let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
-            unreachable!("all-workspaces scope handled above")
+    let (workspace, parent_id) =
+        if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+            // A sandbox caller (only through `/mcp`) lists its own children, in
+            // its own workspace, whatever scope or parent the request names.
+            let caller = state
+                .store
+                .get_message::<Sandbox>(&caller.sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (
+                Some(caller.object_workspace().to_string()),
+                Some(caller.object_id().to_string()),
+            )
+        } else {
+            let scope = authorize_list_workspace_selector(
+                &state.store,
+                &state.admin_role,
+                &principal,
+                request.workspace_scope.as_ref(),
+                MinWorkspaceRole::User,
+            )
+            .await?;
+            let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+                None
+            } else {
+                let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
+                    unreachable!("all-workspaces scope handled above")
+                };
+                let workspace =
+                    super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+                        .await?
+                        .name;
+                Some(workspace)
+            };
+            // Names are unique only within a workspace, so the parent is resolved
+            // there, once, and filtered on by id.
+            let parent_id = if request.parent.is_empty() {
+                None
+            } else {
+                let Some(workspace) = workspace.as_deref() else {
+                    return Err(Status::invalid_argument(
+                        "a parent filter needs a single workspace",
+                    ));
+                };
+                let parent = state
+                    .store
+                    .get_message_by_name::<Sandbox>(workspace, &request.parent)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("parent sandbox '{}' not found", request.parent))
+                    })?;
+                Some(parent.object_id().to_string())
+            };
+            (workspace, parent_id)
         };
-        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-            .await?
-            .name;
-        Some(workspace)
-    };
-    // Names are unique only within a workspace, so the parent is resolved
-    // there, once, and filtered on by id.
-    let parent_id = if request.parent.is_empty() {
-        None
-    } else {
-        let Some(workspace) = workspace.as_deref() else {
-            return Err(Status::invalid_argument(
-                "a parent filter needs a single workspace",
-            ));
-        };
-        let parent = state
-            .store
-            .get_message_by_name::<Sandbox>(workspace, &request.parent)
-            .await
-            .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
-            .ok_or_else(|| {
-                Status::not_found(format!("parent sandbox '{}' not found", request.parent))
-            })?;
-        Some(parent.object_id().to_string())
-    };
     let scope_fingerprint = workspace.as_deref().unwrap_or("*");
     // The parent's id, not its name, so a token stops working if the parent
     // is deleted and a new sandbox takes its name.
@@ -8671,6 +8689,100 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(listed.sandboxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_lists_only_its_own_children_whatever_it_asks_for() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        for (name, parent, id) in [
+            ("w1", "lead", &lead_id),
+            ("w2", "lead", &lead_id),
+            ("x1", "other", &other_id),
+        ] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            put_parent_record(&state, name, &[], Some(link), false).await;
+        }
+
+        // Another root's name and every workspace are both ignored.
+        let mut request = list_children_request("other", 100, String::new());
+        request.workspace_scope = Some(openshell_core::proto::all_workspaces_selector());
+        let listed = handle_list_sandboxes(&state, sandbox_request(&lead_id, request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed_names(&listed), ["w1", "w2"]);
+    }
+
+    #[tokio::test]
+    async fn mcp_list_reaches_the_handler_through_the_grpc_stack() {
+        use crate::auth::authenticator::test_support::MockAuthenticator;
+        use crate::auth::authenticator::{Authentication, AuthenticatorChain};
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+        use tower::ServiceExt;
+
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        put_parent_record(&state, "w1", &[], Some(link), false).await;
+
+        let lead = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: lead_id,
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+                auth_epoch: None,
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+            Authentication::Accepted(lead),
+        )))]);
+        let stack = crate::multiplex::AuthGrpcRouter::new(
+            openshell_core::proto::open_shell_server::OpenShellServer::new(
+                crate::OpenShellService::new(state.clone()),
+            ),
+            Some(chain),
+            None,
+        );
+        let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "list", "arguments": {}},
+        });
+        let response = crate::mcp::router()
+            .layer(axum::Extension(connection))
+            .oneshot(
+                http::Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer sandbox-token")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let result = &reply["result"];
+        assert_eq!(result["isError"], false, "{reply}");
+        let names: Vec<_> = result["structuredContent"]["sandboxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["w1"]);
     }
 
     #[tokio::test]

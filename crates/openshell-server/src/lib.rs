@@ -29,6 +29,7 @@ mod gateway_ocsf;
 mod gateway_ring;
 mod grpc;
 mod http;
+mod mcp;
 mod middleware;
 mod multiplex;
 mod network_trust;
