@@ -1069,9 +1069,10 @@ async fn parent_policy_revisions(
 }
 
 /// Under the child-create lock, copy the policy the parent is enforcing: the
-/// revision at its current policy version, not a newer pending or failed one. A `fail_closed` parent
-/// that rejected a newer revision denies all new egress, so its loaded
-/// revision would give a new child more access than the parent has.
+/// revision at its current policy version, not a newer pending or failed one.
+/// A `fail_closed` parent that rejected a newer revision denies all new
+/// egress, so its enforced revision would give a new child more access than
+/// the parent has.
 async fn copy_parent_policy(
     state: &ServerState,
     parent: &openshell_core::proto::SandboxParent,
@@ -1298,16 +1299,20 @@ pub(super) async fn admit_child(
         .await
         .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
     else {
-        return Err(Status::failed_precondition(
+        return Err(child_refusal::status(
+            child_refusal::PARENT_MISSING,
             crate::compute::orphaned_child_message(&parent_ref),
         ));
     };
     let loaded = match parent_policy_revisions(state, &parent_ref.id).await? {
         Some((_, Some(_))) => {
-            return Err(Status::failed_precondition(format!(
-                "parent sandbox '{}' rejected its latest policy",
-                parent_ref.name
-            )));
+            return Err(child_refusal::status(
+                child_refusal::PARENT_POLICY_REJECTED,
+                format!(
+                    "parent sandbox '{}' rejected its latest policy",
+                    parent_ref.name
+                ),
+            ));
         }
         Some((loaded, None)) => Some(loaded),
         None => None,
@@ -1347,6 +1352,30 @@ pub(super) async fn provider_attached_for_delivery(
         .is_some_and(|parent| attached(&parent)))
 }
 
+/// Reasons a child is refused configuration or a start, carried as an
+/// `ErrorInfo` alongside the message so callers never match its wording.
+pub mod child_refusal {
+    use openshell_core::rpc_error;
+    use tonic::Status;
+
+    pub const PARENT_MISSING: &str = "PARENT_SANDBOX_MISSING";
+    pub const PARENT_POLICY_REJECTED: &str = "PARENT_POLICY_REJECTED";
+    pub const PARENT_POLICY_NOT_COPIED: &str = "PARENT_POLICY_NOT_COPIED";
+    pub const PARENT_POLICY_UNCOPYABLE: &str = "PARENT_POLICY_UNCOPYABLE";
+
+    pub fn status(reason: &str, message: impl Into<String>) -> Status {
+        rpc_error::failed_precondition(reason, message)
+    }
+
+    /// The gateway's reason on `status`, if it set one.
+    pub fn reason(status: &Status) -> Option<String> {
+        rpc_error::decode_details(status)?
+            .error_info()
+            .filter(|info| info.domain == rpc_error::ERROR_DOMAIN)
+            .map(|info| info.reason.clone())
+    }
+}
+
 /// Refuse a child whose policy copy is older than the policy its parent has
 /// loaded, so a missed or failed sync fails closed. Starts a sync, which
 /// publishes the child once its copy lands.
@@ -1367,16 +1396,22 @@ pub(super) fn refuse_child_behind_parent(
     // once per parent version instead of retrying every rebuild.
     if let Err(reason) = ParentPolicyCopy::of(parent_loaded, &parent.id) {
         warn_uncopyable_parent_policy_once(&parent.id, parent_loaded.version, &reason);
-        return Err(Status::failed_precondition(format!(
-            "parent sandbox '{}' policy version {} cannot be copied to its children",
-            parent.name, parent_loaded.version
-        )));
+        return Err(child_refusal::status(
+            child_refusal::PARENT_POLICY_UNCOPYABLE,
+            format!(
+                "parent sandbox '{}' policy version {} cannot be copied to its children",
+                parent.name, parent_loaded.version
+            ),
+        ));
     }
     spawn_child_sync(state, child);
-    Err(Status::failed_precondition(format!(
-        "parent sandbox '{}' policy version {} is not yet copied to this child",
-        parent.name, parent_loaded.version
-    )))
+    Err(child_refusal::status(
+        child_refusal::PARENT_POLICY_NOT_COPIED,
+        format!(
+            "parent sandbox '{}' policy version {} is not yet copied to this child",
+            parent.name, parent_loaded.version
+        ),
+    ))
 }
 
 fn warn_uncopyable_parent_policy_once(parent_id: &str, version: i64, reason: &Status) {
@@ -1493,7 +1528,8 @@ async fn refuse_orphaned_child(state: &ServerState, sandbox: &Sandbox) -> Result
     if let Some(parent) = sandbox.parent.as_ref()
         && parent_is_missing(state, &parent.id).await?
     {
-        return Err(Status::failed_precondition(
+        return Err(child_refusal::status(
+            child_refusal::PARENT_MISSING,
             crate::compute::orphaned_child_message(parent),
         ));
     }

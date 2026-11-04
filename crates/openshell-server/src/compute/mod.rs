@@ -8243,11 +8243,6 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
     }
 }
 
-/// Ends the message for a child whose parent record is gone.
-pub const ORPHANED_CHILD_SUFFIX: &str = "no longer exists; delete this child sandbox";
-
-/// Why an orphaned child is refused configuration and starts. Names the
-/// parent by id too: a root created later under the same name is not it.
 /// A parent's children, split by whether their delete has started.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChildCount {
@@ -8296,9 +8291,11 @@ pub async fn count_children(
     Ok(count)
 }
 
+/// Why an orphaned child is refused configuration and starts. Names the
+/// parent by id too: a root created later under the same name is not it.
 pub fn orphaned_child_message(parent: &openshell_core::proto::SandboxParent) -> String {
     format!(
-        "parent sandbox '{}' (id {}) {ORPHANED_CHILD_SUFFIX}",
+        "parent sandbox '{}' (id {}) no longer exists; delete this child sandbox",
         parent.name, parent.id
     )
 }
