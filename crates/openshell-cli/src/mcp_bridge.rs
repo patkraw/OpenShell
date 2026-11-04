@@ -1,0 +1,266 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `openshell mcp serve`: a local MCP server over stdio that forwards each
+//! message to the gateway's `/mcp` with the CLI's login (RFC 0021).
+//!
+//! Stdout carries MCP messages only, one JSON-RPC message per line; the
+//! client reads every line as one. Everything else goes to stderr.
+
+use openshell_bootstrap::oidc_token::{load_oidc_token, store_oidc_token};
+use openshell_sdk::{OpenShellClient, Refresh, RefreshError, RefreshedToken};
+use serde_json::{Value, json};
+use std::future::Future;
+use std::sync::Arc;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+
+/// What the gateway answered to one forwarded message.
+pub struct Sent {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// Read MCP messages from `input` and answer each on `output`, one per line.
+///
+/// Each message is sent on its own task, so a long `wait` never holds up a
+/// `ping`; a whole reply line is written under one lock. Returns when `input`
+/// closes and every call in flight has answered.
+pub async fn serve<R, W, S, F>(input: R, output: W, send: S) -> std::io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    S: Fn(Vec<u8>) -> F + Clone + Send + 'static,
+    F: Future<Output = Result<Sent, String>> + Send,
+{
+    let output = Arc::new(tokio::sync::Mutex::new(output));
+    let mut lines = input.lines();
+    let mut calls = tokio::task::JoinSet::new();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let output = Arc::clone(&output);
+        let send = send.clone();
+        calls.spawn(async move {
+            let Some(reply) = reply_to(&line, send).await else {
+                return;
+            };
+            let mut output = output.lock().await;
+            // A client that went away cannot be told anything.
+            let _ = output.write_all(format!("{reply}\n").as_bytes()).await;
+            let _ = output.flush().await;
+        });
+    }
+    while calls.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// The reply line for one message, or none for a notification the gateway
+/// accepted.
+async fn reply_to<S, F>(line: &str, send: S) -> Option<String>
+where
+    S: Fn(Vec<u8>) -> F,
+    F: Future<Output = Result<Sent, String>>,
+{
+    let Ok(message) = serde_json::from_str::<Value>(line) else {
+        return Some(rpc_error(&Value::Null, -32700, "parse error"));
+    };
+    let id = message.get("id").cloned();
+    let error = |message: String| id.as_ref().map(|id| rpc_error(id, -32000, &message));
+    match send(line.as_bytes().to_vec()).await {
+        // Re-encode the reply so it is one line whatever the gateway sent.
+        Ok(Sent { status: 200, body }) => serde_json::from_slice::<Value>(&body).map_or_else(
+            |_| error("the gateway sent a reply that is not JSON".to_string()),
+            |reply| Some(reply.to_string()),
+        ),
+        Ok(Sent { status: 202, .. }) => None,
+        Ok(Sent { status, body }) => {
+            let text = String::from_utf8_lossy(&body);
+            let hint = match status {
+                401 => "; run `openshell gateway login`",
+                _ => "",
+            };
+            error(format!(
+                "the gateway refused the call (HTTP {status}): {}{hint}",
+                text.trim()
+            ))
+        }
+        Err(message) => error(message),
+    }
+}
+
+fn rpc_error(id: &Value, code: i64, message: &str) -> String {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
+}
+
+/// Forward one message with `client`, or explain why there is no client.
+pub async fn send_with(
+    client: Result<&OpenShellClient, &str>,
+    body: &[u8],
+    workspace: &str,
+) -> Result<Sent, String> {
+    let client = client.map_err(str::to_string)?;
+    let reply = client
+        .post_mcp(body, workspace)
+        .await
+        .map_err(|error| format!("gateway unreachable: {error}"))?;
+    Ok(Sent {
+        status: reply.status.as_u16(),
+        body: reply.body,
+    })
+}
+
+/// Refreshes the gateway's stored OIDC login, as the CLI does at start-up,
+/// for a bridge that outlives one access token.
+pub struct StoredOidcRefresher {
+    pub gateway_name: String,
+    pub scopes: Option<String>,
+    pub insecure: bool,
+}
+
+#[async_trait::async_trait]
+impl Refresh for StoredOidcRefresher {
+    async fn refresh(&self) -> Result<RefreshedToken, RefreshError> {
+        let bundle = load_oidc_token(&self.gateway_name).ok_or_else(|| {
+            RefreshError::Terminal(format!(
+                "no stored login; run `openshell gateway login {}`",
+                self.gateway_name
+            ))
+        })?;
+        let refreshed =
+            crate::oidc_auth::oidc_refresh_token(&bundle, self.scopes.as_deref(), self.insecure)
+                .await
+                .map_err(|error| RefreshError::Transient(error.to_string()))?;
+        if let Err(error) = store_oidc_token(&self.gateway_name, &refreshed) {
+            tracing::warn!("could not store the refreshed login: {error}");
+        }
+        let token = RefreshedToken::new(refreshed.access_token);
+        Ok(match refreshed.expires_at {
+            Some(expires_at) => token.with_expires_at(expires_at),
+            None => token,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run the bridge over `input` with a gateway that answers by `answer`,
+    /// and return its stdout lines.
+    async fn bridge_lines(input: &str, answer: fn(&Value) -> Result<Sent, String>) -> Vec<String> {
+        let (writer, mut reader) = tokio::io::duplex(1 << 20);
+        let send =
+            move |body: Vec<u8>| async move { answer(&serde_json::from_slice(&body).unwrap()) };
+        serve(input.as_bytes(), writer, send).await.unwrap();
+        let mut out = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut out)
+            .await
+            .unwrap();
+        out.lines().map(str::to_string).collect()
+    }
+
+    fn gateway(message: &Value) -> Result<Sent, String> {
+        let reply = |status, body: Value| {
+            Ok(Sent {
+                status,
+                body: body.to_string().into_bytes(),
+            })
+        };
+        match message["method"].as_str().unwrap_or_default() {
+            // Pretty-printed, to check the bridge sends it as one line.
+            "ping" => Ok(Sent {
+                status: 200,
+                body: serde_json::to_vec_pretty(
+                    &json!({"jsonrpc": "2.0", "id": message["id"], "result": {}}),
+                )
+                .unwrap(),
+            }),
+            "notifications/initialized" => reply(202, Value::Null),
+            "forbidden" => Ok(Sent {
+                status: 403,
+                body: b"requests with an Origin header are refused".to_vec(),
+            }),
+            "expired" => Ok(Sent {
+                status: 401,
+                body: Vec::new(),
+            }),
+            _ => Err("gateway unreachable: connection refused".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn stdout_carries_one_json_rpc_message_per_line_and_nothing_else() {
+        let input = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "",
+            r#"{"jsonrpc":"2.0","id":2,"method":"forbidden"}"#,
+            r#"{"jsonrpc":"2.0","id":"three","method":"expired"}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"down"}"#,
+            "not json",
+        ]
+        .join("\n");
+        let lines = bridge_lines(&input, gateway).await;
+
+        // Five replies: the notification and the blank line get none.
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        let mut by_id = std::collections::HashMap::new();
+        for line in &lines {
+            let message: Value = serde_json::from_str(line).unwrap_or_else(|_| panic!("{line}"));
+            assert_eq!(message["jsonrpc"], "2.0", "{line}");
+            by_id.insert(message["id"].to_string(), message);
+        }
+        assert_eq!(by_id["1"]["result"], json!({}));
+        assert!(
+            by_id["2"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("HTTP 403")
+        );
+        assert!(
+            by_id["\"three\""]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("openshell gateway login")
+        );
+        assert!(
+            by_id["4"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unreachable")
+        );
+        assert_eq!(by_id["null"]["error"]["code"], -32700);
+    }
+
+    #[tokio::test]
+    async fn a_slow_call_does_not_hold_up_the_others() {
+        let (writer, mut reader) = tokio::io::duplex(1 << 20);
+        let send = |body: Vec<u8>| async move {
+            let message: Value = serde_json::from_slice(&body).unwrap();
+            if message["method"] == "slow" {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Ok(Sent {
+                status: 200,
+                body: json!({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+                    .to_string()
+                    .into_bytes(),
+            })
+        };
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"slow\"}\n\
+                     {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        tokio::spawn(serve(input.as_bytes(), writer, send));
+
+        let mut first = String::new();
+        let mut reader = tokio::io::BufReader::new(&mut reader);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut first),
+        )
+        .await
+        .expect("the ping is answered before the slow call ends")
+        .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&first).unwrap()["id"], 2);
+    }
+}

@@ -232,6 +232,70 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
     }
 }
 
+/// The bridge's gateway client, refreshing an OIDC login for as long as the
+/// bridge runs, or why there is none.
+async fn mcp_client(
+    gateway: &Option<String>,
+    gateway_endpoint: &Option<String>,
+    tls: TlsOptions,
+) -> std::result::Result<openshell_sdk::OpenShellClient, String> {
+    let ctx = resolve_gateway(gateway, gateway_endpoint).map_err(|error| error.to_string())?;
+    let mut tls = tls.with_gateway_name(&ctx.name);
+    if let Some(error) = apply_auth_with_status(&mut tls, &ctx.name) {
+        return Err(error);
+    }
+    let refresher = get_gateway_metadata(&ctx.name)
+        .filter(|meta| meta.auth_mode.as_deref() == Some("oidc"))
+        .map(|meta| {
+            let refresher: std::sync::Arc<dyn openshell_sdk::Refresh> =
+                std::sync::Arc::new(openshell_cli::mcp_bridge::StoredOidcRefresher {
+                    gateway_name: ctx.name.clone(),
+                    scopes: meta.oidc_scopes,
+                    insecure: tls.gateway_insecure,
+                });
+            refresher
+        });
+    openshell_cli::tls::sdk_client(&ctx.endpoint, &tls, refresher)
+        .await
+        .map_err(|error| format!("cannot reach the gateway: {error}"))
+}
+
+/// Run the MCP bridge. Missing or unusable credentials do not stop it: each
+/// call then answers with what to run, so the MCP client shows the reason,
+/// and nothing ever starts an interactive login.
+async fn mcp_serve(
+    gateway: &Option<String>,
+    gateway_endpoint: &Option<String>,
+    tls: TlsOptions,
+    workspace: String,
+) -> Result<()> {
+    let client = mcp_client(gateway, gateway_endpoint, tls).await;
+    if let Err(error) = &client {
+        eprintln!("openshell mcp serve: {error}");
+    }
+    let client = std::sync::Arc::new(client);
+    let workspace = std::sync::Arc::new(workspace);
+    let send = move |body: Vec<u8>| {
+        let client = std::sync::Arc::clone(&client);
+        let workspace = std::sync::Arc::clone(&workspace);
+        async move {
+            openshell_cli::mcp_bridge::send_with(
+                client.as_ref().as_ref().map_err(String::as_str),
+                &body,
+                &workspace,
+            )
+            .await
+        }
+    };
+    openshell_cli::mcp_bridge::serve(
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+        send,
+    )
+    .await
+    .map_err(|error| miette::miette!("MCP stdio failed: {error}"))
+}
+
 /// Resolve a sandbox name, falling back to the last-used sandbox for the
 /// gateway and workspace.
 ///
@@ -619,6 +683,13 @@ enum Commands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
+    },
+
+    /// Serve the gateway's sandbox tools to a local MCP client.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Mcp {
+        #[command(subcommand)]
+        command: Option<McpCommands>,
     },
 
     /// Show the identity validated by the gateway.
@@ -1425,6 +1496,17 @@ enum GatewayCommands {
 // -----------------------------------------------------------------------
 // Doctor (diagnostic) commands
 // -----------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+enum McpCommands {
+    /// Run a local MCP server over stdio for an MCP client.
+    ///
+    /// Add it to the client's configuration as the command
+    /// `openshell mcp serve`. Each tool call goes to the active gateway with
+    /// this CLI's login, acting in `--workspace`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Serve,
+}
 
 #[derive(Subcommand, Debug)]
 enum DoctorCommands {
@@ -2667,9 +2749,17 @@ async fn run_async() -> Result<()> {
 
     // The fmt formatter defaults to ANSI on with no terminal detection, and it
     // writes to stdout, so without this `openshell -v ... | ...` pipes escapes
-    // to the caller.
+    // to the caller. The MCP bridge's stdout carries MCP messages only, so it
+    // logs to stderr.
+    let mcp = matches!(cli.command, Some(Commands::Mcp { .. }));
+    let writer = if mcp {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::fmt()
-        .with_ansi(color::stdout_enabled())
+        .with_ansi(!mcp && color::stdout_enabled())
+        .with_writer(writer)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
@@ -2815,6 +2905,22 @@ async fn run_async() -> Result<()> {
                     "openshell gateway add <endpoint>".dimmed()
                 );
             }
+        }
+
+        // -----------------------------------------------------------
+        // MCP bridge
+        // -----------------------------------------------------------
+        Some(Commands::Mcp {
+            command: Some(McpCommands::Serve),
+        }) => {
+            mcp_serve(&cli.gateway, &cli.gateway_endpoint, tls, cli.workspace).await?;
+        }
+        Some(Commands::Mcp { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("mcp")
+                .expect("mcp subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
         }
 
         // -----------------------------------------------------------
