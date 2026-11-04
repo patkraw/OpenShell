@@ -2915,7 +2915,7 @@ pub(super) async fn load_sandbox_config(
 ///
 /// This is a read-only projection shared by polling and stream delivery.
 pub async fn build_sandbox_config_snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     sandbox: &Sandbox,
 ) -> Result<SandboxConfigSnapshot, Status> {
     let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
@@ -2934,23 +2934,6 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
     let global_settings = &inputs.global_settings;
-
-    // A child is not admitted while its parent denies all new egress, so it
-    // fails closed with the parent instead of keeping its copy's access.
-    // An orphaned child is refused too, until it is stopped and deleted.
-    if let Some(parent) = sandbox.parent.as_ref() {
-        if super::sandbox::parent_is_missing(state, &parent.id).await? {
-            return Err(Status::failed_precondition(
-                crate::compute::orphaned_child_message(parent),
-            ));
-        }
-        if super::sandbox::parent_is_blocked(state, &parent.id).await? {
-            return Err(Status::failed_precondition(format!(
-                "parent sandbox '{}' rejected its latest policy",
-                parent.name
-            )));
-        }
-    }
 
     let global_policy = decode_policy_from_global_settings(global_settings)?;
     let mut global_policy_version: u32 = 0;
@@ -3869,7 +3852,7 @@ pub(super) async fn load_sandbox_provider_environment(
 
 /// Build the complete provider environment for one persisted sandbox.
 pub async fn build_provider_environment_snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     sandbox: &Sandbox,
     supports_static_credential_bindings: bool,
     supports_stable_placeholder_environment_keys: bool,
@@ -5079,6 +5062,14 @@ fn configuration_failure_diagnostic(error: &Status) -> &'static str {
         && message.ends_with(crate::compute::ORPHANED_CHILD_SUFFIX)
     {
         "The parent sandbox no longer exists; delete this child sandbox"
+    } else if message.starts_with("parent sandbox ")
+        && message.ends_with("is not yet copied to this child")
+    {
+        "Waiting for a copy of the parent sandbox's latest policy"
+    } else if message.starts_with("parent sandbox ")
+        && message.ends_with("cannot be copied to its children")
+    {
+        "The parent sandbox's policy cannot be copied to children; fix the parent's policy"
     } else if message.starts_with("parent sandbox ") {
         "The parent sandbox rejected its latest policy; fix the parent's policy"
     } else if message.contains("middleware") {
@@ -5316,7 +5307,7 @@ pub(super) async fn handle_report_policy_status(
 
 /// Sync a root's children in the background, so the root's report is not
 /// held up by them.
-fn spawn_child_policy_sync(state: &Arc<ServerState>, sandbox_id: &str) {
+pub(super) fn spawn_child_policy_sync(state: &Arc<ServerState>, sandbox_id: &str) {
     let state = Arc::clone(state);
     let parent_id = sandbox_id.to_string();
     tokio::spawn(async move {

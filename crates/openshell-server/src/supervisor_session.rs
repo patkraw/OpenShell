@@ -46,10 +46,6 @@ use crate::supervisor_owner::{
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a connecting child waits for its policy sync. Well under the
-/// mutation lock timeout: after a restart, a parent's children reconnect at
-/// once and take its lock in turn.
-const CHILD_POLICY_SYNC_ON_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a stopping replica waits for a redirected supervisor to publish its
 /// replacement session before marking the sandbox not ready.
 const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
@@ -2614,33 +2610,11 @@ pub async fn handle_connect_supervisor(
             .as_ref()
             .and_then(|status| status.configuration_admission.clone()),
     });
-    // A child that missed a sync of its parent's policy catches up before its
-    // first configuration is built. A slow or failed sync never holds up or
-    // refuses the session; the parent's next change syncs the child again.
+    // A child that missed a sync of its parent catches up in the background.
+    // The bootstrap does not wait for it: delivery checks the live parent, so
+    // it refuses a child that is behind and never serves a lost provider.
     if sandbox.parent.is_some() {
-        match tokio::time::timeout(
-            CHILD_POLICY_SYNC_ON_CONNECT_TIMEOUT,
-            crate::grpc::sync_one_child(state, &sandbox),
-        )
-        .await
-        {
-            Ok(Ok(crate::grpc::ChildSync::Done)) => {}
-            Ok(Ok(crate::grpc::ChildSync::Orphaned)) => {
-                // Stopping waits on this very session, so it runs apart from
-                // it. Delivery refuses the orphan configuration meanwhile.
-                let state = Arc::clone(state);
-                let sandbox = sandbox.clone();
-                tokio::spawn(async move {
-                    crate::grpc::stop_orphaned_child(&state, &sandbox).await;
-                });
-            }
-            Ok(Err(error)) => {
-                warn!(sandbox_id = %sandbox_id, error = %error, "child sandbox policy sync on connect failed");
-            }
-            Err(_) => {
-                warn!(sandbox_id = %sandbox_id, "child sandbox policy sync on connect timed out");
-            }
-        }
+        crate::grpc::spawn_child_sync(state, &sandbox);
     }
     let bootstrap = if pushes_config {
         Some(config_session::build_session_bootstrap(state, &sandbox).await?)

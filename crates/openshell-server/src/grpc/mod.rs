@@ -12,7 +12,7 @@ pub mod provider_readiness;
 mod sandbox;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
-pub use sandbox::{ChildSync, stop_orphaned_child, sync_all_children, sync_one_child};
+pub use sandbox::{spawn_child_sync, sync_all_children};
 mod service;
 mod validation;
 pub mod workspace;

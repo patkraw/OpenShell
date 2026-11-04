@@ -984,10 +984,6 @@ async fn check_parent_has_room(
 
 /// Policy-revision provenance naming the parent a child's policy was copied
 /// from. Gateway-owned: the `internal.openshell.ai/` prefix is reserved.
-/// How long a provider detach on a root waits for its children to lose the
-/// provider too. Each child's lock wait can take the full mutation lock
-/// timeout; children not reached in time catch up on connect or restart.
-const DETACH_CHILD_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const COPIED_FROM_PARENT_ID: &str = "internal.openshell.ai/copied-from-parent-id";
 /// The parent policy version a child's policy revision was copied from.
 const COPIED_FROM_PARENT_VERSION: &str = "internal.openshell.ai/copied-from-parent-version";
@@ -1055,18 +1051,6 @@ async fn parent_policy_revisions(
         None
     };
     Ok(Some((loaded, rejected)))
-}
-
-/// Whether a `fail_closed` parent rejected a revision newer than the one it
-/// loaded, and so denies all new egress until a fixed policy loads.
-pub(super) async fn parent_is_blocked(
-    state: &ServerState,
-    parent_id: &str,
-) -> Result<bool, Status> {
-    Ok(matches!(
-        parent_policy_revisions(state, parent_id).await?,
-        Some((_, Some(_)))
-    ))
 }
 
 /// Under the child-create lock, copy the policy the parent is enforcing: its
@@ -1278,6 +1262,174 @@ pub(super) async fn parent_is_missing(
         .await
         .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
         .is_none())
+}
+
+/// Before a child's configuration is built, check it against its parent's
+/// live record: refuse it while the parent is missing or blocked, and keep
+/// only the providers the parent still has, in the child's order. Returns the
+/// parent's loaded revision, which the child's copy must have reached. A root
+/// passes unchanged.
+pub(super) async fn admit_child(
+    state: &ServerState,
+    child: &mut Sandbox,
+) -> Result<Option<crate::persistence::PolicyRecord>, Status> {
+    let Some(parent_ref) = child.parent.clone() else {
+        return Ok(None);
+    };
+    let Some(parent) = state
+        .store
+        .get_message::<Sandbox>(&parent_ref.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+    else {
+        return Err(Status::failed_precondition(
+            crate::compute::orphaned_child_message(&parent_ref),
+        ));
+    };
+    let loaded = match parent_policy_revisions(state, &parent_ref.id).await? {
+        Some((_, Some(_))) => {
+            return Err(Status::failed_precondition(format!(
+                "parent sandbox '{}' rejected its latest policy",
+                parent_ref.name
+            )));
+        }
+        Some((loaded, None)) => Some(loaded),
+        None => None,
+    };
+    let parent_providers = parent.spec.map(|spec| spec.providers).unwrap_or_default();
+    if let Some(spec) = child.spec.as_mut() {
+        spec.providers
+            .retain(|name| parent_providers.contains(name));
+    }
+    Ok(loaded)
+}
+
+/// Whether `provider` is attached to `sandbox` as delivery sees it: for a
+/// child, attached to the child and still to its parent.
+pub(super) async fn provider_attached_for_delivery(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    provider: &str,
+) -> Result<bool, Status> {
+    let attached = |sandbox: &Sandbox| {
+        sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.providers.iter().any(|name| name == provider))
+    };
+    if !attached(sandbox) {
+        return Ok(false);
+    }
+    let Some(parent) = sandbox.parent.as_ref() else {
+        return Ok(true);
+    };
+    Ok(state
+        .store
+        .get_message::<Sandbox>(&parent.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .is_some_and(|parent| attached(&parent)))
+}
+
+/// Refuse a child whose policy copy is older than the policy its parent has
+/// loaded, so a missed or failed sync fails closed. Starts a sync, which
+/// publishes the child once its copy lands.
+pub(super) fn refuse_child_behind_parent(
+    state: &Arc<ServerState>,
+    child: &Sandbox,
+    parent_loaded: &crate::persistence::PolicyRecord,
+    child_latest: Option<&crate::persistence::PolicyRecord>,
+) -> Result<(), Status> {
+    let Some(parent) = child.parent.as_ref() else {
+        return Ok(());
+    };
+    let copied = child_latest.map_or(0, |record| copied_parent_version(record, &parent.id));
+    if copied >= parent_loaded.version {
+        return Ok(());
+    }
+    // A copy that can never succeed would refuse the child for good; say why
+    // once per parent version instead of retrying every rebuild.
+    if let Err(reason) = ParentPolicyCopy::of(parent_loaded, &parent.id) {
+        warn_uncopyable_parent_policy_once(&parent.id, parent_loaded.version, &reason);
+        return Err(Status::failed_precondition(format!(
+            "parent sandbox '{}' policy version {} cannot be copied to its children",
+            parent.name, parent_loaded.version
+        )));
+    }
+    spawn_child_sync(state, child);
+    Err(Status::failed_precondition(format!(
+        "parent sandbox '{}' policy version {} is not yet copied to this child",
+        parent.name, parent_loaded.version
+    )))
+}
+
+fn warn_uncopyable_parent_policy_once(parent_id: &str, version: i64, reason: &Status) {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(parent_id.to_string(), version) != Some(version) {
+        warn!(
+            parent_id,
+            version,
+            reason = %reason.message(),
+            "parent sandbox policy cannot be copied to its children; they are refused configuration"
+        );
+    }
+}
+
+/// The children with a background sync running on this replica.
+static CHILD_SYNCS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A child's entry in [`CHILD_SYNCS_IN_FLIGHT`]. Dropping it clears the entry
+/// on every exit, a panic included, so one failed sync never blocks the
+/// child's later ones.
+struct InFlightChildSync(String);
+
+impl InFlightChildSync {
+    fn claim(child_id: &str) -> Option<Self> {
+        Self::syncs()
+            .insert(child_id.to_string())
+            .then(|| Self(child_id.to_string()))
+    }
+
+    fn syncs() -> std::sync::MutexGuard<'static, HashSet<String>> {
+        CHILD_SYNCS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for InFlightChildSync {
+    fn drop(&mut self) {
+        Self::syncs().remove(&self.0);
+    }
+}
+
+/// Bring one child up to its parent in the background, at most one sync per
+/// child on this replica at a time. Stops the child if its parent is gone.
+pub fn spawn_child_sync(state: &Arc<ServerState>, child: &Sandbox) {
+    let child_id = child.object_id().to_string();
+    let Some(entry) = InFlightChildSync::claim(&child_id) else {
+        return;
+    };
+    let state = Arc::clone(state);
+    let child = child.clone();
+    tokio::spawn(async move {
+        let _entry = entry;
+        match sync_one_child(&state, &child).await {
+            Ok(ChildSync::Done) => {
+                state.sandbox_watch_bus.notify(&child_id);
+                crate::config_delivery::publish_sandbox(&state, &child_id);
+            }
+            // Stopping waits on the child's session, so it runs here, apart
+            // from any build. Delivery refuses the orphan meanwhile.
+            Ok(ChildSync::Orphaned) => stop_orphaned_child(&state, &child).await,
+            Err(error) => warn!(child_id, error = %error, "child sandbox sync failed"),
+        }
+    });
 }
 
 /// Stop a child whose parent record is gone. Delivery already refuses it
@@ -2863,23 +3015,17 @@ pub(super) async fn handle_detach_sandbox_provider(
         "DetachSandboxProvider request completed successfully"
     );
 
-    // A root's children lose what it loses. A child whose sync is cut short
-    // or fails catches up when it next connects or the gateway restarts.
-    if detached && sandbox.parent.is_none() {
-        match tokio::time::timeout(
-            DETACH_CHILD_SYNC_TIMEOUT,
-            Box::pin(sync_children(state, &sandbox_id)),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!(sandbox_name = %sandbox_name, error = %error, "child sandbox sync after provider detach failed");
-            }
-            Err(_) => {
-                warn!(sandbox_name = %sandbox_name, "child sandbox sync after provider detach timed out");
-            }
+    // A root's children lose what it loses. Delivery already serves them only
+    // the root's providers; the sync, never cancelled, removes the provider
+    // from their records and pushes each child. It runs for every root, so a
+    // retried detach still reaches children an earlier sync missed. Every
+    // session that follows the provider rebuilds at once, which includes
+    // the children: their records name it until the sync runs.
+    if sandbox.parent.is_none() {
+        if detached {
+            crate::config_delivery::publish_provider(state, &workspace, &request.provider);
         }
+        super::policy::spawn_child_policy_sync(state, &sandbox_id);
     }
 
     Ok(Response::new(DetachSandboxProviderResponse {
@@ -10388,8 +10534,8 @@ mod tests {
 
         // The parent's policy did not change, so the child's copy is current
         // and only the provider is removed, as a detach removes it.
+        eventually(|| async { sandbox_spec(&state, &worker_id).await.providers.is_empty() }).await;
         let after = sandbox_spec(&state, &worker_id).await;
-        assert!(after.providers.is_empty());
         assert_ne!(
             after.provider_attachment_epoch, before.provider_attachment_epoch,
             "the supervisor must see a new attachment epoch to drop the credential"
@@ -10405,7 +10551,7 @@ mod tests {
 
         detach_from_lead(&state, "work-github").await;
 
-        assert!(sandbox_spec(&state, &worker_id).await.providers.is_empty());
+        eventually(|| async { sandbox_spec(&state, &worker_id).await.providers.is_empty() }).await;
     }
 
     #[tokio::test]
@@ -10431,6 +10577,303 @@ mod tests {
         sync_one_child(&state, &worker).await.unwrap();
 
         assert!(sandbox_spec(&state, &worker_id).await.providers.is_empty());
+    }
+
+    /// Wait for a background sync to reach the store.
+    async fn eventually<F, Fut>(mut reached: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        for _ in 0..500 {
+            if reached().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("not reached within 5 seconds");
+    }
+
+    async fn sandbox_record(state: &ServerState, sandbox_id: &str) -> Sandbox {
+        state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn delivered_variables(state: &Arc<ServerState>, sandbox: &Sandbox) -> Vec<String> {
+        super::super::policy::build_provider_environment_snapshot(state, sandbox, true, true)
+            .await
+            .expect("provider environment")
+            .values
+            .into_iter()
+            .map(|value| value.name)
+            .collect()
+    }
+
+    /// Take a provider from the lead's record without any sync, as when the
+    /// sync after a detach is lost.
+    async fn lead_loses_providers_without_a_sync(state: &ServerState, lead_id: &str) {
+        let mut lead = sandbox_record(state, lead_id).await;
+        lead.spec.as_mut().unwrap().providers.clear();
+        state.store.put_message(&lead).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_loses_a_provider_its_parent_lost_at_its_next_build() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        let worker = sandbox_record(&state, &worker_id).await;
+        assert!(
+            delivered_variables(&state, &worker)
+                .await
+                .contains(&"GITHUB_TOKEN".to_string())
+        );
+
+        lead_loses_providers_without_a_sync(&state, &lead_id).await;
+
+        // No sync ran: the child's record still names the provider, but its
+        // very next build serves none of it.
+        assert_eq!(
+            sandbox_spec(&state, &worker_id).await.providers,
+            vec!["work-github"]
+        );
+        assert!(delivered_variables(&state, &worker).await.is_empty());
+        let inputs = super::super::policy::load_sandbox_config_inputs(&state, worker.clone())
+            .await
+            .unwrap();
+        assert!(inputs.sandbox().spec.as_ref().unwrap().providers.is_empty());
+        let config = child_config(&state, &worker_id).await;
+        assert!(config.configuration_admitted);
+        assert!(
+            !provider_attached_for_delivery(&state, &worker, "work-github")
+                .await
+                .unwrap(),
+            "readiness reports the provider as not attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detach_rebuilds_a_push_mode_child_at_once_without_a_sync() {
+        use openshell_core::proto::{SupervisorMessage, gateway_message, supervisor_message};
+
+        let mut state = child_sandboxes_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+        let (_, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            &worker_id,
+            crate::grpc::test_support::StreamFeatures::Apply,
+        )
+        .await
+        .unwrap();
+        let accepted = harness.inbound.message().await.unwrap().unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) = accepted.payload else {
+            panic!("expected SessionAccepted");
+        };
+        let bootstrap = accepted.bootstrap.expect("push bootstrap");
+        assert!(
+            bootstrap
+                .provider_environment
+                .as_ref()
+                .unwrap()
+                .values
+                .iter()
+                .any(|value| value.name == "GITHUB_TOKEN")
+        );
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                    crate::config_delivery::session::applied_result(&bootstrap),
+                )),
+            })
+            .await
+            .unwrap();
+        // The acknowledgement is recorded under the child's lock; live
+        // updates start once it is.
+        eventually(|| async {
+            !state
+                .supervisor_sessions
+                .config_update_in_flight(&worker_id, &accepted.session_id)
+        })
+        .await;
+        // Holding the child's lock keeps the sync from reaching it. The
+        // detach runs as its own task, as a request would.
+        let _guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", &worker_id))
+            .await
+            .unwrap();
+        let detach_state = Arc::clone(&state);
+        tokio::spawn(async move { detach_from_lead(&detach_state, "work-github").await })
+            .await
+            .unwrap();
+
+        // Acknowledge each update, as a supervisor does, until one without
+        // the credential arrives. The sync started on connect may push one
+        // first. Well under the 30 s re-check, so only the detach's own
+        // notification can explain it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = harness.inbound.message().await.unwrap().unwrap();
+                let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+                    continue;
+                };
+                harness
+                    .outbound
+                    .send(SupervisorMessage {
+                        payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                            crate::config_delivery::session::applied_result(&update),
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                if update
+                    .provider_environment
+                    .unwrap()
+                    .values
+                    .iter()
+                    .all(|value| value.name != "GITHUB_TOKEN")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the child is rebuilt at once, not at its 30 s re-check");
+        assert_eq!(
+            sandbox_spec(&state, &worker_id).await.providers,
+            vec!["work-github"],
+            "no sync has run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connecting_childs_first_configuration_lacks_a_provider_its_parent_lost() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        // The record read when the child connected, before any sync.
+        let read_at_connect = sandbox_record(&state, &worker_id).await;
+        lead_loses_providers_without_a_sync(&state, &lead_id).await;
+
+        let bootstrap =
+            crate::config_delivery::session::build_session_bootstrap(&state, &read_at_connect)
+                .await
+                .unwrap();
+
+        assert!(bootstrap.config.sandbox_config.configuration_admitted);
+        assert!(
+            bootstrap
+                .config
+                .provider_environment
+                .values
+                .iter()
+                .all(|value| value.name != "GITHUB_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_behind_its_parent_is_refused_until_its_copy_lands() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        // The lead loads v2, and the sync that would copy it is lost.
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+        let worker = sandbox_record(&state, &worker_id).await;
+        // Hold the lead's lock, which every child sync takes, so the sync the
+        // refusal starts cannot land before the checks below.
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", &lead_id))
+            .await
+            .unwrap();
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(!config.configuration_admitted);
+        assert_eq!(
+            config.configuration_error,
+            "Waiting for a copy of the parent sandbox's latest policy"
+        );
+        assert_eq!(
+            config.policy_validation_failure_mode,
+            openshell_core::PolicyValidationFailureMode::FailClosed.as_str()
+        );
+        let err =
+            super::super::policy::build_provider_environment_snapshot(&state, &worker, true, true)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            copied_version(&latest_policy(&state, &worker_id).await),
+            Some("1")
+        );
+
+        // The refusal started a sync; once it lands, the child is admitted.
+        drop(guard);
+        eventually(|| async {
+            copied_version(&latest_policy(&state, &worker_id).await) == Some("2")
+        })
+        .await;
+        let config = child_config(&state, &worker_id).await;
+        assert!(config.configuration_admitted);
+        assert!(config.policy.unwrap().network_policies.contains_key("api"));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_parents_child_is_refused_its_provider_environment() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        let worker = sandbox_record(&state, &worker_id).await;
+
+        let err =
+            super::super::policy::build_provider_environment_snapshot(&state, &worker, true, true)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "parent sandbox 'lead' rejected its latest policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_policy_that_cannot_be_copied_refuses_children_and_says_why() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        let mut uncopyable = lead_policy(false);
+        let rule = uncopyable.network_policies.remove("api").unwrap();
+        uncopyable
+            .network_policies
+            .insert("_provider_github".to_string(), rule);
+        put_policy_revision_with_status(&state, &lead_id, 2, &uncopyable, "loaded").await;
+        let worker = sandbox_record(&state, &worker_id).await;
+
+        let err = super::super::policy::load_sandbox_config_inputs(&state, worker)
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "parent sandbox 'lead' policy version 2 cannot be copied to its children"
+        );
+        let config = child_config(&state, &worker_id).await;
+        assert_eq!(
+            config.configuration_error,
+            "The parent sandbox's policy cannot be copied to children; fix the parent's policy"
+        );
+        // No sync is started for a copy that cannot succeed.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            copied_version(&latest_policy(&state, &worker_id).await),
+            Some("1")
+        );
     }
 
     #[tokio::test]
