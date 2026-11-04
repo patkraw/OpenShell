@@ -4,9 +4,10 @@
 //! Sandbox-local door to the gateway's MCP endpoint.
 //!
 //! The workload reaches `http://openshell.local/mcp`. The supervisor forwards
-//! the request body to the gateway's `/mcp` over this sandbox's existing
-//! gateway connection, which carries the sandbox's own credentials. The
-//! workload never holds a gateway credential.
+//! the request body to the gateway's `/mcp` over one gateway connection the
+//! door opens on first use and then reuses, with the sandbox's own
+//! credentials attached to each request. The workload never holds a gateway
+//! credential.
 
 use crate::policy_local::PolicyLocalContext;
 use bytes::Bytes;
@@ -26,6 +27,9 @@ const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Covers the gateway's 45 second tool limit with margin.
 const GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+/// Door requests one sandbox may have open at once, so a workload cannot
+/// flood the gateway through its supervisor.
+const MAX_CONCURRENT_REQUESTS: usize = 8;
 /// Request headers copied from the workload. Identity headers are never copied.
 const FORWARDED_HEADERS: [&str; 3] = ["content-type", "accept", "mcp-protocol-version"];
 
@@ -86,6 +90,16 @@ where
         )
         .await;
     }
+    let door = ctx.mcp_door();
+    let Ok(_slot) = door.slots.try_acquire() else {
+        return refuse(
+            client,
+            method,
+            503,
+            "too many gateway requests at once; try again",
+        )
+        .await;
+    };
     let body =
         crate::policy_local::read_request_body(initial_request, client, MAX_REQUEST_BYTES).await?;
     let Some(gateway) = ctx.gateway() else {
@@ -110,7 +124,7 @@ where
         )))
         .into_diagnostic()?;
 
-    match tokio::time::timeout(GATEWAY_TIMEOUT, forward(gateway, request)).await {
+    match tokio::time::timeout(GATEWAY_TIMEOUT, forward(door, gateway, request)).await {
         Ok(Ok((status, content_type, reply))) => {
             emit_door_event(
                 method,
@@ -130,6 +144,16 @@ where
             )
             .await
         }
+        Ok(Err(Forward::Refused(error))) => {
+            tracing::warn!(%error, "openshell.local: gateway request refused locally");
+            refuse(
+                client,
+                method,
+                502,
+                "this sandbox's gateway credentials are not available",
+            )
+            .await
+        }
         Ok(Err(Forward::Unreachable(error))) => {
             tracing::warn!(%error, "openshell.local: gateway request failed");
             refuse(client, method, 502, "gateway unreachable").await
@@ -141,21 +165,85 @@ where
 enum Forward {
     Unreachable(String),
     TooLarge,
+    /// The request was refused before it reached `/mcp`, such as by the
+    /// credential interceptor once the sandbox's token is revoked.
+    Refused(String),
 }
 
-/// POST to the gateway's `/mcp` over this sandbox's authenticated gateway
-/// channel, so TLS, the gateway address and token renewal are shared with gRPC.
+/// The door's gateway connection and request slots, shared by every door
+/// request of one sandbox.
+pub struct DoorConnection {
+    /// Opened on first use and reused: one HTTP/2 connection carries every
+    /// request. The interceptor reads the sandbox's token slot on each
+    /// request, so a renewed token is used without reconnecting.
+    channel: tokio::sync::Mutex<Option<openshell_core::grpc_client::AuthedChannel>>,
+    slots: tokio::sync::Semaphore,
+}
+
+impl Default for DoorConnection {
+    fn default() -> Self {
+        Self {
+            channel: tokio::sync::Mutex::new(None),
+            slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS),
+        }
+    }
+}
+
+impl DoorConnection {
+    async fn channel(
+        &self,
+        gateway: &openshell_core::grpc_client::GatewayEndpoint,
+    ) -> std::result::Result<openshell_core::grpc_client::AuthedChannel, Forward> {
+        let mut cached = self.channel.lock().await;
+        if let Some(channel) = cached.as_ref() {
+            return Ok(channel.clone());
+        }
+        let channel = openshell_core::grpc_client::connect_channel_pub(gateway)
+            .await
+            .map_err(|e| Forward::Unreachable(e.to_string()))?;
+        *cached = Some(channel.clone());
+        Ok(channel)
+    }
+
+    /// Drop the cached connection after a transport failure, so the next
+    /// request connects again.
+    async fn discard(&self) {
+        *self.channel.lock().await = None;
+    }
+}
+
+/// POST to the gateway's `/mcp` over the door's gateway connection, which
+/// shares TLS settings, the gateway address and the token slot with gRPC.
 async fn forward(
+    door: &DoorConnection,
     gateway: &openshell_core::grpc_client::GatewayEndpoint,
     request: http::Request<tonic::body::Body>,
 ) -> std::result::Result<(u16, String, Vec<u8>), Forward> {
-    let channel = openshell_core::grpc_client::connect_channel_pub(gateway)
-        .await
-        .map_err(|e| Forward::Unreachable(e.to_string()))?;
-    let response = channel
-        .oneshot(request)
-        .await
-        .map_err(|e| Forward::Unreachable(e.to_string()))?;
+    let channel = door.channel(gateway).await?;
+    let response = match channel.oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            door.discard().await;
+            return Err(Forward::Unreachable(error.to_string()));
+        }
+    };
+    // `/mcp` never answers with gRPC status. One here comes from the channel
+    // itself, which reports a refusal as an empty gRPC reply, not as an error.
+    if let Some(code) = response
+        .headers()
+        .get("grpc-status")
+        .filter(|code| code.as_bytes() != b"0")
+    {
+        let message = response
+            .headers()
+            .get("grpc-message")
+            .and_then(|message| message.to_str().ok())
+            .unwrap_or_default();
+        return Err(Forward::Refused(format!(
+            "grpc-status {}: {message}",
+            String::from_utf8_lossy(code.as_bytes())
+        )));
+    }
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -166,7 +254,13 @@ async fn forward(
     let mut body = response.into_body();
     let mut reply = Vec::new();
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|e| Forward::Unreachable(e.to_string()))?;
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                door.discard().await;
+                return Err(Forward::Unreachable(error.to_string()));
+            }
+        };
         if let Some(data) = frame.data_ref() {
             if reply.len() + data.len() > MAX_RESPONSE_BYTES {
                 return Err(Forward::TooLarge);
@@ -445,5 +539,169 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    }
+
+    const PING: &[u8] =
+        b"POST /mcp HTTP/1.1\r\nHost: openshell.local\r\nContent-Length: 2\r\n\r\n{}";
+
+    /// A plaintext HTTP/2 gateway that counts the connections it accepts,
+    /// can drop them all, and answers each request only once `replies`
+    /// grants a permit.
+    struct CountingGateway {
+        endpoint: GatewayEndpoint,
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        replies: Arc<tokio::sync::Semaphore>,
+        open: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    }
+
+    impl CountingGateway {
+        async fn start(replies: usize) -> Self {
+            use std::sync::atomic::Ordering;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let replies = Arc::new(tokio::sync::Semaphore::new(replies));
+            let open: Arc<Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
+            let (counted, seen, gate, tasks) = (
+                connections.clone(),
+                requests.clone(),
+                replies.clone(),
+                open.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let (seen, gate) = (seen.clone(), gate.clone());
+                    let task = tokio::spawn(async move {
+                        let service = hyper::service::service_fn(
+                            move |_: http::Request<hyper::body::Incoming>| {
+                                let (seen, gate) = (seen.clone(), gate.clone());
+                                async move {
+                                    seen.fetch_add(1, Ordering::SeqCst);
+                                    gate.acquire().await.unwrap().forget();
+                                    Ok::<_, std::convert::Infallible>(
+                                        http::Response::builder()
+                                            .header("content-type", "application/json")
+                                            .body(http_body_util::Full::new(Bytes::from_static(
+                                                b"{}",
+                                            )))
+                                            .unwrap(),
+                                    )
+                                }
+                            },
+                        );
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                    });
+                    tasks.lock().unwrap().push(task.abort_handle());
+                }
+            });
+            let credentials = GatewayCredentials::from_gateway_token("sandbox-token").unwrap();
+            Self {
+                endpoint: GatewayEndpoint::new(format!("http://{address}"), credentials),
+                connections,
+                requests,
+                replies,
+                open,
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Close every connection the gateway holds, as a restart would.
+        fn drop_connections(&self) {
+            for task in self.open.lock().unwrap().drain(..) {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn door_requests_share_one_gateway_connection() {
+        let gateway = CountingGateway::start(usize::MAX >> 4).await;
+        let ctx = context(Some(gateway.endpoint.clone()));
+
+        for _ in 0..5 {
+            let response = door(&ctx, PING).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        assert_eq!(gateway.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_door_reconnects_after_the_gateway_drops_its_connection() {
+        let gateway = CountingGateway::start(usize::MAX >> 4).await;
+        let ctx = context(Some(gateway.endpoint.clone()));
+        assert!(door(&ctx, PING).await.starts_with("HTTP/1.1 200"));
+
+        gateway.drop_connections();
+
+        // The request on the dropped connection may fail once; the next one
+        // must reach the gateway on a new connection.
+        let mut response = door(&ctx, PING).await;
+        if !response.starts_with("HTTP/1.1 200") {
+            response = door(&ctx, PING).await;
+        }
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(gateway.connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_door_refuses_at_once_when_every_slot_is_busy() {
+        let gateway = CountingGateway::start(0).await;
+        let ctx = Arc::new(context(Some(gateway.endpoint.clone())));
+        let busy: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
+            .map(|_| {
+                let ctx = ctx.clone();
+                tokio::spawn(async move { door(&ctx, PING).await })
+            })
+            .collect();
+        while gateway.requests.load(std::sync::atomic::Ordering::SeqCst) < MAX_CONCURRENT_REQUESTS {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), door(&ctx, PING))
+            .await
+            .expect("refused at once, not queued");
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.ends_with("too many gateway requests at once; try again"));
+
+        // Finished requests free their slots.
+        gateway.replies.add_permits(MAX_CONCURRENT_REQUESTS + 1);
+        for request in busy {
+            assert!(request.await.unwrap().starts_with("HTTP/1.1 200"));
+        }
+        assert!(door(&ctx, PING).await.starts_with("HTTP/1.1 200"));
+    }
+
+    #[tokio::test]
+    async fn a_reused_connection_reads_the_token_slot_on_every_request() {
+        let gateway = CountingGateway::start(usize::MAX >> 4).await;
+        let ctx = context(Some(gateway.endpoint.clone()));
+        assert!(door(&ctx, PING).await.starts_with("HTTP/1.1 200"));
+
+        // Renewal and revocation write the same slot. Revoking shows the
+        // cached connection does not keep the token it was opened with.
+        gateway.endpoint.credentials().revoke();
+        let before = gateway.requests.load(std::sync::atomic::Ordering::SeqCst);
+        let response = door(&ctx, PING).await;
+
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(response.ends_with("this sandbox's gateway credentials are not available"));
+        assert_eq!(
+            gateway.requests.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "the request never reached the gateway"
+        );
     }
 }
