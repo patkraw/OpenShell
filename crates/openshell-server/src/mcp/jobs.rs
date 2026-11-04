@@ -9,10 +9,9 @@
 //! like any exec argument; it is never part of the script text.
 
 use super::{
-    CapturedOutput, ExecArgs, McpConnection, OUTPUT_EDGE_BYTES, Refusal, ToolError,
-    arguments_object, run_in_child,
+    Call, CapturedOutput, ExecArgs, OUTPUT_EDGE_BYTES, Refusal, ToolError, arguments_object,
+    run_in_child,
 };
-use axum::http::HeaderMap;
 use openshell_core::proto::ExecSandboxRequest;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -58,11 +57,7 @@ impl JobHandle {
 }
 
 /// Start `args.command` as the child's background job and return its handle.
-pub(super) async fn start(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-    args: ExecArgs,
-) -> Result<Value, ToolError> {
+pub(super) async fn start(call: &Call<'_>, args: ExecArgs) -> Result<Value, ToolError> {
     let token = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
     let has_stdin = if args.stdin.is_empty() { "0" } else { "1" };
     let mut command = script_command("start");
@@ -75,7 +70,7 @@ pub(super) async fn start(
         stdin: args.stdin,
         ..Default::default()
     };
-    let outcome = run_in_child(connection, headers, request, STEP_TIMEOUT, STEP_GRACE).await?;
+    let outcome = run_in_child(call, request, STEP_TIMEOUT, STEP_GRACE).await?;
     let stdout = outcome.stdout.into_bytes();
     let line = String::from_utf8_lossy(&stdout);
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -113,16 +108,12 @@ pub(super) async fn start(
 
 /// Wait up to `timeout_s` for a job, checking every [`WAIT_POLL`]; a job
 /// still running at the end is not an error.
-pub(super) async fn wait(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-    arguments: &Value,
-) -> Result<Value, ToolError> {
+pub(super) async fn wait(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
     let (name, handle, timeout) = parse_wait_args(arguments)?;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let state = check(connection, headers, &name, &handle, remaining).await?;
+        let state = check(call, &name, &handle, remaining).await?;
         let reply = match state {
             JobState::Running if remaining > WAIT_POLL => {
                 tokio::time::sleep(WAIT_POLL).await;
@@ -146,8 +137,7 @@ pub(super) async fn wait(
                 out_bytes,
                 err_bytes,
             } => {
-                let (stdout, stderr) =
-                    output(connection, headers, &name, &handle, out_bytes, err_bytes).await?;
+                let (stdout, stderr) = output(call, &name, &handle, out_bytes, err_bytes).await?;
                 let (stdout, stdout_truncated, stdout_binary) = stdout.render();
                 let (stderr, stderr_truncated, stderr_binary) = stderr.render();
                 json!({
@@ -215,8 +205,7 @@ impl JobState {
 
 /// One check of a job, limited to what is left of the caller's wait.
 async fn check(
-    connection: &McpConnection,
-    headers: &HeaderMap,
+    call: &Call<'_>,
     name: &str,
     handle: &JobHandle,
     remaining: Duration,
@@ -229,7 +218,7 @@ async fn check(
         ..Default::default()
     };
     let timeout = remaining.clamp(Duration::from_secs(1), STEP_TIMEOUT);
-    let outcome = run_in_child(connection, headers, request, timeout, STEP_GRACE).await?;
+    let outcome = run_in_child(call, request, timeout, STEP_GRACE).await?;
     let stdout = outcome.stdout.into_bytes();
     let line = String::from_utf8_lossy(&stdout);
     if let Some((0, _)) = outcome.exit {
@@ -242,8 +231,7 @@ async fn check(
 /// The edges of a finished job's output. Only the bytes the reply keeps
 /// leave the child.
 async fn output(
-    connection: &McpConnection,
-    headers: &HeaderMap,
+    call: &Call<'_>,
     name: &str,
     handle: &JobHandle,
     out_bytes: usize,
@@ -260,7 +248,7 @@ async fn output(
         command,
         ..Default::default()
     };
-    let outcome = run_in_child(connection, headers, request, STEP_TIMEOUT, STEP_GRACE).await?;
+    let outcome = run_in_child(call, request, STEP_TIMEOUT, STEP_GRACE).await?;
     match outcome.exit {
         Some((0, _)) => Ok((
             CapturedOutput::from_edges(&outcome.stdout.into_bytes(), out_bytes),

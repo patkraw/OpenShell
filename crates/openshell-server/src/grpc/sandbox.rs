@@ -9090,10 +9090,7 @@ mod tests {
         tool: &str,
         arguments: serde_json::Value,
     ) -> serde_json::Value {
-        use crate::auth::authenticator::test_support::MockAuthenticator;
-        use crate::auth::authenticator::{Authentication, AuthenticatorChain};
         use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
-        use tower::ServiceExt;
 
         let caller = Principal::Sandbox(SandboxPrincipal {
             sandbox_id: caller_id.to_string(),
@@ -9103,6 +9100,23 @@ mod tests {
             },
             trust_domain: Some("openshell".to_string()),
         });
+        call_mcp_as(state, caller, None, None, tool, arguments).await
+    }
+
+    /// Call one MCP tool as `caller` through the real router and handlers,
+    /// with an RBAC policy and a bridge workspace header when given.
+    async fn call_mcp_as(
+        state: &Arc<ServerState>,
+        caller: crate::auth::principal::Principal,
+        authz_policy: Option<crate::auth::authz::AuthzPolicy>,
+        workspace: Option<&str>,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        use crate::auth::authenticator::test_support::MockAuthenticator;
+        use crate::auth::authenticator::{Authentication, AuthenticatorChain};
+        use tower::ServiceExt;
+
         let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
             Authentication::Accepted(caller),
         )))]);
@@ -9111,7 +9125,7 @@ mod tests {
                 crate::OpenShellService::new(state.clone()),
             ),
             Some(chain),
-            None,
+            authz_policy,
         );
         let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack)
             .with_short_create_wait();
@@ -9119,12 +9133,16 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": tool, "arguments": arguments},
         });
+        let mut request = http::Request::post("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer caller-token");
+        if let Some(workspace) = workspace {
+            request = request.header("x-openshell-workspace", workspace);
+        }
         let response = crate::mcp::router()
             .layer(axum::Extension(connection))
             .oneshot(
-                http::Request::post("/mcp")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer sandbox-token")
+                request
                     .body(axum::body::Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -9887,8 +9905,210 @@ mod tests {
         assert_eq!(result["isError"], true, "{result}");
         assert_eq!(
             result["structuredContent"]["message"],
-            "child sandbox 'w1' failed: image pull failed"
+            "sandbox 'w1' failed: image pull failed"
         );
+    }
+
+    fn mcp_user(subject: &str, roles: &[&str]) -> crate::auth::principal::Principal {
+        crate::auth::principal::Principal::User(crate::auth::principal::UserPrincipal {
+            identity: crate::auth::identity::Identity {
+                subject: subject.to_string(),
+                display_name: None,
+                roles: roles.iter().map(ToString::to_string).collect(),
+                scopes: Vec::new(),
+                provider: crate::auth::identity::IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    /// A child-sandbox state whose users are checked against workspace
+    /// membership (an empty admin role would make every user an admin).
+    async fn member_checked_state() -> Arc<ServerState> {
+        let mut state = child_sandboxes_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        state
+    }
+
+    fn mcp_names(result: &serde_json::Value) -> Vec<String> {
+        result["structuredContent"]["sandboxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sandbox| sandbox["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn mcp_users_act_only_in_workspaces_they_belong_to() {
+        let state = member_checked_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        let far_id = put_parent_record(&state, "far", &[], None, false).await;
+        let mut far = state
+            .store
+            .get_message::<Sandbox>(&far_id)
+            .await
+            .unwrap()
+            .unwrap();
+        far.metadata.as_mut().unwrap().workspace = "team".to_string();
+        state.store.delete("sandbox", &far_id).await.unwrap();
+        state.store.put_message(&far).await.unwrap();
+        put_member(&state, "alice").await;
+        let alice = || mcp_user("alice", &["openshell-user"]);
+
+        let list = call_mcp_as(&state, alice(), None, None, "list", serde_json::json!({})).await;
+        assert_eq!(list["isError"], false, "{list}");
+        assert_eq!(mcp_names(&list), vec!["lead".to_string()]);
+        let logs = call_mcp_as(
+            &state,
+            alice(),
+            None,
+            None,
+            "logs",
+            serde_json::json!({"name": "lead"}),
+        )
+        .await;
+        assert_eq!(logs["isError"], false, "{logs}");
+
+        // Another workspace, and a sandbox there, read as missing.
+        let logs = call_mcp_as(
+            &state,
+            alice(),
+            None,
+            Some("team"),
+            "logs",
+            serde_json::json!({"name": "far"}),
+        )
+        .await;
+        assert_eq!(logs["structuredContent"]["error"], "not_found", "{logs}");
+        let list = call_mcp_as(
+            &state,
+            alice(),
+            None,
+            Some("team"),
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(list["isError"], true, "{list}");
+        // So does a sandbox in a workspace the user is not a member of.
+        let bob = mcp_user("bob", &["openshell-user"]);
+        let logs = call_mcp_as(
+            &state,
+            bob,
+            None,
+            None,
+            "logs",
+            serde_json::json!({"name": "lead"}),
+        )
+        .await;
+        assert_eq!(logs["structuredContent"]["error"], "not_found", "{logs}");
+    }
+
+    #[tokio::test]
+    async fn mcp_users_need_the_role_for_each_method() {
+        let state = member_checked_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        put_member(&state, "carol").await;
+        let policy = || crate::auth::authz::AuthzPolicy {
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_enabled: false,
+        };
+
+        let refused = call_mcp_as(
+            &state,
+            mcp_user("carol", &[]),
+            Some(policy()),
+            None,
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            refused["structuredContent"]["error"], "permission_denied",
+            "{refused}"
+        );
+        let allowed = call_mcp_as(
+            &state,
+            mcp_user("carol", &["openshell-user"]),
+            Some(policy()),
+            None,
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(allowed["isError"], false, "{allowed}");
+    }
+
+    #[tokio::test]
+    async fn mcp_users_create_roots_and_children_but_no_grandchildren() {
+        let state = member_checked_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        put_member(&state, "alice").await;
+        let create = |arguments| {
+            call_mcp_as(
+                &state,
+                mcp_user("alice", &["openshell-user"]),
+                None,
+                None,
+                "create_sandbox",
+                arguments,
+            )
+        };
+
+        let root = create(serde_json::json!({"name": "r1", "image": "alpine:3"})).await;
+        assert_eq!(root["isError"], false, "{root}");
+        let r1 = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "r1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r1.parent.is_none());
+        assert_eq!(r1.created_by, "alice");
+        assert_eq!(
+            r1.spec.as_ref().unwrap().template.as_ref().unwrap().image,
+            "alpine:3"
+        );
+
+        let child = create(serde_json::json!({"name": "c1", "parent": "lead"})).await;
+        assert_eq!(child["isError"], false, "{child}");
+        assert_eq!(child["structuredContent"]["parent"], "lead");
+
+        let grandchild = create(serde_json::json!({"name": "g1", "parent": "c1"})).await;
+        assert_eq!(grandchild["isError"], true, "{grandchild}");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_sandbox_caller_ignores_a_workspace_header() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        put_parent_record(&state, "w1", &[], Some(link), false).await;
+        let caller =
+            crate::auth::principal::Principal::Sandbox(crate::auth::principal::SandboxPrincipal {
+                sandbox_id: lead_id,
+                source: crate::auth::principal::SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                    auth_epoch: None,
+                },
+                trust_domain: Some("openshell".to_string()),
+            });
+
+        let list = call_mcp_as(
+            &state,
+            caller,
+            None,
+            Some("team"),
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(list["isError"], false, "{list}");
+        assert_eq!(mcp_names(&list), vec!["w1".to_string()]);
     }
 
     #[tokio::test]
