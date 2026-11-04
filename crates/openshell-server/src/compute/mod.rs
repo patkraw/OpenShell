@@ -12,7 +12,7 @@ mod provisioning_operation;
 pub mod rootfs_tar;
 
 pub use mutation_guard::MutationScope;
-use mutation_guard::{LocalMutationGuard, LocalMutationLocks, MutationGuard};
+use mutation_guard::{LocalMutationGuard, LocalMutationLocks, MutationGuard, SandboxDeleteGuard};
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -3357,7 +3357,11 @@ impl ComputeRuntime {
         preconditions: SandboxDeletePreconditions,
     ) -> Result<DeleteSandboxResult, Status> {
         let delete_guard = self.lifecycle_gates.lock_for(&target.sandbox_id).await;
-        let sandbox_guard = self.lock_sandbox_for_lifecycle(&delete_guard).await;
+        let sandbox_guard = Box::pin(self.lock_sandbox_for_delete(&delete_guard))
+            .await
+            .map_err(|err| {
+                crate::grpc::persistence_error_to_status(err, "acquire sandbox delete lock")
+            })?;
 
         // There is no await between acquiring the initial guards and spawning
         // the worker. From this commitment point onward, request cancellation
@@ -3400,7 +3404,7 @@ impl ComputeRuntime {
         target: SandboxDeleteTarget,
         preconditions: SandboxDeletePreconditions,
         delete_guard: SandboxLifecycleGuard,
-        guard: LocalMutationGuard,
+        guard: SandboxDeleteGuard,
     ) -> Result<DeleteSandboxResult, Status> {
         let current = self
             .store
@@ -3439,9 +3443,10 @@ impl ComputeRuntime {
                 "sandbox resource version changed before delete mutation",
             ));
         }
-        // Checked under the sandbox's lock, which a child create also takes on
-        // its parent, so a child cannot be added between this check and the
-        // delete. Children already being deleted do not block.
+        // Checked under the root's mutation guard, which a child create on any
+        // replica also takes on its parent, so a child cannot be added between
+        // this check and the delete. Children already being deleted do not
+        // block.
         if current.parent.is_none() {
             let live_children = self.live_child_count(&current).await?;
             if live_children > 0 {
