@@ -1509,6 +1509,14 @@ mod tests {
             .update_policy_status(sandbox_id, version, "loaded", None, Some(1))
             .await
             .unwrap();
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.set_current_policy_version(u32::try_from(version).unwrap());
+        state.store.put_message(&sandbox).await.unwrap();
     }
 
     /// Receive the next configuration update and acknowledge it, as a
