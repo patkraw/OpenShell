@@ -3434,24 +3434,11 @@ impl ComputeRuntime {
 
     /// Count a root's children that are not already being deleted.
     async fn live_child_count(&self, parent: &Sandbox) -> Result<usize, Status> {
-        let sandboxes = self
-            .store
-            .collect_messages::<Sandbox>(ObjectListQuery::Workspace(parent.object_workspace()))
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        Ok(sandboxes
-            .iter()
-            .filter(|sandbox| {
-                sandbox
-                    .parent
-                    .as_ref()
-                    .is_some_and(|link| link.id == parent.object_id())
-                    && sandbox
-                        .metadata
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.deletion_time.is_none())
-            })
-            .count())
+        Ok(
+            count_children(&self.store, parent.object_workspace(), parent.object_id())
+                .await?
+                .live,
+        )
     }
 
     async fn delete_sandbox_inner(
@@ -8261,6 +8248,54 @@ pub const ORPHANED_CHILD_SUFFIX: &str = "no longer exists; delete this child san
 
 /// Why an orphaned child is refused configuration and starts. Names the
 /// parent by id too: a root created later under the same name is not it.
+/// A parent's children, split by whether their delete has started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChildCount {
+    pub live: usize,
+    pub being_deleted: usize,
+}
+
+impl ChildCount {
+    pub fn total(self) -> usize {
+        self.live + self.being_deleted
+    }
+}
+
+/// Whether a sandbox's delete has started. It keeps its record, and its
+/// compute resources may still run, until the driver finishes.
+pub fn is_being_deleted(sandbox: &Sandbox) -> bool {
+    sandbox
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
+}
+
+/// Count a parent's children by scanning its workspace.
+pub async fn count_children(
+    store: &Store,
+    workspace: &str,
+    parent_id: &str,
+) -> Result<ChildCount, Status> {
+    let sandboxes = store
+        .collect_messages::<Sandbox>(ObjectListQuery::Workspace(workspace))
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    let mut count = ChildCount::default();
+    for sandbox in sandboxes.iter().filter(|sandbox| {
+        sandbox
+            .parent
+            .as_ref()
+            .is_some_and(|parent| parent.id == parent_id)
+    }) {
+        if is_being_deleted(sandbox) {
+            count.being_deleted += 1;
+        } else {
+            count.live += 1;
+        }
+    }
+    Ok(count)
+}
+
 pub fn orphaned_child_message(parent: &openshell_core::proto::SandboxParent) -> String {
     format!(
         "parent sandbox '{}' (id {}) {ORPHANED_CHILD_SUFFIX}",
