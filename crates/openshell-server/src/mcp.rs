@@ -738,8 +738,17 @@ fn tool_call_details(
     result: &Result<Value, ToolError>,
 ) -> Vec<(&'static str, String)> {
     let mut details = audit_details(tool, arguments);
-    let Ok(content) = result else {
-        return details;
+    let content = match result {
+        Ok(content) => content,
+        Err(ToolError::Refused(Refusal {
+            withheld: Some(withheld),
+            ..
+        })) => {
+            details.push(("request_id", withheld.request_id.clone()));
+            details.push(("error_detail", withheld.detail.clone()));
+            return details;
+        }
+        Err(_) => return details,
     };
     let flag = |key: &str| content.get(key).and_then(Value::as_bool);
     match tool {
@@ -1091,6 +1100,7 @@ async fn create_child(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolE
                         args.name
                     ),
                     retryable: false,
+                    withheld: None,
                 }))
             }
         }
@@ -1114,6 +1124,7 @@ async fn wait_until_ready(
                 code: "not_found",
                 message: format!("sandbox '{name}' not found"),
                 retryable: false,
+                withheld: None,
             }));
         };
         let mut reply = child_summary(&child);
@@ -1125,6 +1136,7 @@ async fn wait_until_ready(
                     code: "failed_precondition",
                     message: format!("sandbox '{name}' failed: {}", failure_message(&child)),
                     retryable: false,
+                    withheld: None,
                 }));
             }
             _ => {}
@@ -1311,6 +1323,15 @@ struct Refusal {
     code: &'static str,
     message: String,
     retryable: bool,
+    /// What the agent is not shown, for the gateway log and the audit event.
+    withheld: Option<Withheld>,
+}
+
+/// An error's own text, withheld from the agent, and the request id that
+/// matches the agent's message to the gateway log and the audit event.
+struct Withheld {
+    request_id: String,
+    detail: String,
 }
 
 impl Refusal {
@@ -1325,11 +1346,30 @@ impl ToolError {
             code: "invalid_argument",
             message: message.to_string(),
             retryable: false,
+            withheld: None,
         })
     }
 
-    /// Map a gRPC status to the agent-facing error. Internal errors can carry
-    /// store or driver detail, so their text is logged, not returned.
+    /// A retryable error whose text is logged and audited, not returned:
+    /// internal and unavailable errors can carry store or driver detail.
+    fn withheld(code: &'static str, summary: &str, status: &tonic::Status) -> Self {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        warn!(%request_id, code, error = %status.message(), "mcp: tool call failed");
+        Self::Refused(Refusal {
+            code,
+            message: format!(
+                "{summary} (request {request_id}); the operator can find it in the gateway logs"
+            ),
+            retryable: true,
+            withheld: Some(Withheld {
+                request_id,
+                detail: status.message().to_string(),
+            }),
+        })
+    }
+
+    /// Map a gRPC status to the agent-facing error. Internal, unknown and
+    /// unavailable errors are withheld; the rest are written for agents.
     fn from_status(status: tonic::Status) -> Self {
         use tonic::Code;
         let (code, retryable) = match status.code() {
@@ -1341,24 +1381,18 @@ impl ToolError {
             Code::PermissionDenied => ("permission_denied", false),
             Code::ResourceExhausted if is_rate_limit(&status) => ("rate_limited", true),
             Code::ResourceExhausted => ("limit_reached", false),
-            Code::Unavailable | Code::Aborted => ("unavailable", true),
+            Code::Aborted => ("unavailable", true),
             Code::DeadlineExceeded => ("timed_out", true),
-            _ => {
-                let request_id = uuid::Uuid::new_v4();
-                warn!(%request_id, error = %status.message(), "mcp: internal error");
-                return Self::Refused(Refusal {
-                    code: "internal",
-                    message: format!(
-                        "internal error (request {request_id}); the operator can find it in the gateway logs"
-                    ),
-                    retryable: true,
-                });
+            Code::Unavailable => {
+                return Self::withheld("unavailable", "gateway unavailable", &status);
             }
+            _ => return Self::withheld("internal", "internal error", &status),
         };
         Self::Refused(Refusal {
             code,
             message: status.message().to_string(),
             retryable,
+            withheld: None,
         })
     }
 }
@@ -1681,6 +1715,22 @@ mod tests {
             &json!({"name": long, "command": [long], "workdir": long, "timeout_s": long}),
             &Ok(json!({"job": long, "state": long})),
         ));
+        worst.push(("acting_for", long.clone()));
+        let worst = capped_audit_details(worst);
+        let total: usize = worst
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        assert!(total <= 4096, "{total}");
+
+        // So does a failed call, which records the withheld error instead.
+        let mut worst = capped_audit_details(tool_call_details(
+            "exec",
+            &json!({"name": long, "command": [long], "workdir": long, "timeout_s": long}),
+            &Err(ToolError::from_status(tonic::Status::internal(
+                long.clone(),
+            ))),
+        ));
         worst.push(("acting_for", long));
         let worst = capped_audit_details(worst);
         let total: usize = worst
@@ -1721,6 +1771,52 @@ mod tests {
                 refused["message"],
                 format!("mcp tool call exec: refused ({code})")
             );
+        }
+    }
+
+    /// Internal, unknown and unavailable errors can carry store or driver
+    /// detail: the agent gets a request id instead, and keeps its retry hint.
+    #[test]
+    fn internal_detail_never_reaches_the_agent() {
+        let detail = "store pool exhausted at 10.0.0.3:5432";
+        for (status, code) in [
+            (tonic::Status::internal(detail), "internal"),
+            (tonic::Status::unknown(detail), "internal"),
+            (tonic::Status::unavailable(detail), "unavailable"),
+        ] {
+            let ToolError::Refused(refusal) = ToolError::from_status(status) else {
+                panic!("not a refusal");
+            };
+            assert_eq!((refusal.code, refusal.retryable), (code, true));
+            assert!(!refusal.message.contains("10.0.0.3"), "{}", refusal.message);
+            // The audit event keeps the detail, under the id the agent sees.
+            let message = refusal.message.clone();
+            let fields = recorded("list", json!({}), Err(ToolError::Refused(refusal)));
+            assert_eq!(fields["error_detail"], detail);
+            assert!(
+                message.contains(&format!("(request {})", fields["request_id"])),
+                "{message}"
+            );
+        }
+        let fields = recorded(
+            "list",
+            json!({}),
+            Err(ToolError::from_status(tonic::Status::internal(
+                "é".repeat(400),
+            ))),
+        );
+        assert!(fields["error_detail"].len() <= MAX_AUDIT_FIELD_BYTES);
+        assert!(fields["error_detail"].ends_with(AUDIT_CUT_MARKER));
+        // Messages written for agents are kept.
+        for status in [
+            tonic::Status::failed_precondition("parent sandbox 'lead' is being deleted"),
+            tonic::Status::invalid_argument("name must be at most 63 characters"),
+        ] {
+            let message = status.message().to_string();
+            let ToolError::Refused(refusal) = ToolError::from_status(status) else {
+                panic!("not a refusal");
+            };
+            assert_eq!(refusal.message, message);
         }
     }
 
