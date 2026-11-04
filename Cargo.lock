@@ -5083,6 +5083,8 @@ dependencies = [
  "async-stream",
  "async-trait",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "miette",
