@@ -324,8 +324,6 @@ fn job_not_found(name: &str, handle: &JobHandle) -> ToolError {
     })
 }
 
-/// A job step that did not answer as the script does: the child's own words,
-/// cut short, since they are the child's data.
 /// Why a child cannot run background jobs, by the cause the script named.
 fn unusable_message(cause: &str, name: &str) -> String {
     let need = match cause {
@@ -336,6 +334,8 @@ fn unusable_message(cause: &str, name: &str) -> String {
     format!("background jobs need {need} (in '{name}')")
 }
 
+/// A job step that did not answer as the script does: the child's own words,
+/// cut short, since they are the child's data.
 fn step_failed(step: &str, detail: &str) -> ToolError {
     ToolError::Refused(Refusal {
         code: "unavailable",
