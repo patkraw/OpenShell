@@ -11,7 +11,6 @@
 //! reach the user-facing methods in [`SANDBOX_TOOL_METHODS`].
 
 use crate::auth::audit::{self, RequestOrigin};
-use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::Principal;
 use crate::multiplex::CallerAuthenticator;
 use axum::Extension;
@@ -134,8 +133,15 @@ async fn handle(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if !origin_allowed(&headers) {
-        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    // Browsers always send Origin on a cross-site POST; the CLI bridge and the
+    // sandbox door never do. So no web page can drive /mcp with a user's
+    // session (DNS rebinding included).
+    if headers.contains_key(http::header::ORIGIN) {
+        return (
+            StatusCode::FORBIDDEN,
+            "requests with an Origin header are refused",
+        )
+            .into_response();
     }
     if let Some(version) = headers.get("mcp-protocol-version")
         && !version
@@ -148,19 +154,26 @@ async fn handle(
     let Ok(principal) = connection.auth.authenticate(&headers, MCP_PATH).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    match &principal {
-        Principal::Sandbox(_) => {}
+    // A user acts in the workspace the bridge names, like the CLI; a sandbox
+    // always acts in its own, which its handlers read from its record.
+    let workspace = match &principal {
+        Principal::Sandbox(_) => None,
+        Principal::User(_) => match headers.get(WORKSPACE_HEADER).map(|value| value.to_str()) {
+            None => Some(DEFAULT_WORKSPACE.to_string()),
+            Some(Ok(workspace)) => Some(workspace.to_string()),
+            Some(Err(_)) => {
+                return (StatusCode::BAD_REQUEST, "invalid workspace header").into_response();
+            }
+        },
         Principal::Anonymous => return StatusCode::UNAUTHORIZED.into_response(),
-        Principal::User(user) if user.identity.provider == IdentityProvider::LocalDev => {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-        Principal::User(_) => {
-            return (StatusCode::FORBIDDEN, "MCP for users is not available yet").into_response();
-        }
         _ => {
-            return (StatusCode::FORBIDDEN, "MCP is available to sandboxes only").into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                "MCP is available to users and sandboxes only",
+            )
+                .into_response();
         }
-    }
+    };
     let Ok(body) = axum::body::to_bytes(body, MAX_REQUEST_BYTES).await else {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -193,7 +206,7 @@ async fn handle(
                 ),
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "openshell-gateway", "version": openshell_core::VERSION},
-                "instructions": "Create and manage child sandboxes of this sandbox.",
+                "instructions": "Create and manage OpenShell sandboxes: a sandbox manages its own child sandboxes, a user the sandboxes in their workspace.",
             }),
         ),
         "ping" => rpc_ok(&id, json!({})),
@@ -207,31 +220,22 @@ async fn handle(
                 return rpc_error(&id, -32602, &format!("unknown tool '{name}'"));
             }
             let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+            let call = Call {
+                connection: &connection,
+                headers: &headers,
+                workspace,
+            };
             let result = match name {
-                "create_sandbox" => create_child(&connection, &headers, &arguments).await,
-                "exec" => exec_in_child(&connection, &headers, &arguments).await,
-                "wait" => jobs::wait(&connection, &headers, &arguments).await,
-                "delete" => delete_child(&connection, &headers, &arguments).await,
-                "logs" => child_logs(&connection, &headers, &arguments).await,
-                "list" => caller_children(&connection, &headers)
-                    .await
-                    .map(|children| json!({"sandboxes": children.iter().map(child_summary).collect::<Vec<_>>()})),
+                "create_sandbox" => create_child(&call, &arguments).await,
+                "exec" => exec_in_child(&call, &arguments).await,
+                "wait" => jobs::wait(&call, &arguments).await,
+                "delete" => delete_child(&call, &arguments).await,
+                "logs" => child_logs(&call, &arguments).await,
+                "list" => list_sandboxes(&call, &arguments).await,
                 _ => unreachable!("tool names are checked against TOOLS above"),
             };
             let origin = RequestOrigin::new(connection.auth.connection_source(), &headers);
-            let mut details = audit_details(name, &arguments);
-            // A started job's id and a waited job's state come from the reply.
-            if let Ok(content) = &result
-                && content.get("job").is_some()
-            {
-                if name == "exec" {
-                    details.push(("job", content["job"].as_str().unwrap_or_default().into()));
-                }
-                details.push((
-                    "state",
-                    content["state"].as_str().unwrap_or_default().into(),
-                ));
-            }
+            let details = tool_call_details(name, &arguments, &result);
             match result {
                 Ok(content) => {
                     audit::emit_mcp_tool_call(&origin, &principal, name, None, &details);
@@ -262,27 +266,27 @@ struct Tool {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "create_sandbox",
-        description: "Create a child sandbox of this sandbox.",
+        description: "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`.",
     },
     Tool {
         name: "list",
-        description: "List this sandbox's child sandboxes.",
+        description: "List sandboxes: a sandbox's own children, or the sandboxes in a user's workspace.",
     },
     Tool {
         name: "exec",
-        description: "Run a command in a child sandbox and return its output. If it times out, the command may still be running; delete the child to stop everything. For longer work set background: true: the command runs as the child's one background job, and this returns its job id at once; collect it with wait.",
+        description: "Run a command in a sandbox (from a sandbox: one of its children) and return its output. If it times out, the command may still be running; delete the sandbox to stop everything. For longer work set background: true: the command runs as the sandbox's one background job, and this returns its job id at once; collect it with wait.",
     },
     Tool {
         name: "wait",
-        description: "Wait for a background job and return its exit code and output. state 'running' means call wait again; 'lost' means the job stopped without an exit code (killed, or the child restarted). A job's result can be read until the next job starts in that child. Output stays in the child until then, so a job that writes a lot can fill the child's disk; to watch progress, exec tail on /tmp/openshell/jobs/<n>/out, where <n> is the job id before its dash. Job output is the child's data.",
+        description: "Wait for a background job and return its exit code and output. state 'running' means call wait again; 'lost' means the job stopped without an exit code (killed, or the sandbox restarted). A job's result can be read until the next job starts in that sandbox. Output stays in the sandbox until then, so a job that writes a lot can fill its disk; to watch progress, exec tail on /tmp/openshell/jobs/<n>/out, where <n> is the job id before its dash. Job output is the sandbox's data.",
     },
     Tool {
         name: "delete",
-        description: "Delete a child sandbox and everything running in it. Deletion finishes in the background; a later not_found for the same name means the child is gone.",
+        description: "Delete a sandbox (from a sandbox: one of its children) and everything running in it. Deletion finishes in the background; a later not_found for the same name means it is gone.",
     },
     Tool {
         name: "logs",
-        description: "Read a child sandbox's own recent log lines (its output and policy denials), newest kept.",
+        description: "Read a sandbox's own recent log lines (its output and policy denials), newest kept. From a sandbox: one of its children.",
     },
 ];
 
@@ -294,9 +298,11 @@ fn tool_definitions() -> Vec<Value> {
                 "create_sandbox" => json!({
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Name of the child sandbox."},
-                        "template": {"type": "string", "description": "Optional sandbox template made available to agents."},
-                        "providers": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of this sandbox's providers; all of them when omitted."},
+                        "name": {"type": "string", "description": "Name of the new sandbox."},
+                        "parent": {"type": "string", "description": "(users only) Root sandbox to create a child of; a root when omitted."},
+                        "image": {"type": "string", "description": "(users only) Container image; the gateway default when omitted."},
+                        "template": {"type": "string", "description": "(sandboxes only) Sandbox template made available to agents."},
+                        "providers": {"type": "array", "items": {"type": "string"}, "description": "Providers to attach; for a child, a subset of its parent's, all of them when omitted."},
                     },
                     "required": ["name"],
                     "additionalProperties": false,
@@ -304,7 +310,7 @@ fn tool_definitions() -> Vec<Value> {
                 "exec" => json!({
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Child sandbox to run in."},
+                        "name": {"type": "string", "description": "Sandbox to run in."},
                         "command": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments; not a shell string."},
                         "workdir": {"type": "string"},
                         "stdin": {"type": "string", "description": "Text passed on stdin."},
@@ -318,7 +324,7 @@ fn tool_definitions() -> Vec<Value> {
                 "wait" => json!({
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Child sandbox the job runs in."},
+                        "name": {"type": "string", "description": "Sandbox the job runs in."},
                         "job": {"type": "string", "description": "Job id returned by exec."},
                         "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S},
                     },
@@ -327,18 +333,23 @@ fn tool_definitions() -> Vec<Value> {
                 }),
                 "delete" => json!({
                     "type": "object",
-                    "properties": {"name": {"type": "string", "description": "Child sandbox to delete."}},
+                    "properties": {"name": {"type": "string", "description": "Sandbox to delete."}},
                     "required": ["name"],
                     "additionalProperties": false,
                 }),
                 "logs" => json!({
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Child sandbox to read."},
+                        "name": {"type": "string", "description": "Sandbox to read."},
                         "lines": {"type": "integer", "minimum": 1, "maximum": MAX_LOG_LINES},
                         "since": {"type": "string", "description": "Only lines at or after this RFC 3339 time."},
                     },
                     "required": ["name"],
+                    "additionalProperties": false,
+                }),
+                "list" => json!({
+                    "type": "object",
+                    "properties": {"parent": {"type": "string", "description": "(users only) List only this root's children."}},
                     "additionalProperties": false,
                 }),
                 _ => json!({"type": "object"}),
@@ -373,7 +384,7 @@ fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
     let args = arguments_object(arguments)?;
     for key in args.keys() {
         if key == "env" {
-            return Err(ToolError::invalid("'env' is only available to users"));
+            return Err(cli_only("env"));
         }
         if ![
             "name",
@@ -467,14 +478,10 @@ fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
 /// Run a command in one of the caller's children and collect its output, for
 /// at most `timeout_s` plus a short grace for the gateway's exit event; or
 /// start it as the child's background job.
-async fn exec_in_child(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-    arguments: &Value,
-) -> Result<Value, ToolError> {
+async fn exec_in_child(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
     let args = parse_exec_args(arguments)?;
     if args.background {
-        return jobs::start(connection, headers, args).await;
+        return jobs::start(call, args).await;
     }
     let request = ExecSandboxRequest {
         sandbox: args.name,
@@ -487,7 +494,7 @@ async fn exec_in_child(
         stdout,
         stderr,
         exit,
-    } = run_in_child(connection, headers, request, args.timeout, EXEC_EXIT_GRACE).await?;
+    } = run_in_child(call, request, args.timeout, EXEC_EXIT_GRACE).await?;
     let exit_code = command_exit_code(exit, args.timeout);
     let (stdout, stdout_truncated, stdout_binary) = stdout.render();
     let (stderr, stderr_truncated, stderr_binary) = stderr.render();
@@ -519,8 +526,7 @@ struct ExecOutcome {
 /// Send one `ExecSandbox` with `timeout` and collect its output until it
 /// exits, or until `timeout` plus `grace` has passed.
 async fn run_in_child(
-    connection: &McpConnection,
-    headers: &HeaderMap,
+    call: &Call<'_>,
     mut request: ExecSandboxRequest,
     timeout: std::time::Duration,
     grace: std::time::Duration,
@@ -533,10 +539,10 @@ async fn run_in_child(
     });
     let started = tokio::time::Instant::now();
     let deadline = started + timeout + grace;
-    let mut client = OpenShellClient::new(connection.grpc.clone());
-    let call: futures::future::BoxFuture<'_, _> =
-        Box::pin(client.exec_sandbox(mcp_request(request, headers)));
-    let mut events = call.await.map_err(ToolError::from_status)?.into_inner();
+    let mut client = OpenShellClient::new(call.connection.grpc.clone());
+    let pending: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.exec_sandbox(call.request(request)));
+    let mut events = pending.await.map_err(ToolError::from_status)?.into_inner();
     let (mut stdout, mut stderr) = (CapturedOutput::default(), CapturedOutput::default());
     let mut exit = None;
     loop {
@@ -674,8 +680,30 @@ fn utf8_start_after_partial(bytes: &[u8]) -> usize {
         .count()
 }
 
-/// What the audit event records about a tool call: for `exec`, the target,
-/// the argument list (capped) and the working directory; never stdin.
+/// Every field the audit event records about a tool call beyond its caller
+/// and outcome. The handler adds nothing else: the arguments' fields, plus a
+/// started job's id and a waited job's state from the reply.
+fn tool_call_details(
+    tool: &str,
+    arguments: &Value,
+    result: &Result<Value, ToolError>,
+) -> Vec<(&'static str, String)> {
+    let mut details = audit_details(tool, arguments);
+    if let Ok(content) = result
+        && content.get("job").is_some()
+    {
+        let field = |key: &str| content[key].as_str().unwrap_or_default().to_string();
+        if tool == "exec" {
+            details.push(("job", field("job")));
+        }
+        details.push(("state", field("state")));
+    }
+    details
+}
+
+/// What the audit event records from a tool call's arguments: for `exec`,
+/// the target, the argument list (capped) and the working directory; never
+/// stdin.
 fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
     let text = |key| {
         arguments
@@ -743,20 +771,16 @@ fn arguments_object(arguments: &Value) -> Result<serde_json::Map<String, Value>,
 
 /// Delete one of the caller's children. Returns at once; deletion finishes in
 /// the background.
-async fn delete_child(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-    arguments: &Value,
-) -> Result<Value, ToolError> {
+async fn delete_child(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
     let name = required_name(&arguments_object(arguments)?, &["name"])?;
     let request = DeleteSandboxRequest {
         name: name.clone(),
         ..Default::default()
     };
-    let mut client = OpenShellClient::new(connection.grpc.clone());
-    let call: futures::future::BoxFuture<'_, _> =
-        Box::pin(client.delete_sandbox(mcp_request(request, headers)));
-    call.await.map_err(ToolError::from_status)?;
+    let mut client = OpenShellClient::new(call.connection.grpc.clone());
+    let pending: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.delete_sandbox(call.request(request)));
+    pending.await.map_err(ToolError::from_status)?;
     Ok(json!({"name": name, "deleting": true}))
 }
 
@@ -766,11 +790,7 @@ const MAX_LOG_LINES: u64 = 2000;
 const MAX_LOG_BYTES: usize = 64 * 1024;
 
 /// A child's own recent output, newest lines kept within the reply cap.
-async fn child_logs(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-    arguments: &Value,
-) -> Result<Value, ToolError> {
+async fn child_logs(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
     let args = arguments_object(arguments)?;
     let name = required_name(&args, &["name", "lines", "since"])?;
     let lines = match args.get("lines") {
@@ -795,10 +815,10 @@ async fn child_logs(
         since_time,
         ..Default::default()
     };
-    let mut client = OpenShellClient::new(connection.grpc.clone());
-    let call: futures::future::BoxFuture<'_, _> =
-        Box::pin(client.get_sandbox_logs(mcp_request(request, headers)));
-    let logs = call
+    let mut client = OpenShellClient::new(call.connection.grpc.clone());
+    let pending: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.get_sandbox_logs(call.request(request)));
+    let logs = pending
         .await
         .map_err(ToolError::from_status)?
         .into_inner()
@@ -844,26 +864,39 @@ fn required_name(
         .ok_or_else(|| ToolError::invalid("'name' is required"))
 }
 
-/// `create_sandbox` arguments a user may send but a sandbox may not.
-const USER_ONLY_CREATE_ARGUMENTS: [&str; 8] = [
-    "image", "cpu", "memory", "env", "labels", "command", "policy", "parent",
-];
+/// `create_sandbox` arguments only a user may send.
+const USER_CREATE_ARGUMENTS: [&str; 2] = ["parent", "image"];
+/// `create_sandbox` arguments only a sandbox may send.
+const SANDBOX_CREATE_ARGUMENTS: [&str; 1] = ["template"];
+/// Create options of the CLI that MCP does not take yet.
+const CLI_ONLY_CREATE_ARGUMENTS: [&str; 6] =
+    ["cpu", "memory", "env", "labels", "command", "policy"];
 
 struct CreateArgs {
     name: String,
+    parent: String,
+    image: String,
     template: String,
     providers: Vec<String>,
 }
 
-fn parse_create_args(arguments: &Value) -> Result<CreateArgs, ToolError> {
+fn parse_create_args(arguments: &Value, user: bool) -> Result<CreateArgs, ToolError> {
     let args = arguments_object(arguments)?;
-    for key in args.keys() {
-        if USER_ONLY_CREATE_ARGUMENTS.contains(&key.as_str()) {
+    for key in args.keys().map(String::as_str) {
+        if CLI_ONLY_CREATE_ARGUMENTS.contains(&key)
+            || (user && SANDBOX_CREATE_ARGUMENTS.contains(&key))
+        {
+            return Err(cli_only(key));
+        }
+        if !user && USER_CREATE_ARGUMENTS.contains(&key) {
             return Err(ToolError::invalid(&format!(
                 "'{key}' is only available to users"
             )));
         }
-        if !["name", "template", "providers"].contains(&key.as_str()) {
+        if !["name", "providers"].contains(&key)
+            && !USER_CREATE_ARGUMENTS.contains(&key)
+            && !SANDBOX_CREATE_ARGUMENTS.contains(&key)
+        {
             return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
         }
     }
@@ -872,11 +905,12 @@ fn parse_create_args(arguments: &Value) -> Result<CreateArgs, ToolError> {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| ToolError::invalid("'name' is required"))?;
-    let template = match args.get("template") {
-        None => "",
-        Some(Value::String(template)) => template,
-        Some(_) => return Err(ToolError::invalid("'template' must be a string")),
+    let text = |key: &str| match args.get(key) {
+        None => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(ToolError::invalid(&format!("'{key}' must be a string"))),
     };
+    let (parent, image, template) = (text("parent")?, text("image")?, text("template")?);
     let providers = match args.get("providers") {
         None => Vec::new(),
         Some(Value::Array(items)) => items
@@ -888,41 +922,52 @@ fn parse_create_args(arguments: &Value) -> Result<CreateArgs, ToolError> {
     };
     Ok(CreateArgs {
         name: name.to_string(),
-        template: template.to_string(),
+        parent,
+        image,
+        template,
         providers,
     })
 }
 
-/// Create a child, or return the caller's existing child of that name, then
+/// Refuse a create or exec option that only the CLI offers for now.
+fn cli_only(key: &str) -> ToolError {
+    ToolError::invalid(&format!(
+        "'{key}' is not available over MCP; users can set it with the CLI"
+    ))
+}
+
+/// Create a sandbox, or return the caller's existing one of that name, then
 /// wait for it. The name is looked up first so a retry still works when the
 /// parent is at its child limit.
-async fn create_child(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-    arguments: &Value,
-) -> Result<Value, ToolError> {
-    let args = parse_create_args(arguments)?;
-    if find_child(connection, headers, &args.name).await?.is_some() {
-        return wait_until_ready(connection, headers, &args.name, true).await;
+async fn create_child(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
+    let args = parse_create_args(arguments, call.is_user())?;
+    if find_child(call, &args.name).await?.is_some() {
+        return wait_until_ready(call, &args.name, true).await;
     }
+    let template = (!args.image.is_empty()).then(|| openshell_core::proto::SandboxTemplate {
+        image: args.image,
+        ..Default::default()
+    });
     let request = CreateSandboxRequest {
         name: args.name.clone(),
+        parent: args.parent,
         workload_template: args.template,
         spec: Some(SandboxSpec {
             providers: args.providers,
+            template,
             ..Default::default()
         }),
         ..Default::default()
     };
-    let mut client = OpenShellClient::new(connection.grpc.clone());
-    let call: futures::future::BoxFuture<'_, _> =
-        Box::pin(client.create_sandbox(mcp_request(request, headers)));
-    match call.await {
-        Ok(_) => wait_until_ready(connection, headers, &args.name, false).await,
+    let mut client = OpenShellClient::new(call.connection.grpc.clone());
+    let pending: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.create_sandbox(call.request(request)));
+    match pending.await {
+        Ok(_) => wait_until_ready(call, &args.name, false).await,
         // A create racing the lookup above.
         Err(status) if status.code() == tonic::Code::AlreadyExists => {
-            if find_child(connection, headers, &args.name).await?.is_some() {
-                wait_until_ready(connection, headers, &args.name, true).await
+            if find_child(call, &args.name).await?.is_some() {
+                wait_until_ready(call, &args.name, true).await
             } else {
                 Err(ToolError::Refused(Refusal {
                     code: "already_exists",
@@ -941,16 +986,15 @@ async fn create_child(
 /// Poll the caller's children until `name` is ready or failed, for at most
 /// the create wait. Still provisioning at the end is not an error.
 async fn wait_until_ready(
-    connection: &McpConnection,
-    headers: &HeaderMap,
+    call: &Call<'_>,
     name: &str,
     already_existed: bool,
 ) -> Result<Value, ToolError> {
-    let wait = connection.create_wait;
+    let wait = call.connection.create_wait;
     let deadline = tokio::time::Instant::now() + wait.limit;
     let mut pause = wait.first_poll;
     loop {
-        let Some(child) = find_child(connection, headers, name).await? else {
+        let Some(child) = find_child(call, name).await? else {
             return Err(ToolError::Refused(Refusal {
                 code: "not_found",
                 message: format!("sandbox '{name}' not found"),
@@ -964,7 +1008,7 @@ async fn wait_until_ready(
             SandboxPhase::Error => {
                 return Err(ToolError::Refused(Refusal {
                     code: "failed_precondition",
-                    message: format!("child sandbox '{name}' failed: {}", failure_message(&child)),
+                    message: format!("sandbox '{name}' failed: {}", failure_message(&child)),
                     retryable: false,
                 }));
             }
@@ -998,36 +1042,51 @@ fn failure_message(sandbox: &Sandbox) -> String {
         .unwrap_or_else(|| "no reason was recorded".to_string())
 }
 
-async fn find_child(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-    name: &str,
-) -> Result<Option<Sandbox>, ToolError> {
-    Ok(caller_children(connection, headers)
+/// The caller's sandbox of this name: a sandbox's child, or for a user any
+/// sandbox in the workspace.
+async fn find_child(call: &Call<'_>, name: &str) -> Result<Option<Sandbox>, ToolError> {
+    Ok(caller_children(call, "")
         .await?
         .into_iter()
         .find(|child| child.object_name() == name))
 }
 
-/// Every child of the calling sandbox, following page tokens to the end.
-async fn caller_children(
-    connection: &McpConnection,
-    headers: &HeaderMap,
-) -> Result<Vec<Sandbox>, ToolError> {
-    let mut client = OpenShellClient::new(connection.grpc.clone());
+async fn list_sandboxes(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
+    let args = arguments_object(arguments)?;
+    if let Some(key) = args.keys().find(|key| key.as_str() != "parent") {
+        return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
+    }
+    let parent = match args.get("parent") {
+        None => "",
+        Some(_) if !call.is_user() => {
+            return Err(ToolError::invalid("'parent' is only available to users"));
+        }
+        Some(Value::String(parent)) => parent,
+        Some(_) => return Err(ToolError::invalid("'parent' must be a string")),
+    };
+    let sandboxes = caller_children(call, parent).await?;
+    Ok(json!({"sandboxes": sandboxes.iter().map(child_summary).collect::<Vec<_>>()}))
+}
+
+/// Every sandbox the caller lists, following page tokens to the end: a
+/// sandbox's own children, or the user's workspace, narrowed to `parent`'s
+/// children when it is set.
+async fn caller_children(call: &Call<'_>, parent: &str) -> Result<Vec<Sandbox>, ToolError> {
+    let mut client = OpenShellClient::new(call.connection.grpc.clone());
     let mut children = Vec::new();
     let mut page_token = String::new();
     loop {
         let request = ListSandboxesRequest {
             page_size: i32::try_from(crate::pagination::MAX_PAGE_SIZE).unwrap_or(i32::MAX),
             page_token,
+            parent: parent.to_string(),
             ..Default::default()
         };
         // Boxed so the handler future is provably `Send`; tonic's generic
         // error bound otherwise trips a higher-ranked lifetime check.
-        let call: futures::future::BoxFuture<'_, _> =
-            Box::pin(client.list_sandboxes(mcp_request(request, headers)));
-        let page = call.await.map_err(ToolError::from_status)?.into_inner();
+        let pending: futures::future::BoxFuture<'_, _> =
+            Box::pin(client.list_sandboxes(call.request(request)));
+        let page = pending.await.map_err(ToolError::from_status)?.into_inner();
         children.extend(page.sandboxes);
         if page.next_page_token.is_empty() {
             break;
@@ -1044,12 +1103,71 @@ fn child_summary(sandbox: &Sandbox) -> Value {
         .as_ref()
         .and_then(|metadata| metadata.created_time.as_ref())
         .map(ToString::to_string);
-    json!({
+    let mut summary = json!({
         "name": sandbox.object_name(),
         "state": phase.as_str_name().trim_start_matches("SANDBOX_PHASE_").to_ascii_lowercase(),
         "created_at": created_at,
-    })
+    });
+    if let Some(parent) = &sandbox.parent {
+        summary["parent"] = json!(parent.name);
+    }
+    summary
 }
+
+/// The workspace a user's bridge names; sandboxes never send it.
+const WORKSPACE_HEADER: &str = "x-openshell-workspace";
+/// A user's workspace when the bridge names none, as in the CLI.
+const DEFAULT_WORKSPACE: &str = "default";
+
+/// One tool call: the connection, the caller's headers and, for a user, the
+/// workspace to act in. A sandbox caller has no workspace here; its handlers
+/// read it from the caller's own record.
+struct Call<'a> {
+    connection: &'a McpConnection,
+    headers: &'a HeaderMap,
+    workspace: Option<String>,
+}
+
+impl Call<'_> {
+    fn is_user(&self) -> bool {
+        self.workspace.is_some()
+    }
+
+    /// A gRPC request for the in-process stack: the caller's own credential,
+    /// the `/mcp` marker and, for a user, the workspace.
+    fn request<T: WorkspaceScoped>(&self, mut message: T) -> tonic::Request<T> {
+        if let Some(workspace) = &self.workspace {
+            *message.workspace_scope() =
+                Some(openshell_core::proto::workspace_selector(workspace.clone()));
+        }
+        mcp_request(message, self.headers)
+    }
+}
+
+/// The requests the tools send, each with its workspace selector.
+trait WorkspaceScoped {
+    fn workspace_scope(&mut self) -> &mut Option<openshell_core::proto::WorkspaceSelector>;
+}
+
+macro_rules! workspace_scoped {
+    ($($request:ty),*) => {$(
+        impl WorkspaceScoped for $request {
+            fn workspace_scope(
+                &mut self,
+            ) -> &mut Option<openshell_core::proto::WorkspaceSelector> {
+                &mut self.workspace_scope
+            }
+        }
+    )*};
+}
+
+workspace_scoped!(
+    CreateSandboxRequest,
+    ListSandboxesRequest,
+    ExecSandboxRequest,
+    DeleteSandboxRequest,
+    openshell_core::proto::GetSandboxLogsRequest
+);
 
 /// A gRPC request for the in-process stack: the caller's own credential and
 /// the `/mcp` marker.
@@ -1149,26 +1267,6 @@ fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
         .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
 }
 
-/// Browsers attach `Origin`; MCP servers must refuse foreign origins to stop
-/// DNS rebinding. Requests without `Origin` (agents, the sandbox door) and
-/// local origins are accepted.
-fn origin_allowed(headers: &HeaderMap) -> bool {
-    let Some(origin) = headers.get(http::header::ORIGIN) else {
-        return true;
-    };
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    let host = origin
-        .split_once("://")
-        .map_or(origin, |(_, rest)| rest)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or_default();
-    matches!(host, "localhost" | "127.0.0.1" | "openshell.local")
-        || origin.starts_with("http://[::1]")
-}
-
 fn rpc_ok(id: &Value, result: Value) -> Response {
     axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
 }
@@ -1184,6 +1282,7 @@ mod tests {
     use crate::auth::authenticator::test_support::MockAuthenticator;
     use crate::auth::authenticator::{Authentication, AuthenticatorChain};
     use crate::auth::identity::Identity;
+    use crate::auth::identity::IdentityProvider;
     use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -1255,20 +1354,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callers_without_a_sandbox_credential_are_turned_away() {
+    async fn users_and_sandboxes_are_served_and_anonymous_callers_are_not() {
         let initialize = || rpc("initialize", json!({"protocolVersion": "2025-06-18"}));
         for (caller, expected) in [
             (None, StatusCode::UNAUTHORIZED),
             (Some(Principal::Anonymous), StatusCode::UNAUTHORIZED),
-            (
-                Some(user(IdentityProvider::LocalDev)),
-                StatusCode::UNAUTHORIZED,
-            ),
-            (Some(user(IdentityProvider::Oidc)), StatusCode::FORBIDDEN),
-            (Some(user(IdentityProvider::Mtls)), StatusCode::FORBIDDEN),
+            (Some(user(IdentityProvider::LocalDev)), StatusCode::OK),
+            (Some(user(IdentityProvider::Oidc)), StatusCode::OK),
+            (Some(user(IdentityProvider::Mtls)), StatusCode::OK),
+            (Some(sandbox_principal("lead")), StatusCode::OK),
         ] {
             let (status, _) = post_mcp(connection(caller), &[], initialize()).await;
             assert_eq!(status, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn any_origin_header_is_refused_from_every_caller() {
+        for caller in [user(IdentityProvider::Oidc), sandbox_principal("lead")] {
+            for origin in [
+                "http://attacker.example",
+                "http://localhost:8080",
+                "http://openshell.local",
+                "null",
+            ] {
+                let (status, _) = post_mcp(
+                    connection(Some(caller.clone())),
+                    &[("origin", origin)],
+                    rpc("ping", json!({})),
+                )
+                .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{origin}");
+            }
         }
     }
 
@@ -1380,6 +1497,118 @@ mod tests {
     }
 
     #[test]
+    fn create_arguments_depend_on_the_caller() {
+        let refusal = |arguments: Value, user: bool| match parse_create_args(&arguments, user) {
+            Ok(_) => String::new(),
+            Err(ToolError::Refused(refusal)) => refusal.message,
+            Err(ToolError::Unauthenticated) => unreachable!(),
+        };
+        let user_args = json!({"name": "w", "parent": "lead", "image": "img", "providers": ["p"]});
+        let args = parse_create_args(&user_args, true).ok().unwrap();
+        assert_eq!(
+            (
+                args.parent.as_str(),
+                args.image.as_str(),
+                args.providers.len()
+            ),
+            ("lead", "img", 1)
+        );
+        let sandbox_args = json!({"name": "w", "template": "t", "providers": ["p"]});
+        assert_eq!(refusal(sandbox_args, false), "");
+        for (arguments, user, message) in [
+            (
+                json!({"name": "w", "parent": "x"}),
+                false,
+                "'parent' is only available to users",
+            ),
+            (
+                json!({"name": "w", "image": "x"}),
+                false,
+                "'image' is only available to users",
+            ),
+            (
+                json!({"name": "w", "template": "t"}),
+                true,
+                "'template' is not available over MCP; users can set it with the CLI",
+            ),
+            (
+                json!({"name": "w", "policy": "x"}),
+                true,
+                "'policy' is not available over MCP; users can set it with the CLI",
+            ),
+            (
+                json!({"name": "w", "env": {}}),
+                false,
+                "'env' is not available over MCP; users can set it with the CLI",
+            ),
+            (
+                json!({"name": "w", "size": 3}),
+                true,
+                "unknown argument 'size'",
+            ),
+        ] {
+            assert_eq!(refusal(arguments, user), message);
+        }
+    }
+
+    #[tokio::test]
+    async fn only_users_may_list_by_parent() {
+        let (_, reply) = post_mcp(
+            connection(Some(sandbox_principal("lead"))),
+            &[],
+            rpc(
+                "tools/call",
+                json!({"name": "list", "arguments": {"parent": "other"}}),
+            ),
+        )
+        .await;
+        let result = &reply.unwrap()["result"];
+        assert_eq!(
+            result["structuredContent"]["message"],
+            "'parent' is only available to users"
+        );
+    }
+
+    #[test]
+    fn tool_call_details_add_a_jobs_id_and_state_from_the_reply() {
+        let field = |details: &[(&str, String)], key: &str| {
+            details
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let start = json!({"name": "w", "command": ["sleep", "9"], "background": true});
+        let details = tool_call_details(
+            "exec",
+            &start,
+            &Ok(json!({"job": "1-0a1b2c3d", "state": "running"})),
+        );
+        assert_eq!(field(&details, "argv").as_deref(), Some("sleep 9"));
+        assert_eq!(field(&details, "background").as_deref(), Some("true"));
+        assert_eq!(field(&details, "job").as_deref(), Some("1-0a1b2c3d"));
+        assert_eq!(field(&details, "state").as_deref(), Some("running"));
+
+        let wait = json!({"name": "w", "job": "1-0a1b2c3d"});
+        let details = tool_call_details(
+            "wait",
+            &wait,
+            &Ok(json!({"job": "1-0a1b2c3d", "state": "completed", "stdout": "secret output"})),
+        );
+        assert_eq!(field(&details, "target").as_deref(), Some("w"));
+        assert_eq!(field(&details, "job").as_deref(), Some("1-0a1b2c3d"));
+        assert_eq!(field(&details, "state").as_deref(), Some("completed"));
+        assert_eq!(details.iter().filter(|(name, _)| *name == "job").count(), 1);
+        assert!(details.iter().all(|(_, value)| !value.contains("secret")));
+
+        // A refused call records only what its arguments say.
+        let refused = Err(ToolError::invalid(
+            "'job' must be a job id returned by exec",
+        ));
+        let details = tool_call_details("wait", &wait, &refused);
+        assert_eq!(field(&details, "state"), None);
+    }
+
+    #[test]
     fn output_keeps_both_ends_and_cuts_on_character_boundaries() {
         let mut small = CapturedOutput::default();
         small.push(b"hello");
@@ -1478,7 +1707,7 @@ mod tests {
             (
                 json!({"name": "w", "command": ["ls"], "env": {}}),
                 invalid,
-                "'env' is only available to users",
+                "'env' is not available over MCP; users can set it with the CLI",
             ),
             (
                 json!({"name": "w", "command": ["ls"], "size": 3}),
