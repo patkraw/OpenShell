@@ -1909,7 +1909,12 @@ async fn handle_create_sandbox_inner(
         status: None,
         created_from_workload_template,
         parent,
-        created_by: creator_subject(&principal),
+        // Records who decided: the user, or for a child created over MCP,
+        // the root sandbox. The user a root acts for is the root's creator.
+        created_by: caller.as_ref().map_or_else(
+            || creator_subject(&principal),
+            |root| format!("sandbox:{}", root.object_id()),
+        ),
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
     sandbox
@@ -9847,6 +9852,33 @@ mod tests {
             .auth
             .allow_unauthenticated_users = true;
         create(state.clone(), dev, "w5").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_mcp_child_records_the_root_that_created_it() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, sandbox_child_request("worker")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+
+        // The lead decided, so the child names the lead; the lead names the
+        // user it acts for.
+        let by_lead = format!("sandbox:{lead_id}");
+        assert_eq!(child.created_by, by_lead);
+        assert_eq!(
+            sandbox_record(&state, child.object_id()).await.created_by,
+            by_lead,
+            "stored, not only returned"
+        );
+        assert_eq!(sandbox_record(&state, &lead_id).await.created_by, "alice");
     }
 
     #[tokio::test]

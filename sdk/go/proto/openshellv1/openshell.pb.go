@@ -2391,8 +2391,9 @@ type Sandbox struct {
 	// Read-only parent of a child sandbox, set by the gateway at creation.
 	// Absent on root sandboxes. Never changes.
 	Parent *SandboxParent `protobuf:"bytes,21,opt,name=parent,proto3" json:"parent,omitempty"`
-	// Read-only identity of the user who created this sandbox, set by the
-	// gateway. Empty on sandboxes created before this field existed.
+	// Read-only identity of who created this sandbox, set by the gateway: the
+	// user who created it, or `sandbox:<id>` when a sandbox created it over
+	// MCP. Empty on sandboxes created before this field existed.
 	CreatedBy     string `protobuf:"bytes,22,opt,name=created_by,json=createdBy,proto3" json:"created_by,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
