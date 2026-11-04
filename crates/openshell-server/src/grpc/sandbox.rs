@@ -732,6 +732,7 @@ async fn sandbox_caller_create(
             "only root sandboxes can create child sandboxes",
         ));
     }
+    refuse_caller_with_driver_config(&caller)?;
     check_creator_has_access(state, &caller).await?;
     Ok(caller)
 }
@@ -829,18 +830,80 @@ async fn check_creator_has_access(state: &ServerState, caller: &Sandbox) -> Resu
 }
 
 /// The spec a sandbox caller's child gets without a template: the caller's
-/// image, CPU and memory, and the named providers. Nothing else is copied.
+/// image, CPU and memory, isolation settings, and the named providers.
+/// Nothing else is copied, so no GPU or other device.
 fn spec_copied_from_caller(caller: &Sandbox, providers: Vec<String>) -> SandboxSpec {
     let template = caller.spec.as_ref().and_then(|spec| spec.template.as_ref());
+    let mut child = SandboxTemplate {
+        image: template.map(|t| t.image.clone()).unwrap_or_default(),
+        resources: template.and_then(|t| cpu_and_memory_only(t.resources.as_ref())),
+        ..Default::default()
+    };
+    copy_isolation_from_caller(caller, &mut child);
     SandboxSpec {
-        template: Some(SandboxTemplate {
-            image: template.map(|t| t.image.clone()).unwrap_or_default(),
-            resources: template.and_then(|t| t.resources.clone()),
-            ..Default::default()
-        }),
+        template: Some(child),
         providers,
         ..Default::default()
     }
+}
+
+/// A child is never less isolated than its root or its template: the root's
+/// runtime class wins when it has one, and user namespaces stay on when
+/// either asks for them.
+fn copy_isolation_from_caller(caller: &Sandbox, child: &mut SandboxTemplate) {
+    let root = caller.spec.as_ref().and_then(|spec| spec.template.as_ref());
+    if let Some(root) = root.filter(|root| !root.runtime_class_name.is_empty()) {
+        child
+            .runtime_class_name
+            .clone_from(&root.runtime_class_name);
+    }
+    if root.and_then(|root| root.user_namespaces) == Some(true) {
+        child.user_namespaces = Some(true);
+    }
+}
+
+/// Driver configuration can set isolation, devices and mounts that cannot be
+/// copied safely, so a root that has any cannot create children over MCP.
+fn refuse_caller_with_driver_config(caller: &Sandbox) -> Result<(), Status> {
+    let has_driver_config = caller
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .is_some_and(|template| template.driver_config.is_some());
+    if has_driver_config {
+        return Err(Status::failed_precondition(
+            "this sandbox has driver configuration, which children cannot copy",
+        ));
+    }
+    Ok(())
+}
+
+/// Keep only `cpu` and `memory` under `limits` and `requests`; drop GPUs and
+/// any other extended resource.
+fn cpu_and_memory_only(resources: Option<&Struct>) -> Option<Struct> {
+    let fields: std::collections::BTreeMap<_, _> = resources?
+        .fields
+        .iter()
+        .filter(|(section, _)| matches!(section.as_str(), "limits" | "requests"))
+        .filter_map(|(section, value)| {
+            let Some(Kind::StructValue(quantities)) = value.kind.as_ref() else {
+                return None;
+            };
+            let kept: std::collections::BTreeMap<_, _> = quantities
+                .fields
+                .iter()
+                .filter(|(name, _)| matches!(name.as_str(), "cpu" | "memory"))
+                .map(|(name, quantity)| (name.clone(), quantity.clone()))
+                .collect();
+            (!kept.is_empty()).then(|| {
+                let value = Value {
+                    kind: Some(Kind::StructValue(Struct { fields: kept })),
+                };
+                (section.clone(), value)
+            })
+        })
+        .collect();
+    (!fields.is_empty()).then_some(Struct { fields })
 }
 
 /// Agents may create children only from templates an administrator marked
@@ -1547,6 +1610,9 @@ async fn handle_create_sandbox_inner(
             resource_version: template.get_resource_version().to_string(),
         };
         let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
+        if let Some(caller) = &caller {
+            copy_isolation_from_caller(caller, resolved.template.get_or_insert_default());
+        }
         resolved.policy = governance_spec.policy;
         resolved.providers = governance_spec.providers;
         resolved.command = governance_spec.command;
@@ -9224,8 +9290,53 @@ mod tests {
         }
     }
 
+    fn quantities(pairs: &[(&str, &str)]) -> Value {
+        let fields = pairs
+            .iter()
+            .map(|(name, quantity)| {
+                let value = Value {
+                    kind: Some(Kind::StringValue((*quantity).to_string())),
+                };
+                ((*name).to_string(), value)
+            })
+            .collect();
+        Value {
+            kind: Some(Kind::StructValue(Struct { fields })),
+        }
+    }
+
+    fn resources(sections: &[(&str, Value)]) -> Struct {
+        Struct {
+            fields: sections
+                .iter()
+                .map(|(section, value)| ((*section).to_string(), value.clone()))
+                .collect(),
+        }
+    }
+
+    /// Give the root a template, as `sandbox create --from` would.
+    async fn set_root_template(state: &Arc<ServerState>, id: &str, template: SandboxTemplate) {
+        let mut root = state
+            .store
+            .get_message::<Sandbox>(id)
+            .await
+            .unwrap()
+            .unwrap();
+        root.spec.as_mut().unwrap().template = Some(template);
+        state.store.put_message(&root).await.unwrap();
+    }
+
+    fn isolated_template() -> SandboxTemplate {
+        SandboxTemplate {
+            image: "registry.example.com/lead:1".to_string(),
+            runtime_class_name: "gvisor".to_string(),
+            user_namespaces: Some(true),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn a_sandbox_caller_child_copies_image_cpu_and_memory_only() {
+    async fn a_sandbox_caller_child_copies_image_cpu_memory_and_isolation_only() {
         let state = child_sandboxes_state().await;
         let lead_id = member_root(&state, "lead", &[]).await;
         let mut lead = state
@@ -9234,16 +9345,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let resources = template_resource_struct(&SandboxResources {
-            cpu: "2".to_string(),
-            memory: "4Gi".to_string(),
-            gpu: None,
-        });
+        let lead_resources = resources(&[
+            (
+                "limits",
+                quantities(&[("cpu", "2"), ("memory", "4Gi"), ("nvidia.com/gpu", "1")]),
+            ),
+            (
+                "requests",
+                quantities(&[("cpu", "1"), ("example.com/fpga", "1")]),
+            ),
+            ("claims", quantities(&[("gpu", "a100")])),
+        ]);
         let spec = lead.spec.as_mut().unwrap();
         spec.template = Some(SandboxTemplate {
-            image: "registry.example.com/lead:1".to_string(),
-            resources: resources.clone(),
-            ..Default::default()
+            resources: Some(lead_resources),
+            labels: HashMap::from([("team".to_string(), "a".to_string())]),
+            agent_socket: "/run/agent.sock".to_string(),
+            ..isolated_template()
         });
         spec.resource_requirements = Some(ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count: Some(1) }),
@@ -9268,7 +9386,18 @@ mod tests {
         let spec = child.spec.as_ref().unwrap();
         let template = spec.template.as_ref().unwrap();
         assert_eq!(template.image, "registry.example.com/lead:1");
-        assert_eq!(template.resources, resources);
+        assert_eq!(
+            template.resources,
+            Some(resources(&[
+                ("limits", quantities(&[("cpu", "2"), ("memory", "4Gi")])),
+                ("requests", quantities(&[("cpu", "1")])),
+            ])),
+            "only CPU and memory are copied"
+        );
+        assert_eq!(template.runtime_class_name, "gvisor");
+        assert_eq!(template.user_namespaces, Some(true));
+        assert!(template.labels.is_empty());
+        assert!(template.agent_socket.is_empty());
         assert!(spec.resource_requirements.is_none(), "no GPU is copied");
         assert!(spec.environment.is_empty());
         assert!(child.metadata.as_ref().unwrap().labels.is_empty());
@@ -9425,6 +9554,22 @@ mod tests {
         let template = child.spec.as_ref().unwrap().template.as_ref().unwrap();
         assert_eq!(template.image, "registry.example.com/agent:latest");
 
+        // A template child still runs with the root's isolation settings.
+        set_root_template(&state, &lead_id, isolated_template()).await;
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, from_template("w3", "agents")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        let template = child.spec.as_ref().unwrap().template.as_ref().unwrap();
+        assert_eq!(template.image, "registry.example.com/agent:latest");
+        assert_eq!(template.runtime_class_name, "gvisor");
+        assert_eq!(template.user_namespaces, Some(true));
+
         for name in ["unlabelled", "driver", "missing"] {
             let err =
                 handle_create_sandbox(&state, sandbox_request(&lead_id, from_template("w2", name)))
@@ -9436,6 +9581,64 @@ mod tests {
                 format!("template '{name}' is not available to agents")
             );
         }
+    }
+
+    #[test]
+    fn a_child_keeps_isolation_its_template_asked_for() {
+        let plain_root = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut child = isolated_template();
+        copy_isolation_from_caller(&plain_root, &mut child);
+        assert_eq!(child.runtime_class_name, "gvisor");
+        assert_eq!(child.user_namespaces, Some(true));
+
+        let kata_root = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    runtime_class_name: "kata".to_string(),
+                    user_namespaces: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut child = isolated_template();
+        copy_isolation_from_caller(&kata_root, &mut child);
+        assert_eq!(child.runtime_class_name, "kata", "the root's class wins");
+        assert_eq!(child.user_namespaces, Some(true), "never turned off");
+    }
+
+    #[tokio::test]
+    async fn a_root_with_driver_config_cannot_create_children_over_mcp() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        set_root_template(
+            &state,
+            &lead_id,
+            SandboxTemplate {
+                driver_config: Some(Struct::default()),
+                ..isolated_template()
+            },
+        )
+        .await;
+
+        let err = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, sandbox_child_request("worker")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "this sandbox has driver configuration, which children cannot copy"
+        );
     }
 
     #[tokio::test]
