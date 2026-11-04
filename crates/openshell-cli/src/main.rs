@@ -262,30 +262,30 @@ async fn mcp_client(
 
 /// Run the MCP bridge. Missing or unusable credentials do not stop it: each
 /// call then answers with what to run, so the MCP client shows the reason,
-/// and nothing ever starts an interactive login.
+/// and nothing ever starts an interactive login. The client is built on the
+/// first call that can build it, so a login made after the bridge started
+/// takes effect without restarting it.
 async fn mcp_serve(
     gateway: &Option<String>,
     gateway_endpoint: &Option<String>,
     tls: TlsOptions,
     workspace: String,
 ) -> Result<()> {
-    let client = mcp_client(gateway, gateway_endpoint, tls).await;
-    if let Err(error) = &client {
+    let (gateway, gateway_endpoint) = (gateway.clone(), gateway_endpoint.clone());
+    let client = std::sync::Arc::new(openshell_cli::mcp_bridge::LazyClient::new(move || {
+        let (gateway, gateway_endpoint, tls) =
+            (gateway.clone(), gateway_endpoint.clone(), tls.clone());
+        async move { mcp_client(&gateway, &gateway_endpoint, tls).await }
+    }));
+    // Try once at start so a missing login shows on stderr straight away.
+    if let Err(error) = client.get().await {
         eprintln!("openshell mcp serve: {error}");
     }
-    let client = std::sync::Arc::new(client);
     let workspace = std::sync::Arc::new(workspace);
     let send = move |body: Vec<u8>| {
         let client = std::sync::Arc::clone(&client);
         let workspace = std::sync::Arc::clone(&workspace);
-        async move {
-            openshell_cli::mcp_bridge::send_with(
-                client.as_ref().as_ref().map_err(String::as_str),
-                &body,
-                &workspace,
-            )
-            .await
-        }
+        async move { openshell_cli::mcp_bridge::send_with(client.get().await, &body, &workspace).await }
     };
     openshell_cli::mcp_bridge::serve(
         tokio::io::BufReader::new(tokio::io::stdin()),
