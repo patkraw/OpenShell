@@ -95,11 +95,13 @@ pub(super) async fn start(call: &Call<'_>, args: ExecArgs) -> Result<Value, Tool
                 rest.first().unwrap_or(&"")
             ),
             retryable: false,
+            withheld: None,
         })),
         (Some((0, _)), ["unusable", cause]) => Err(ToolError::Refused(Refusal {
             code: "failed_precondition",
             message: unusable_message(cause, &args.name),
             retryable: false,
+            withheld: None,
         })),
         _ => {
             let stderr = outcome.stderr.into_bytes();
@@ -318,6 +320,7 @@ fn job_not_found(name: &str, handle: &JobHandle) -> ToolError {
             handle.render()
         ),
         retryable: false,
+        withheld: None,
     })
 }
 
@@ -341,6 +344,7 @@ fn step_failed(step: &str, detail: &str) -> ToolError {
             super::truncate_at_char_boundary(detail.trim(), 200)
         ),
         retryable: true,
+        withheld: None,
     })
 }
 
