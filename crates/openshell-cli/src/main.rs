@@ -685,7 +685,7 @@ enum Commands {
         output: OutputFormat,
     },
 
-    /// Serve the gateway's sandbox tools to a local MCP client.
+    /// Serve the gateway's sandbox tools to a local MCP client (experimental).
     #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Mcp {
         #[command(subcommand)]
@@ -1503,7 +1503,8 @@ enum McpCommands {
     ///
     /// Add it to the client's configuration as the command
     /// `openshell mcp serve`. Each tool call goes to the active gateway with
-    /// this CLI's login, acting in `--workspace`.
+    /// this CLI's login, acting in `--workspace`. The gateway serves the tools
+    /// only when `experimental_enable_child_sandboxes` is on.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Serve,
 }
