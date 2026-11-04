@@ -163,7 +163,8 @@ async fn ws_tunnel_status_through_edge_proxy() {
     // Extract the gateway endpoint from the info output.
     // The format varies, but it should contain a URL-like string.
     let endpoint = info_clean.lines().find_map(|line| {
-        if line.to_lowercase().contains("endpoint") || line.to_lowercase().contains("gateway") {
+        let lower = line.to_lowercase();
+        if lower.contains("endpoint") || lower.contains("gateway") || lower.contains("server") {
             // Try to extract a URL from the line
             line.split_whitespace()
                 .find(|word| word.starts_with("http://") || word.starts_with("https://"))
