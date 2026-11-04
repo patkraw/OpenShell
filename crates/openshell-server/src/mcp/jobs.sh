@@ -77,10 +77,18 @@ case $action in
 start)
     token=$1 has_stdin=$2
     shift 2
-    # Jobs need a writable root, and wait needs /proc and stat.
-    if ! mkdir -p "$root" 2>/dev/null || [ ! -w "$root" ] \
-        || ! start_time $$ > /dev/null || ! stat -c %Y "$root" > /dev/null 2>&1; then
-        echo unusable
+    # Jobs need a writable root, and wait needs /proc and stat. Each cause
+    # is named, so the caller can say which one to fix.
+    if ! mkdir -p "$root" 2>/dev/null || [ ! -w "$root" ]; then
+        echo unusable tmp
+        exit 0
+    fi
+    if ! start_time $$ > /dev/null; then
+        echo unusable proc
+        exit 0
+    fi
+    if ! stat -c %Y "$root" > /dev/null 2>&1; then
+        echo unusable stat
         exit 0
     fi
     last=$(numbered_jobs | sort -n | tail -n 1)
