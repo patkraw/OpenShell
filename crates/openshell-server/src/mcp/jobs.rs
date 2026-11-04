@@ -24,8 +24,13 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long past a step's limit the tool waits for its exit event.
 const STEP_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_WAIT_S: u64 = 30;
-const MAX_WAIT_S: u64 = 45;
+/// Polling stops by 40 s. With one last check's grace and a full output read
+/// after it, a call still ends well inside the door's 60 s limit.
+pub(super) const MAX_WAIT_S: u64 = 40;
 const WAIT_POLL: Duration = Duration::from_secs(2);
+/// A check needs at least this long; with less left, `wait` answers
+/// "running" without one, and the caller calls again.
+const MIN_CHECK: Duration = Duration::from_secs(1);
 
 /// A job handle, `<n>-<token>`: `n` numbers the job in its child and
 /// `token` is the gateway's, so an old handle never matches a newer job.
@@ -107,34 +112,68 @@ pub(super) async fn start(call: &Call<'_>, args: ExecArgs) -> Result<Value, Tool
 /// still running at the end is not an error.
 pub(super) async fn wait(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolError> {
     let (name, handle, timeout) = parse_wait_args(arguments)?;
+    wait_with(
+        &handle,
+        timeout,
+        |remaining| check(call, &name, &handle, remaining),
+        |out_bytes, err_bytes| output(call, &name, &handle, out_bytes, err_bytes),
+        || job_not_found(&name, &handle),
+    )
+    .await
+}
+
+/// The polling loop of [`wait`]. Each check is limited to what is left of
+/// the wait, and none starts with less than [`MIN_CHECK`] left. The output
+/// read keeps its own limit, so a job that finishes just before the end
+/// still returns its output.
+async fn wait_with<C, CF, O, OF>(
+    handle: &JobHandle,
+    timeout: Duration,
+    mut check: C,
+    output: O,
+    not_found: impl FnOnce() -> ToolError,
+) -> Result<Value, ToolError>
+where
+    C: FnMut(Duration) -> CF,
+    CF: Future<Output = Result<JobState, ToolError>>,
+    O: FnOnce(usize, usize) -> OF,
+    OF: Future<Output = Result<(CapturedOutput, CapturedOutput), ToolError>>,
+{
+    let still_running = || {
+        json!({
+            "job": handle.render(),
+            "state": "running",
+            "message": "the job is still running; call wait again",
+        })
+    };
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let state = check(call, &name, &handle, remaining).await?;
+        if remaining < MIN_CHECK {
+            return Ok(still_running());
+        }
+        let state = check(remaining).await?;
         let reply = match state {
-            JobState::Running if remaining > WAIT_POLL => {
+            JobState::Running => {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if left <= WAIT_POLL {
+                    return Ok(still_running());
+                }
                 tokio::time::sleep(WAIT_POLL).await;
                 continue;
             }
-            JobState::Running => json!({
-                "job": handle.render(),
-                "state": "running",
-                "message": "the job is still running; call wait again",
-            }),
             JobState::Lost => json!({
                 "job": handle.render(),
                 "state": "lost",
                 "message": "the job stopped without an exit code: it was killed, or the child restarted",
             }),
-            JobState::Missing => {
-                return Err(job_not_found(&name, &handle));
-            }
+            JobState::Missing => return Err(not_found()),
             JobState::Completed {
                 exit_code,
                 out_bytes,
                 err_bytes,
             } => {
-                let (stdout, stderr) = output(call, &name, &handle, out_bytes, err_bytes).await?;
+                let (stdout, stderr) = output(out_bytes, err_bytes).await?;
                 let (stdout, stdout_truncated, stdout_binary) = stdout.render();
                 let (stderr, stderr_truncated, stderr_binary) = stderr.render();
                 json!({
@@ -166,7 +205,7 @@ fn parse_wait_args(arguments: &Value) -> Result<(String, JobHandle, Duration), T
         Some(value) => value
             .as_u64()
             .filter(|timeout| (1..=MAX_WAIT_S).contains(timeout))
-            .ok_or_else(|| ToolError::invalid("'timeout_s' must be between 1 and 45"))?,
+            .ok_or_else(|| ToolError::invalid("'timeout_s' must be between 1 and 40"))?,
     };
     Ok((name, handle, Duration::from_secs(timeout_s)))
 }
@@ -200,6 +239,11 @@ impl JobState {
     }
 }
 
+/// The limit of one check: what is left of the wait, at most a step's.
+fn check_limit(remaining: Duration) -> Duration {
+    remaining.min(STEP_TIMEOUT)
+}
+
 /// One check of a job, limited to what is left of the caller's wait.
 async fn check(
     call: &Call<'_>,
@@ -214,8 +258,7 @@ async fn check(
         command,
         ..Default::default()
     };
-    let timeout = remaining.clamp(Duration::from_secs(1), STEP_TIMEOUT);
-    let outcome = run_in_child(call, request, timeout, STEP_GRACE).await?;
+    let outcome = run_in_child(call, request, check_limit(remaining), STEP_GRACE).await?;
     let stdout = outcome.stdout.into_bytes();
     let line = String::from_utf8_lossy(&stdout);
     if let Some((0, _)) = outcome.exit {
@@ -305,6 +348,99 @@ fn step_failed(step: &str, detail: &str) -> ToolError {
 mod tests {
     use super::*;
 
+    fn completed() -> JobState {
+        JobState::Completed {
+            exit_code: 0,
+            out_bytes: 2,
+            err_bytes: 0,
+        }
+    }
+
+    fn captured_ok() -> (CapturedOutput, CapturedOutput) {
+        (
+            CapturedOutput::from_edges(b"ok", 2),
+            CapturedOutput::from_edges(b"", 0),
+        )
+    }
+
+    /// The slowest cases: every check takes its whole limit plus the grace,
+    /// and the read after the last one takes its whole limit plus the grace.
+    /// Whenever the job finishes, the call ends inside the door's 60 s and a
+    /// finished job's output is returned.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_stays_under_the_door_limit_whenever_the_job_finishes() {
+        let handle = JobHandle::parse("1-0a1b2c3d").unwrap();
+        let wait = Duration::from_secs(MAX_WAIT_S);
+        for half_seconds in 0..=(MAX_WAIT_S * 2 + 4) {
+            let started = tokio::time::Instant::now();
+            let finishes_at = started + Duration::from_millis(half_seconds * 500);
+            let short_check = std::cell::Cell::new(false);
+
+            let reply = wait_with(
+                &handle,
+                wait,
+                |remaining| {
+                    short_check.set(short_check.get() || remaining < MIN_CHECK);
+                    async move {
+                        tokio::time::sleep(check_limit(remaining) + STEP_GRACE).await;
+                        Ok(if tokio::time::Instant::now() >= finishes_at {
+                            completed()
+                        } else {
+                            JobState::Running
+                        })
+                    }
+                },
+                |_, _| async {
+                    tokio::time::sleep(STEP_TIMEOUT + STEP_GRACE).await;
+                    Ok(captured_ok())
+                },
+                || panic!("not missing"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("wait failed"));
+
+            let took = started.elapsed();
+            assert!(
+                took < Duration::from_secs(58),
+                "finish at {half_seconds}/2 s took {took:?}"
+            );
+            assert!(
+                !short_check.get(),
+                "a check started with less than a second left"
+            );
+            if reply["state"] == "completed" {
+                assert_eq!(reply["stdout"], "ok", "the output is returned");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_with_too_little_time_left_answers_running_without_a_check() {
+        let handle = JobHandle::parse("1-0a1b2c3d").unwrap();
+        let checks = std::cell::Cell::new(0);
+
+        let reply = wait_with(
+            &handle,
+            Duration::from_secs(3),
+            |_| {
+                checks.set(checks.get() + 1);
+                // Each check uses up 2.5 s, so after the first only 0.5 s
+                // is left.
+                async {
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    Ok(JobState::Running)
+                }
+            },
+            |_, _| async { Ok(captured_ok()) },
+            || panic!("not missing"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("wait failed"));
+
+        assert_eq!(reply["state"], "running");
+        assert_eq!(checks.get(), 1, "no check with less than a second left");
+    }
+
     #[test]
     fn each_unusable_cause_has_its_own_message() {
         let tmp = unusable_message("tmp", "w1");
@@ -372,7 +508,7 @@ mod tests {
             ),
             (
                 json!({"name": "w", "job": "1-0a1b2c3d", "timeout_s": 46}),
-                "'timeout_s' must be between 1 and 45",
+                "'timeout_s' must be between 1 and 40",
             ),
             (
                 json!({"name": "w", "job": "1-0a1b2c3d", "lines": 3}),

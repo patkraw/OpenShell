@@ -79,7 +79,7 @@ The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each to
 | `create_sandbox` | Create a sandbox and wait until it is ready, up to 45 seconds. If it is not ready by then, the tool returns its current state with `timed_out: true`, not an error; call it again with the same name to keep waiting. Calling it again returns the existing sandbox with `already_existed: true`. |
 | `list` | List sandboxes and their state. |
 | `exec` | Run a command and return its exit code and output, or start a background job. |
-| `wait` | Wait for a background job, up to 45 seconds, and return its result. |
+| `wait` | Wait for a background job, up to 40 seconds, and return its result. |
 | `delete` | Delete a sandbox. |
 | `logs` | Read a sandbox's own log lines, such as startup errors and policy denials. |
 
