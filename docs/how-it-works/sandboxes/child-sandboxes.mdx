@@ -87,7 +87,8 @@ The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each to
 
 An agent in a root sandbox calls `http://openshell.local/mcp`. The sandbox's supervisor attaches the sandbox's credential, so the agent holds no token. A sandbox acts only on its own children:
 
-- `create_sandbox` takes a `name`, and optionally a `template` and `providers`. Without a template, the child copies the root's image, CPU and memory, but not a GPU. A template must carry the label `openshell.ai/agent-usable: "true"` and have no driver configuration. Without `providers`, the child gets all of the root's.
+- `create_sandbox` takes a `name`, and optionally a `template` and `providers`. Without a template, the child copies the root's image, CPU and memory, but not a GPU or other device. A template must carry the label `openshell.ai/agent-usable: "true"` and have no driver configuration. Either way, the child gets the root's runtime class and user namespace setting. Without `providers`, the child gets all of the root's.
+- A root created with driver configuration cannot create children through MCP.
 - `list`, `exec`, `wait`, `delete` and `logs` act only on the root's children. Any other name reads as not found.
 - The root can create children only while the user who created it is still a member of the workspace.
 
