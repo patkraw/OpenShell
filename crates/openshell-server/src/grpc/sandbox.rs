@@ -9322,7 +9322,8 @@ mod tests {
             authz_policy,
         );
         let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack)
-            .with_short_create_wait();
+            .with_short_create_wait()
+            .with_store(state.store.clone());
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": tool, "arguments": arguments},
@@ -9856,6 +9857,37 @@ mod tests {
             "stored, not only returned"
         );
         assert_eq!(sandbox_record(&state, &lead_id).await.created_by, "alice");
+    }
+
+    #[tokio::test]
+    async fn an_audit_event_records_the_user_a_sandbox_acts_for() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let unknown_root = put_parent_record(&state, "old-root", &[], None, false).await;
+        let stack = crate::multiplex::AuthGrpcRouter::new(
+            openshell_core::proto::open_shell_server::OpenShellServer::new(
+                crate::OpenShellService::new(state.clone()),
+            ),
+            None,
+            None,
+        );
+        let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack);
+
+        // Without a store, and for a root without a creator, it is unknown.
+        assert_eq!(
+            crate::mcp::acting_for(&connection, &lead_id).await,
+            "unknown"
+        );
+        let connection = connection.with_store(state.store.clone());
+        assert_eq!(crate::mcp::acting_for(&connection, &lead_id).await, "alice");
+        assert_eq!(
+            crate::mcp::acting_for(&connection, &unknown_root).await,
+            "unknown"
+        );
+        assert_eq!(
+            crate::mcp::acting_for(&connection, "missing").await,
+            "unknown"
+        );
     }
 
     #[tokio::test]

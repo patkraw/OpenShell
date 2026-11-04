@@ -349,7 +349,8 @@ impl MultiplexService {
                     let (parts, body) = req.into_parts();
                     Request::from_parts(parts, BoxBody(body.map_err(Into::into).boxed_unsync()))
                 }),
-        );
+        )
+        .with_store(self.state.store.clone());
         let http_service = http_router(self.state.clone()).layer(axum::Extension(mcp_connection));
 
         let grpc_service = request_id_middleware!(grpc_service);
