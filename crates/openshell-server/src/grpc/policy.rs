@@ -5057,22 +5057,24 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 }
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
+    use super::sandbox::child_refusal;
     let message = error.message();
-    if message.starts_with("parent sandbox ")
-        && message.ends_with(crate::compute::ORPHANED_CHILD_SUFFIX)
-    {
-        "The parent sandbox no longer exists; delete this child sandbox"
-    } else if message.starts_with("parent sandbox ")
-        && message.ends_with("is not yet copied to this child")
-    {
-        "Waiting for a copy of the parent sandbox's latest policy"
-    } else if message.starts_with("parent sandbox ")
-        && message.ends_with("cannot be copied to its children")
-    {
-        "The parent sandbox's policy cannot be copied to children; fix the parent's policy"
-    } else if message.starts_with("parent sandbox ") {
-        "The parent sandbox rejected its latest policy; fix the parent's policy"
-    } else if message.contains("middleware") {
+    match child_refusal::reason(error).as_deref() {
+        Some(child_refusal::PARENT_MISSING) => {
+            return "The parent sandbox no longer exists; delete this child sandbox";
+        }
+        Some(child_refusal::PARENT_POLICY_NOT_COPIED) => {
+            return "Waiting for a copy of the parent sandbox's latest policy";
+        }
+        Some(child_refusal::PARENT_POLICY_UNCOPYABLE) => {
+            return "The parent sandbox's policy cannot be copied to children; fix the parent's policy";
+        }
+        Some(child_refusal::PARENT_POLICY_REJECTED) => {
+            return "The parent sandbox rejected its latest policy; fix the parent's policy";
+        }
+        _ => {}
+    }
+    if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
     } else if message.contains("credential") || message.contains("provider") {
         "Effective provider configuration is invalid; repair credential bindings, attached providers, or their policy layers"
@@ -8425,6 +8427,41 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The child hints follow the refusal's reason, not its wording, and the
+    /// reason travels alongside the message without changing it.
+    #[test]
+    fn child_configuration_hints_follow_the_refusal_reason() {
+        for (reason, hint) in [
+            (
+                "PARENT_SANDBOX_MISSING",
+                "The parent sandbox no longer exists; delete this child sandbox",
+            ),
+            (
+                "PARENT_POLICY_NOT_COPIED",
+                "Waiting for a copy of the parent sandbox's latest policy",
+            ),
+            (
+                "PARENT_POLICY_UNCOPYABLE",
+                "The parent sandbox's policy cannot be copied to children; fix the parent's policy",
+            ),
+            (
+                "PARENT_POLICY_REJECTED",
+                "The parent sandbox rejected its latest policy; fix the parent's policy",
+            ),
+        ] {
+            let refusal = openshell_core::rpc_error::failed_precondition(reason, "reworded");
+            assert_eq!(refusal.message(), "reworded");
+            assert_eq!(configuration_failure_diagnostic(&refusal), hint, "{reason}");
+        }
+        // Wording alone no longer picks a child hint.
+        let unreasoned =
+            Status::failed_precondition("parent sandbox 'lead' rejected its latest policy");
+        assert_eq!(
+            configuration_failure_diagnostic(&unreasoned),
+            "Stored policy structure or safety validation failed; submit a complete valid replacement policy"
+        );
+    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
