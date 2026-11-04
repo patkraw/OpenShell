@@ -188,6 +188,10 @@ run = "e2e/rust/e2e-docker.sh"
 description = "Run the child sandbox and MCP e2e tests against a Docker gateway with child sandboxes enabled"
 run = "OPENSHELL_E2E_CHILD_SANDBOXES=1 OPENSHELL_TEST_CONTAINER_ENGINE=docker e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-child-sandboxes --test child_sandboxes"
 
+["e2e:rust:child-sandboxes:podman"]
+description = "Run the child sandbox and MCP e2e tests against a Podman gateway with child sandboxes enabled"
+run = "OPENSHELL_E2E_CHILD_SANDBOXES=1 OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-child-sandboxes --test child_sandboxes"
+
 ["e2e:workload:build"]
 description = "Build the Docker E2E workload fixture"
 run = "CONTAINER_ENGINE=docker bash tasks/scripts/e2e-build-workload.sh"

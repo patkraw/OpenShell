@@ -48,9 +48,15 @@ async fn cli(args: &[&str]) -> (String, bool) {
 }
 
 /// A policy that lets any binary reach the host test server on `allow_port`,
-/// or nothing when `None`. `/tmp` is writable unless `writable_tmp` is false.
+/// or nothing when `None`. `/tmp` is writable unless `writable_tmp` is false;
+/// then it is listed read-only, since the supervisor adds a writable `/tmp`
+/// to any policy that does not name it.
 fn policy(allow_port: Option<u16>, writable_tmp: bool) -> NamedTempFile {
-    let tmp = if writable_tmp { "\n    - /tmp" } else { "" };
+    let (tmp, read_only_tmp) = if writable_tmp {
+        ("\n    - /tmp", "")
+    } else {
+        ("", "\n    - /tmp")
+    };
     let network = allow_port.map_or_else(String::new, |port| {
         format!(
             r#"network_policies:
@@ -77,7 +83,7 @@ filesystem_policy:
     - /dev/urandom
     - /app
     - /etc
-    - /var/log
+    - /var/log{read_only_tmp}
   read_write:
     - /sandbox{tmp}
     - /dev/null
@@ -139,7 +145,7 @@ async fn probe(sandbox: &SandboxGuard, port: u16) -> String {
     let output = sandbox
         .exec(&["sh", "-c", &script])
         .await
-        .unwrap_or_else(|error| error);
+        .unwrap_or_else(|error| panic!("probe exec in {} failed: {error}", sandbox.name));
     output.trim().to_string()
 }
 
@@ -445,9 +451,16 @@ async fn an_agent_in_a_root_manages_its_children_through_mcp() {
 }
 
 /// The gateway's OCSF events for the job's start and wait carry its id and
-/// state. Read only when the e2e wrapper wrote the gateway's JSONL.
+/// state. The e2e wrapper always writes the gateway's JSONL, so under it a
+/// missing directory fails the test; against a gateway started by hand the
+/// check is skipped.
 fn assert_job_audit_events(job: &str) {
     let Ok(dir) = std::env::var("OPENSHELL_E2E_GATEWAY_OCSF_DIR") else {
+        assert_ne!(
+            std::env::var("OPENSHELL_E2E_CHILD_SANDBOXES").as_deref(),
+            Ok("1"),
+            "the e2e wrapper ran but OPENSHELL_E2E_GATEWAY_OCSF_DIR is not set"
+        );
         eprintln!("skipping the audit check: OPENSHELL_E2E_GATEWAY_OCSF_DIR is not set");
         return;
     };
@@ -501,8 +514,14 @@ async fn a_background_job_needs_a_writable_tmp() {
         "failed_precondition",
         "{refused}"
     );
+    // Only the /tmp cause: /proc and stat are present, so the job is refused
+    // for the reason the test names.
     let message = content(&refused)["message"].as_str().unwrap_or_default();
     assert!(message.contains("need a writable /tmp"), "{message}");
+    assert!(
+        !message.contains("/proc") && !message.contains("stat"),
+        "{message}"
+    );
 }
 
 /// Talk to `openshell mcp serve` over stdio, as a host MCP client does.
