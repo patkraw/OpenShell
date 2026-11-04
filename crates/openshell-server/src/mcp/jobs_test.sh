@@ -74,6 +74,30 @@ j start $R nnnnnnnn 0 sh -c 'head -c 100000 /dev/zero | tr "\0" a' >/dev/null; s
 n=$(ls $R | sort -n | tail -n1)
 ok "$(j output $R $n nnnnnnnn 16384 2>/dev/null | wc -c | tr -d ' ')" 32768 "output capped to both edges"
 
+# START killed after spawning the job, before recording its pid. A stand-in
+# mv, on PATH for this start only, kills any writer that records another
+# process's pid as a job's pid, just before the record lands.
+mkdir $T/shim
+cat > $T/shim/mv <<'EOF'
+#!/bin/sh
+[ "$1" = -f ] && shift
+case $2 in
+*/pid)
+    read -r p _ < "$1"
+    if [ "$p" != "$PPID" ]; then kill -9 "$PPID"; exit 1; fi
+    ;;
+esac
+exec /bin/mv "$@"
+EOF
+chmod +x $T/shim/mv
+sleep 1
+(PATH=$T/shim:$PATH j start $R pppppppp 0 sleep 4) > /dev/null 2>&1
+n=$(ls $R | sort -n | tail -n1)
+ok "$(j check $R $n pppppppp)" running "job outlives a START killed before recording it"
+ok "$(j start $R qqqqqqqq 0 true)" "busy $n pppppppp" "and keeps its slot"
+sleep 4
+ok "$(j check $R $n pppppppp | cut -d' ' -f1-2)" "completed 0" "and completes"
+
 # unusable root
 ok "$(j start /proc/nope oooooooo 0 true)" "unusable tmp" "unwritable root"
 [ $fail = 0 ] && echo ALL OK
