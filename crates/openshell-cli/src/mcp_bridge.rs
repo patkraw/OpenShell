@@ -93,13 +93,42 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> String {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
 }
 
+/// The gateway client, built on first use.
+///
+/// A built client is kept, and its login is refreshed by the client itself.
+/// A failed build is not kept: that call answers with the fresh error and the
+/// next call tries again, so a bridge started before `openshell gateway login`
+/// works once the user logs in. Concurrent first calls share one attempt.
+pub struct LazyClient<C, M> {
+    client: tokio::sync::OnceCell<C>,
+    build: M,
+}
+
+impl<C, M, F> LazyClient<C, M>
+where
+    C: Send + Sync,
+    M: Fn() -> F + Sync,
+    F: Future<Output = Result<C, String>> + Send,
+{
+    pub fn new(build: M) -> Self {
+        Self {
+            client: tokio::sync::OnceCell::new(),
+            build,
+        }
+    }
+
+    pub async fn get(&self) -> Result<&C, String> {
+        self.client.get_or_try_init(|| (self.build)()).await
+    }
+}
+
 /// Forward one message with `client`, or explain why there is no client.
 pub async fn send_with(
-    client: Result<&OpenShellClient, &str>,
+    client: Result<&OpenShellClient, String>,
     body: &[u8],
     workspace: &str,
 ) -> Result<Sent, String> {
-    let client = client.map_err(str::to_string)?;
+    let client = client?;
     let reply = client
         .post_mcp(body, workspace)
         .await
@@ -231,6 +260,74 @@ mod tests {
                 .contains("unreachable")
         );
         assert_eq!(by_id["null"]["error"]["code"], -32700);
+    }
+
+    #[tokio::test]
+    async fn a_login_after_the_bridge_started_works_without_a_restart() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let logged_in = Arc::new(AtomicBool::new(false));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(LazyClient::new({
+            let (logged_in, builds) = (Arc::clone(&logged_in), Arc::clone(&builds));
+            move || {
+                let (logged_in, builds) = (Arc::clone(&logged_in), Arc::clone(&builds));
+                async move {
+                    let attempt = builds.fetch_add(1, Ordering::SeqCst) + 1;
+                    // A slow connect, so concurrent first calls overlap.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if logged_in.load(Ordering::SeqCst) {
+                        Ok("client")
+                    } else {
+                        Err(format!("attempt {attempt}: run `openshell gateway login`"))
+                    }
+                }
+            }
+        }));
+        let send = move |body: Vec<u8>| {
+            let client = Arc::clone(&client);
+            async move {
+                client.get().await?;
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                Ok(Sent {
+                    status: 200,
+                    body: json!({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+                        .to_string()
+                        .into_bytes(),
+                })
+            }
+        };
+        let (mut stdin, input) = tokio::io::duplex(1 << 16);
+        let (output, stdout) = tokio::io::duplex(1 << 16);
+        let bridge = tokio::spawn(serve(tokio::io::BufReader::new(input), output, send));
+        let mut stdout = tokio::io::BufReader::new(stdout).lines();
+        let ping = |id: usize| format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\"}}\n");
+
+        stdin.write_all(ping(1).as_bytes()).await.unwrap();
+        let first: Value =
+            serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            first["error"]["message"], "attempt 1: run `openshell gateway login`",
+            "the call gets the error from its own attempt"
+        );
+
+        logged_in.store(true, Ordering::SeqCst);
+        for id in 2..=6 {
+            stdin.write_all(ping(id).as_bytes()).await.unwrap();
+        }
+        for _ in 2..=6 {
+            let reply: Value =
+                serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(reply["result"], json!({}), "{reply}");
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "one failed build, then one build shared by every later call"
+        );
+
+        drop(stdin);
+        bridge.await.unwrap().unwrap();
     }
 
     #[tokio::test]
