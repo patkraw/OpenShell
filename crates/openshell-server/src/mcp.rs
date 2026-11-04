@@ -1339,6 +1339,7 @@ impl ToolError {
             Code::AlreadyExists => ("already_exists", false),
             Code::FailedPrecondition => ("failed_precondition", false),
             Code::PermissionDenied => ("permission_denied", false),
+            Code::ResourceExhausted if is_rate_limit(&status) => ("rate_limited", true),
             Code::ResourceExhausted => ("limit_reached", false),
             Code::Unavailable | Code::Aborted => ("unavailable", true),
             Code::DeadlineExceeded => ("timed_out", true),
@@ -1360,6 +1361,16 @@ impl ToolError {
             retryable,
         })
     }
+}
+
+/// Whether the gateway's rate limiter refused the call, the one
+/// `ResourceExhausted` worth retrying.
+fn is_rate_limit(status: &tonic::Status) -> bool {
+    openshell_core::rpc_error::decode_details(status)
+        .and_then(|details| details.error_info().cloned())
+        .is_some_and(|info| {
+            info.reason == "RATE_LIMITED" && info.domain == openshell_core::rpc_error::ERROR_DOMAIN
+        })
 }
 
 fn tool_result(content: &Value, is_error: bool) -> Value {
@@ -1710,6 +1721,38 @@ mod tests {
                 refused["message"],
                 format!("mcp tool call exec: refused ({code})")
             );
+        }
+    }
+
+    /// Only a rate limit is worth retrying: a full child limit, even one
+    /// waiting on deletes, and an oversized message are not.
+    #[test]
+    fn only_a_rate_limit_is_retryable() {
+        use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
+        let refusal = |status| match ToolError::from_status(status) {
+            ToolError::Refused(refusal) => refusal,
+            ToolError::Unauthenticated => panic!("not a refusal"),
+        };
+        let rate_limited = refusal(tonic::Status::with_error_details(
+            tonic::Code::ResourceExhausted,
+            "gRPC rate limit exceeded",
+            ErrorDetails::with_error_info(
+                "RATE_LIMITED",
+                ERROR_DOMAIN,
+                std::collections::HashMap::new(),
+            ),
+        ));
+        assert_eq!(
+            (rate_limited.code, rate_limited.retryable),
+            ("rate_limited", true)
+        );
+        assert_eq!(rate_limited.message, "gRPC rate limit exceeded");
+        for message in [
+            "sandbox 'lead' has reached its limit of 2 children, 1 of them still being deleted; try again shortly",
+            "gRPC message exceeds u32",
+        ] {
+            let other = refusal(tonic::Status::resource_exhausted(message));
+            assert_eq!((other.code, other.retryable), ("limit_reached", false));
         }
     }
 
