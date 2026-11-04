@@ -33,9 +33,20 @@ where
     F: Future<Output = Result<Sent, String>> + Send,
 {
     let output = Arc::new(tokio::sync::Mutex::new(output));
-    let mut lines = input.lines();
+    let mut input = input;
+    let mut raw = Vec::new();
     let mut calls = tokio::task::JoinSet::new();
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        raw.clear();
+        if input.read_until(b'\n', &mut raw).await? == 0 {
+            break;
+        }
+        // A line that is not UTF-8 cannot be JSON: answer it as a parse
+        // error, as for any other bad line, and keep reading.
+        let line = String::from_utf8(raw.clone()).map_or_else(
+            |_| "\u{fffd}".to_string(),
+            |line| line.trim_end_matches(['\r', '\n']).to_string(),
+        );
         if line.trim().is_empty() {
             continue;
         }
@@ -328,6 +339,31 @@ mod tests {
 
         drop(stdin);
         bridge.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_is_a_parse_error_and_the_bridge_keeps_reading() {
+        let (writer, mut reader) = tokio::io::duplex(1 << 20);
+        let mut input = b"\xff\xfe not utf-8\n".to_vec();
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n");
+        let send = |body: Vec<u8>| async move { gateway(&serde_json::from_slice(&body).unwrap()) };
+
+        serve(&input[..], writer, send).await.unwrap();
+
+        let mut out = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut out)
+            .await
+            .unwrap();
+        let replies: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 2, "{out}");
+        let parse_error = replies.iter().find(|reply| reply["id"].is_null()).unwrap();
+        assert_eq!(parse_error["error"]["code"], -32700);
+        assert_eq!(parse_error["error"]["message"], "parse error");
+        let ping = replies.iter().find(|reply| reply["id"] == 1).unwrap();
+        assert_eq!(ping["result"], json!({}));
     }
 
     #[tokio::test]
