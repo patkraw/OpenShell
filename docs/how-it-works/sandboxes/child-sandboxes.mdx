@@ -37,7 +37,7 @@ openshell sandbox list --parent lead
 
 ## Policy
 
-A child always uses its parent's policy. When it is created, the gateway copies the policy the parent is enforcing into the child. When the parent loads a new policy, the gateway copies that version into each child and delivers it as it delivers any policy update. A child that was offline catches up when it reconnects.
+A child always uses its parent's policy. When it is created, the gateway copies the policy the parent is enforcing into the child. When the parent loads a new policy, the gateway copies that version into each child and delivers it as it delivers any policy update. Until a child has the copy, the gateway refuses it configuration, so it has no new network access; this normally lasts seconds and at most about 30 seconds.
 
 You cannot give a child a policy of its own or change its policy. `sandbox create --parent` refuses `--policy` with `child sandboxes use their parent's policy; omit --policy`, and ignores `OPENSHELL_SANDBOX_POLICY` with a note. Policy updates, approvals and proposals for a child are refused. To change what a child can do, change its parent's policy.
 
@@ -47,7 +47,7 @@ A child always fails closed. If it cannot load its copy, it denies all new netwo
 
 A child can use only providers attached to its parent. Without `--provider`, a child gets all of its parent's providers. With `--provider`, it gets the ones you name, and naming one the parent does not have is refused with `provider 'github' is not attached to parent 'lead'`.
 
-When a provider is detached from the parent, the gateway detaches it from every child too. A provider later attached to the parent reaches only children created after that.
+When a provider is detached from the parent, every child stops receiving it at its next configuration update, and the gateway detaches it from the child too. A provider later attached to the parent reaches only children created after that.
 
 ## Delete a Parent
 
