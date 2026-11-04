@@ -91,12 +91,9 @@ pub(super) async fn start(call: &Call<'_>, args: ExecArgs) -> Result<Value, Tool
             ),
             retryable: false,
         })),
-        (Some((0, _)), ["unusable"]) => Err(ToolError::Refused(Refusal {
+        (Some((0, _)), ["unusable", cause]) => Err(ToolError::Refused(Refusal {
             code: "failed_precondition",
-            message: format!(
-                "background jobs need a writable /tmp and a readable /proc in '{}'; a child uses its parent's filesystem policy",
-                args.name
-            ),
+            message: unusable_message(cause, &args.name),
             retryable: false,
         })),
         _ => {
@@ -283,6 +280,16 @@ fn job_not_found(name: &str, handle: &JobHandle) -> ToolError {
 
 /// A job step that did not answer as the script does: the child's own words,
 /// cut short, since they are the child's data.
+/// Why a child cannot run background jobs, by the cause the script named.
+fn unusable_message(cause: &str, name: &str) -> String {
+    let need = match cause {
+        "tmp" => "a writable /tmp; a child uses its parent's filesystem policy",
+        "proc" => "a readable /proc; a child uses its parent's filesystem policy",
+        _ => "the stat command; use an image that has it",
+    };
+    format!("background jobs need {need} (in '{name}')")
+}
+
 fn step_failed(step: &str, detail: &str) -> ToolError {
     ToolError::Refused(Refusal {
         code: "unavailable",
@@ -297,6 +304,23 @@ fn step_failed(step: &str, detail: &str) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_unusable_cause_has_its_own_message() {
+        let tmp = unusable_message("tmp", "w1");
+        let proc = unusable_message("proc", "w1");
+        let stat = unusable_message("stat", "w1");
+        assert!(
+            tmp.contains("need a writable /tmp") && !tmp.contains("/proc"),
+            "{tmp}"
+        );
+        assert!(
+            proc.contains("need a readable /proc") && !proc.contains("/tmp"),
+            "{proc}"
+        );
+        assert!(stat.contains("the stat command"), "{stat}");
+        assert!(tmp.ends_with("(in 'w1')"));
+    }
 
     #[test]
     fn handles_are_checked_before_use() {

@@ -75,5 +75,5 @@ n=$(ls $R | sort -n | tail -n1)
 ok "$(j output $R $n nnnnnnnn 16384 2>/dev/null | wc -c | tr -d ' ')" 32768 "output capped to both edges"
 
 # unusable root
-ok "$(j start /proc/nope oooooooo 0 true)" unusable "unwritable root"
+ok "$(j start /proc/nope oooooooo 0 true)" "unusable tmp" "unwritable root"
 [ $fail = 0 ] && echo ALL OK
