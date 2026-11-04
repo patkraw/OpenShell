@@ -350,7 +350,7 @@ fn tool_definitions() -> Vec<Value> {
                     "properties": {
                         "name": {"type": "string", "description": "Sandbox the job runs in."},
                         "job": {"type": "string", "description": "Job id returned by exec."},
-                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S},
+                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": jobs::MAX_WAIT_S},
                     },
                     "required": ["name", "job"],
                     "additionalProperties": false,
