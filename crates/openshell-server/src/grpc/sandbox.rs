@@ -670,11 +670,7 @@ fn check_create_parent(
     spec: &mut SandboxSpec,
 ) -> Result<openshell_core::proto::SandboxParent, Status> {
     let parent_name = parent.object_name();
-    if parent
-        .metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.deletion_time.is_some())
-    {
+    if crate::compute::is_being_deleted(parent) {
         return Err(Status::failed_precondition(format!(
             "parent sandbox '{parent_name}' is being deleted"
         )));
@@ -971,11 +967,18 @@ async fn check_parent_has_room(
             parent.name
         )));
     }
+    // A child keeps its slot until its delete finishes: until then its
+    // compute resources may still run, and a stuck delete must not let a
+    // looping agent exceed the limit.
     let limit = state.config.max_concurrent_children;
-    let children = count_children(state, workspace, &parent.id).await?;
-    if children >= limit as usize {
+    let children = crate::compute::count_children(&state.store, workspace, &parent.id).await?;
+    if children.total() >= limit as usize {
+        let leaving = match children.being_deleted {
+            0 => String::new(),
+            n => format!(", {n} of them still being deleted; try again shortly"),
+        };
         return Err(Status::resource_exhausted(format!(
-            "sandbox '{}' has reached its limit of {limit} children",
+            "sandbox '{}' has reached its limit of {limit} children{leaving}",
             parent.name
         )));
     }
@@ -1570,11 +1573,7 @@ async fn sync_child_locked(
     else {
         return Ok(());
     };
-    if child
-        .metadata
-        .as_ref()
-        .is_some_and(|meta| meta.deletion_time.is_some())
-    {
+    if crate::compute::is_being_deleted(&child) {
         return Ok(());
     }
     let parent_providers = state
@@ -1667,28 +1666,6 @@ async fn check_parent_has_provider(
         )));
     }
     Ok(())
-}
-
-/// Count the children of a parent by scanning its workspace.
-async fn count_children(
-    state: &ServerState,
-    workspace: &str,
-    parent_id: &str,
-) -> Result<usize, Status> {
-    let sandboxes = state
-        .store
-        .collect_messages::<Sandbox>(ObjectListQuery::Workspace(workspace))
-        .await
-        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-    Ok(sandboxes
-        .iter()
-        .filter(|sandbox| {
-            sandbox
-                .parent
-                .as_ref()
-                .is_some_and(|parent| parent.id == parent_id)
-        })
-        .count())
 }
 
 async fn handle_create_sandbox_inner(
@@ -11528,6 +11505,42 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn a_child_being_deleted_keeps_its_slot_until_its_record_is_gone() {
+        let state = child_sandboxes_state_with_limit(2).await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+        put_parent_record(&state, "worker1", &[], Some(link.clone()), false).await;
+        let leaving = put_parent_record(&state, "worker2", &[], Some(link), true).await;
+        let create = || {
+            handle_create_sandbox(
+                &state,
+                authed_request(child_request("worker3", "lead", SandboxSpec::default())),
+            )
+        };
+
+        let err = create().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            err.message(),
+            "sandbox 'lead' has reached its limit of 2 children, \
+             1 of them still being deleted; try again shortly"
+        );
+
+        // The driver finished removing it, so its record is gone.
+        state
+            .store
+            .delete(Sandbox::object_type(), &leaving)
+            .await
+            .unwrap();
+        create()
+            .await
+            .expect("the slot is free once the delete finishes");
     }
 
     #[tokio::test]

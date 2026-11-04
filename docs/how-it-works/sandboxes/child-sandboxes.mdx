@@ -27,7 +27,7 @@ openshell sandbox create --name lead --from codex-agent:local --provider openai 
 openshell sandbox create --name reviewer --parent lead --from claude-agent:local --provider anthropic
 ```
 
-The gateway refuses a child of a child with `only one level of child sandboxes is supported`. When a root already has as many children as the gateway's `max_concurrent_children` allows, it refuses with `sandbox 'lead' has reached its limit of 10 children`. Every child counts until it is deleted, whatever its state.
+The gateway refuses a child of a child with `only one level of child sandboxes is supported`. When a root already has as many children as the gateway's `max_concurrent_children` allows, it refuses with `sandbox 'lead' has reached its limit of 10 children`. Every child counts whatever its state, and keeps its slot until its delete finishes. While one is still being deleted, the refusal says so and you can retry shortly.
 
 `sandbox list` adds a `PARENT` column when the page holds a child. A root shows `-`, and a child whose parent no longer exists shows `deleted (<id>)`. List one root's children with `--parent`:
 
