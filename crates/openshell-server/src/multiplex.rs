@@ -950,6 +950,21 @@ impl<S> GrpcRateLimitService<S> {
     }
 }
 
+/// The refusal for a call over the gRPC rate limit, tagged `RATE_LIMITED` so
+/// clients can tell it from other `ResourceExhausted` errors and retry later.
+fn rate_limit_exceeded() -> tonic::Status {
+    use openshell_core::rpc_error::StatusExt;
+    tonic::Status::with_error_details(
+        tonic::Code::ResourceExhausted,
+        "gRPC rate limit exceeded",
+        openshell_core::rpc_error::ErrorDetails::with_error_info(
+            "RATE_LIMITED",
+            openshell_core::rpc_error::ERROR_DOMAIN,
+            std::collections::HashMap::new(),
+        ),
+    )
+}
+
 impl<S, B> tower::Service<Request<B>> for GrpcRateLimitService<S>
 where
     S: tower::Service<Request<B>, Response = Response<tonic::body::Body>>,
@@ -990,8 +1005,7 @@ where
         // Tower contract forbids forwarding to an inner service that did not
         // report readiness.
         if std::mem::take(&mut self.rate_limited) {
-            let response =
-                tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
+            let response = rate_limit_exceeded().into_http();
             return Box::pin(async move { Ok(response) });
         }
         if self
@@ -999,8 +1013,7 @@ where
             .as_ref()
             .is_some_and(|limiter| !limiter.allow())
         {
-            let response =
-                tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
+            let response = rate_limit_exceeded().into_http();
             return Box::pin(async move { Ok(response) });
         }
         let future = self.inner.call(req);
@@ -2472,6 +2485,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grpc_status_from_response(&second), "8");
+        let status = tonic::Status::from_header_map(second.headers()).expect("grpc status");
+        let details = openshell_core::rpc_error::decode_details(&status).expect("error details");
+        let info = details.error_info().expect("error info");
+        assert_eq!(
+            (info.reason.as_str(), info.domain.as_str()),
+            ("RATE_LIMITED", openshell_core::rpc_error::ERROR_DOMAIN)
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
