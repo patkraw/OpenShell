@@ -163,6 +163,7 @@ pub trait PolicyStoreExt {
 
     async fn get_latest_policy(&self, sandbox_id: &str) -> PersistenceResult<Option<PolicyRecord>>;
 
+    #[allow(dead_code)]
     async fn get_latest_loaded_policy(
         &self,
         sandbox_id: &str,
