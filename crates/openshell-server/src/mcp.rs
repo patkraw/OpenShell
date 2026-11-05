@@ -316,7 +316,7 @@ struct Tool {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "create_sandbox",
-        description: "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`.",
+        description: "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`. A child never contacts its parent on its own: results come only from exec and wait. Delete a child when its work is done.",
     },
     Tool {
         name: "list",
@@ -324,7 +324,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "exec",
-        description: "Run a command in a sandbox (from a sandbox: one of its children) and return its output. If it times out, the command may still be running; delete the sandbox to stop everything. For longer work set background: true: the command runs as the sandbox's one background job, and this returns its job id at once; collect it with wait.",
+        description: "Run a command in a sandbox (from a sandbox: one of its children) and return its output. If it times out, the command may still be running; delete the sandbox to stop everything. Work longer than 45 seconds needs background: true: the command runs as the sandbox's one background job, and this returns its job id at once; collect it with wait. A sandbox runs one background job at a time, so parallel work needs more children.",
     },
     Tool {
         name: "wait",

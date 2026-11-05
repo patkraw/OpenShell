@@ -183,8 +183,8 @@ pub fn http_router(state: Arc<crate::ServerState>) -> Router {
     if state.config.enable_websocket_tunnel {
         router = router.merge(crate::ws_tunnel::router(state.clone()));
     }
-    // Not registered while child sandboxes are off; step 6 (MCP for users)
-    // makes `/mcp` always available, as the RFC describes.
+    // Not registered while child sandboxes are off, for users and sandboxes
+    // alike.
     if state.config.enable_child_sandboxes {
         router = router.merge(crate::mcp::router());
     }
