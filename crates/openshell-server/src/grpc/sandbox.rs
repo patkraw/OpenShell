@@ -2568,6 +2568,9 @@ pub(super) async fn handle_list_sandbox_templates(
 ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+        return list_agent_templates(state, &caller.sandbox_id).await;
+    }
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -2616,6 +2619,57 @@ pub(super) async fn handle_list_sandbox_templates(
     Ok(Response::new(ListSandboxTemplatesResponse {
         templates: page.messages,
         next_page_token,
+    }))
+}
+
+/// Most templates a sandbox caller is shown; MCP puts every name into the
+/// `create_sandbox` tool, so the list stays short.
+const MAX_AGENT_TEMPLATES: u32 = 50;
+
+/// A sandbox caller (only through `/mcp`) sees the templates it may create
+/// children from, in its own workspace, whatever scope or selector the request
+/// names, and without their environment.
+async fn list_agent_templates(
+    state: &ServerState,
+    caller_id: &str,
+) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+    let caller = state
+        .store
+        .get_message::<Sandbox>(caller_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let selector = format!("{AGENT_USABLE_TEMPLATE_LABEL}=true");
+    let page = state
+        .store
+        .list_message_page::<SandboxWorkloadTemplate>(
+            ObjectListQuery::WorkspaceSelector {
+                workspace: caller.object_workspace(),
+                label_selector: &selector,
+            },
+            None,
+            MAX_AGENT_TEMPLATES,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?;
+    let templates = page
+        .messages
+        .into_iter()
+        .filter(|template| check_agent_usable_template(template).is_ok())
+        .map(|mut template| {
+            if let Some(workload) = template
+                .spec
+                .as_mut()
+                .and_then(|spec| spec.workload.as_mut())
+            {
+                workload.environment.clear();
+            }
+            template
+        })
+        .collect();
+    Ok(Response::new(ListSandboxTemplatesResponse {
+        templates,
+        next_page_token: String::new(),
     }))
 }
 
@@ -9344,17 +9398,28 @@ mod tests {
         tool: &str,
         arguments: serde_json::Value,
     ) -> serde_json::Value {
+        call_mcp_as(
+            state,
+            sandbox_caller(caller_id),
+            None,
+            None,
+            tool,
+            arguments,
+        )
+        .await
+    }
+
+    fn sandbox_caller(sandbox_id: &str) -> crate::auth::principal::Principal {
         use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 
-        let caller = Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: caller_id.to_string(),
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
                 auth_epoch: None,
             },
             trust_domain: Some("openshell".to_string()),
-        });
-        call_mcp_as(state, caller, None, None, tool, arguments).await
+        })
     }
 
     /// Call one MCP tool as `caller` through the real router and handlers,
@@ -9366,6 +9431,22 @@ mod tests {
         workspace: Option<&str>,
         tool: &str,
         arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        });
+        post_mcp_as(state, caller, authz_policy, workspace, body).await["result"].clone()
+    }
+
+    /// Post one JSON-RPC message to `/mcp` as `caller` through the real
+    /// router and handlers, and return the whole reply.
+    async fn post_mcp_as(
+        state: &Arc<ServerState>,
+        caller: crate::auth::principal::Principal,
+        authz_policy: Option<crate::auth::authz::AuthzPolicy>,
+        workspace: Option<&str>,
+        body: serde_json::Value,
     ) -> serde_json::Value {
         use crate::auth::authenticator::test_support::MockAuthenticator;
         use crate::auth::authenticator::{Authentication, AuthenticatorChain};
@@ -9384,10 +9465,6 @@ mod tests {
         let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack)
             .with_short_create_wait()
             .with_store(state.store.clone());
-        let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
-        });
         let mut request = http::Request::post("/mcp")
             .header("content-type", "application/json")
             .header("authorization", "Bearer caller-token");
@@ -9410,7 +9487,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        reply["result"].clone()
+        reply
     }
 
     #[tokio::test]
@@ -9770,6 +9847,97 @@ mod tests {
                 format!("template '{name}' is not available to agents")
             );
         }
+    }
+
+    /// Store a template in `workspace`, labelled for agents when `labelled`,
+    /// with driver configuration when `driver_config`.
+    async fn put_agent_template(
+        state: &Arc<ServerState>,
+        workspace: &str,
+        name: &str,
+        labelled: bool,
+        driver_config: bool,
+    ) {
+        let mut template = test_workload_template(name);
+        let metadata = template.metadata.as_mut().unwrap();
+        metadata.id = uuid::Uuid::new_v4().to_string();
+        metadata.workspace = workspace.to_string();
+        if labelled {
+            metadata
+                .labels
+                .insert(AGENT_USABLE_TEMPLATE_LABEL.to_string(), "true".to_string());
+        }
+        if driver_config {
+            template.spec.as_mut().unwrap().driver_config = Some(Struct::default());
+        }
+        state.store.put_message(&template).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_lists_only_templates_made_available_to_agents() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        put_agent_template(&state, "default", "agents", true, false).await;
+        put_agent_template(&state, "default", "unlabelled", false, false).await;
+        put_agent_template(&state, "default", "driver", true, true).await;
+        put_agent_template(&state, "other", "elsewhere", true, false).await;
+
+        // Whatever scope or selector the request names.
+        let request = ListSandboxTemplatesRequest {
+            workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            label_selector: "team=runtime".to_string(),
+            ..Default::default()
+        };
+        let listed = handle_list_sandbox_templates(&state, sandbox_request(&lead_id, request))
+            .await
+            .unwrap()
+            .into_inner();
+        let names: Vec<&str> = listed
+            .templates
+            .iter()
+            .map(ObjectName::object_name)
+            .collect();
+        assert_eq!(names, ["agents"]);
+        let workload = listed.templates[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .workload
+            .as_ref()
+            .unwrap();
+        assert_eq!(workload.image, "registry.example.com/agent:latest");
+        assert!(workload.environment.is_empty(), "environment is withheld");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_offers_a_sandbox_its_agent_templates() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        put_agent_template(&state, "default", "agents", true, false).await;
+        put_agent_template(&state, "default", "unlabelled", false, false).await;
+
+        let reply = post_mcp_as(
+            &state,
+            sandbox_caller(&lead_id),
+            None,
+            None,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        let create = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "create_sandbox")
+            .unwrap();
+        let template = &create["inputSchema"]["properties"]["template"];
+        assert_eq!(template["enum"], serde_json::json!(["agents"]), "{create}");
+        let description = create["description"].as_str().unwrap();
+        assert!(
+            description.contains("agents (image registry.example.com/agent:latest)"),
+            "{description}"
+        );
+        assert!(!description.contains("unlabelled"), "{description}");
     }
 
     #[test]
