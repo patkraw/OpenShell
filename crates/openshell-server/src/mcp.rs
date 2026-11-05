@@ -21,11 +21,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    CreateSandboxRequest, DeleteSandboxRequest, ExecSandboxRequest, ListSandboxesRequest, Sandbox,
-    SandboxPhase, SandboxSpec,
+    CreateSandboxRequest, DeleteSandboxRequest, ExecSandboxRequest, ListSandboxTemplatesRequest,
+    ListSandboxesRequest, Sandbox, SandboxPhase, SandboxSpec, SandboxWorkloadTemplate,
 };
 use openshell_core::{ObjectId, ObjectName};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tower::util::BoxCloneSyncService;
 use tracing::warn;
@@ -45,9 +46,10 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 /// Methods a sandbox caller may reach, and only with [`McpOrigin`].
-const SANDBOX_TOOL_METHODS: [&str; 5] = [
+const SANDBOX_TOOL_METHODS: [&str; 6] = [
     "/openshell.v1.OpenShell/CreateSandbox",
     "/openshell.v1.OpenShell/ListSandboxes",
+    "/openshell.v1.OpenShell/ListSandboxTemplates",
     "/openshell.v1.OpenShell/ExecSandbox",
     "/openshell.v1.OpenShell/DeleteSandbox",
     "/openshell.v1.OpenShell/GetSandboxLogs",
@@ -221,7 +223,31 @@ async fn handle(
             }),
         ),
         "ping" => rpc_ok(&id, json!({})),
-        "tools/list" => rpc_ok(&id, json!({"tools": tool_definitions()})),
+        "tools/list" => {
+            let templates = match &principal {
+                Principal::Sandbox(_) => {
+                    let call = Call {
+                        connection: &connection,
+                        headers: &headers,
+                        workspace,
+                    };
+                    match agent_templates(&call).await {
+                        Ok(templates) => templates,
+                        Err(ToolError::Unauthenticated) => {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        // The tools still work without the list; a create
+                        // names its template either way.
+                        Err(ToolError::Refused(error)) => {
+                            warn!(error = %error.message, "could not list templates for the MCP tool list");
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            rpc_ok(&id, json!({"tools": tool_definitions(&templates)}))
+        }
         "tools/call" => {
             let name = params
                 .get("name")
@@ -314,23 +340,67 @@ const TOOLS: &[Tool] = &[
     },
 ];
 
-fn tool_definitions() -> Vec<Value> {
+/// The templates a sandbox caller may create children from, as the gateway
+/// lists them for it: only those made available to agents, in its workspace.
+async fn agent_templates(call: &Call<'_>) -> Result<Vec<SandboxWorkloadTemplate>, ToolError> {
+    let mut client = OpenShellClient::new(call.connection.grpc.clone());
+    // Boxed so the handler future is provably `Send`, as in `caller_children`.
+    let pending: futures::future::BoxFuture<'_, _> = Box::pin(
+        client.list_sandbox_templates(call.request(ListSandboxTemplatesRequest::default())),
+    );
+    Ok(pending
+        .await
+        .map_err(ToolError::from_status)?
+        .into_inner()
+        .templates)
+}
+
+/// The tool list. `templates` are the ones a sandbox caller may use; they are
+/// offered on `create_sandbox` so an agent need not be told their names.
+fn tool_definitions(templates: &[SandboxWorkloadTemplate]) -> Vec<Value> {
     TOOLS
         .iter()
         .map(|tool| {
+            let mut description = tool.description.to_string();
             let schema = match tool.name {
-                "create_sandbox" => json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Name of the new sandbox."},
-                        "parent": {"type": "string", "description": "(users only) Root sandbox to create a child of; a root when omitted."},
-                        "image": {"type": "string", "description": "(users only) Container image; the gateway default when omitted."},
-                        "template": {"type": "string", "description": "(sandboxes only) Sandbox template made available to agents."},
-                        "providers": {"type": "array", "items": {"type": "string"}, "description": "Providers to attach; for a child, a subset of its parent's, all of them when omitted."},
-                    },
-                    "required": ["name"],
-                    "additionalProperties": false,
-                }),
+                "create_sandbox" => {
+                    let mut template = json!({"type": "string", "description": "(sandboxes only) Sandbox template made available to agents."});
+                    if !templates.is_empty() {
+                        let names: Vec<&str> =
+                            templates.iter().map(ObjectName::object_name).collect();
+                        template["enum"] = json!(names);
+                        let offered: Vec<String> = templates
+                            .iter()
+                            .map(|template| {
+                                let image = template
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|spec| spec.workload.as_ref())
+                                    .map(|workload| workload.image.as_str())
+                                    .filter(|image| !image.is_empty())
+                                    .unwrap_or("the gateway default");
+                                format!("{} (image {image})", template.object_name())
+                            })
+                            .collect();
+                        let _ = write!(
+                            description,
+                            " Templates you may create a child from: {}. Without a template the child copies your image.",
+                            offered.join(", ")
+                        );
+                    }
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Name of the new sandbox."},
+                            "parent": {"type": "string", "description": "(users only) Root sandbox to create a child of; a root when omitted."},
+                            "image": {"type": "string", "description": "(users only) Container image; the gateway default when omitted."},
+                            "template": template,
+                            "providers": {"type": "array", "items": {"type": "string"}, "description": "Providers to attach; for a child, a subset of its parent's, all of them when omitted."},
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false,
+                    })
+                }
                 "exec" => json!({
                     "type": "object",
                     "properties": {
@@ -378,7 +448,7 @@ fn tool_definitions() -> Vec<Value> {
                 }),
                 _ => json!({"type": "object"}),
             };
-            json!({"name": tool.name, "description": tool.description, "inputSchema": schema})
+            json!({"name": tool.name, "description": description, "inputSchema": schema})
         })
         .collect()
 }
@@ -1292,6 +1362,7 @@ macro_rules! workspace_scoped {
 workspace_scoped!(
     CreateSandboxRequest,
     ListSandboxesRequest,
+    ListSandboxTemplatesRequest,
     ExecSandboxRequest,
     DeleteSandboxRequest,
     openshell_core::proto::GetSandboxLogsRequest
@@ -1548,6 +1619,31 @@ mod tests {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{origin}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_users_tool_list_offers_no_templates() {
+        // The connection's gRPC stack panics if called.
+        let (status, reply) = post_mcp(
+            connection(Some(user(IdentityProvider::Oidc))),
+            &[],
+            rpc("tools/list", json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = reply.unwrap();
+        let create = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "create_sandbox")
+            .unwrap();
+        assert!(
+            create["inputSchema"]["properties"]["template"]
+                .get("enum")
+                .is_none(),
+            "{create}"
+        );
     }
 
     #[tokio::test]

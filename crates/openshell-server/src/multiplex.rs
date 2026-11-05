@@ -4252,7 +4252,8 @@ mod tests {
                 ("/openshell.v1.OpenShell/ExecSandbox", true),
                 ("/openshell.v1.OpenShell/DeleteSandbox", true),
                 ("/openshell.v1.OpenShell/GetSandboxLogs", true),
-                ("/openshell.v1.OpenShell/ListSandboxTemplates", false),
+                ("/openshell.v1.OpenShell/ListSandboxTemplates", true),
+                ("/openshell.v1.OpenShell/GetSandboxTemplate", false),
                 ("/openshell.v1.OpenShell/CreateProvider", false),
             ] {
                 // Without the marker is a direct gRPC call with a sandbox token.

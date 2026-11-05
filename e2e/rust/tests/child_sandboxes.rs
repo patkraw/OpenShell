@@ -201,11 +201,19 @@ async fn ensure_workspace_member() {
 /// Call one MCP tool from inside `root`, through `http://openshell.local/mcp`,
 /// and return the tool result (`structuredContent` and `isError`).
 async fn mcp(root: &SandboxGuard, tool: &str, arguments: Value) -> Value {
-    let body = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": tool, "arguments": arguments},
-    })
-    .to_string();
+    mcp_request(
+        root,
+        "tools/call",
+        json!({"name": tool, "arguments": arguments}),
+    )
+    .await["result"]
+        .clone()
+}
+
+/// Send one JSON-RPC request from inside `root` to `http://openshell.local/mcp`
+/// and return the whole reply.
+async fn mcp_request(root: &SandboxGuard, method: &str, params: Value) -> Value {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
     let output = root
         .exec(&[
             "curl",
@@ -221,14 +229,13 @@ async fn mcp(root: &SandboxGuard, tool: &str, arguments: Value) -> Value {
             &body,
         ])
         .await
-        .unwrap_or_else(|error| panic!("MCP {tool} call failed: {error}"));
+        .unwrap_or_else(|error| panic!("MCP {method} failed: {error}"));
     let reply = output
         .lines()
         .rev()
         .find(|line| line.trim_start().starts_with('{'))
-        .unwrap_or_else(|| panic!("no JSON reply to {tool}: {output}"));
-    let reply: Value = serde_json::from_str(reply).expect("MCP reply JSON");
-    reply["result"].clone()
+        .unwrap_or_else(|| panic!("no JSON reply to {method}: {output}"));
+    serde_json::from_str(reply).expect("MCP reply JSON")
 }
 
 fn content(result: &Value) -> &Value {
@@ -489,6 +496,98 @@ fn assert_job_audit_events(job: &str) {
                 && event["unmapped"]["state"] == "completed"),
         "no wait event with state completed for job {job}"
     );
+}
+
+/// Deletes a sandbox template when dropped, also when a test fails halfway.
+struct TemplateGuard(String);
+
+impl Drop for TemplateGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(openshell_e2e::harness::binary::openshell_bin())
+            .args(["sandbox", "template", "delete", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Create a template whose sandboxes get `E2E_TEMPLATE_MARK=<mark>`, labelled
+/// for agents when `agent_usable` is true.
+async fn create_template(name: &str, mark: &str, agent_usable: bool) -> TemplateGuard {
+    let env = format!("E2E_TEMPLATE_MARK={mark}");
+    let mut args = vec!["sandbox", "template", "create", name, "--env", &env];
+    if agent_usable {
+        args.extend(["--label", "openshell.ai/agent-usable=true"]);
+    }
+    let (created, ok) = cli(&args).await;
+    assert!(ok, "template create {name} failed: {created}");
+    TemplateGuard(name.to_string())
+}
+
+#[tokio::test]
+async fn an_agent_creates_children_only_from_templates_marked_for_agents() {
+    ensure_workspace_member().await;
+    let id = std::process::id();
+    let approved = format!("e2e-agent-tpl-{id}");
+    let unlabelled = format!("e2e-plain-tpl-{id}");
+    let mark = format!("from-template-{id}");
+    // Declared before the sandboxes, so they are dropped after them.
+    let _approved_guard = create_template(&approved, &mark, true).await;
+    let _unlabelled_guard = create_template(&unlabelled, &mark, false).await;
+
+    let root = SandboxGuard::create(&[]).await.expect("create root");
+
+    // The agent learns the templates it may use from the tool list.
+    let tools = mcp_request(&root, "tools/list", json!({})).await;
+    let create = tools["result"]["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "create_sandbox"))
+        .unwrap_or_else(|| panic!("no create_sandbox tool: {tools}"));
+    let offered = &create["inputSchema"]["properties"]["template"]["enum"];
+    assert!(
+        offered.as_array().is_some_and(
+            |names| names.contains(&json!(approved)) && !names.contains(&json!(unlabelled))
+        ),
+        "{create}"
+    );
+
+    let worker = format!("{}-t", root.name);
+    let created = mcp(
+        &root,
+        "create_sandbox",
+        json!({"name": worker, "template": approved}),
+    )
+    .await;
+    let _worker_guard = SandboxGuard::manage_existing(worker.clone());
+    assert_eq!(created["isError"], false, "{created}");
+
+    // The child runs with the template's settings, not a copy of its parent's.
+    let ran = mcp(
+        &root,
+        "exec",
+        json!({"name": worker, "command": ["sh", "-c", "printf %s \"$E2E_TEMPLATE_MARK\""]}),
+    )
+    .await;
+    assert_eq!(content(&ran)["exit_code"], 0, "{ran}");
+    assert_eq!(content(&ran)["stdout"], mark, "{ran}");
+
+    // An unlabelled template and a missing one get the same answer, so an
+    // agent cannot learn which templates exist.
+    let missing = format!("e2e-missing-tpl-{id}");
+    for template in [&unlabelled, &missing] {
+        let refused = mcp(
+            &root,
+            "create_sandbox",
+            json!({"name": format!("{}-x", root.name), "template": template}),
+        )
+        .await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            content(&refused)["message"],
+            format!("template '{template}' is not available to agents"),
+            "{refused}"
+        );
+    }
 }
 
 #[tokio::test]
