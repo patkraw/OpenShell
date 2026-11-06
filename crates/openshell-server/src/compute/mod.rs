@@ -118,6 +118,8 @@ use provisioning_operation::ProvisioningOperationError;
 pub struct SandboxCreateRuntimeInputs {
     pub effective_policy: Option<ProtoSandboxPolicy>,
     pub launch_authentication: Option<Vec<u8>>,
+    /// Gateway-owned provenance for the sandbox's version-one policy revision.
+    pub initial_policy_provenance: HashMap<String, String>,
 }
 
 impl SandboxCreateRuntimeInputs {
@@ -126,6 +128,7 @@ impl SandboxCreateRuntimeInputs {
         Self {
             effective_policy: Some(effective_policy),
             launch_authentication: None,
+            initial_policy_provenance: HashMap::new(),
         }
     }
 }
@@ -1639,10 +1642,12 @@ impl ComputeRuntime {
         sandbox: Sandbox,
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
-        runtime_inputs: SandboxCreateRuntimeInputs,
+        mut runtime_inputs: SandboxCreateRuntimeInputs,
         lifecycle_guard: SandboxLifecycleGuard,
         mutation_guard: MutationGuard,
     ) -> Result<Sandbox, Status> {
+        let initial_policy_provenance =
+            std::mem::take(&mut runtime_inputs.initial_policy_provenance);
         // Defend the internal create path too, before consuming a staged archive
         // or persisting the sandbox. The gRPC handler checks before driver validation.
         self.validate_launch_signer_configured(
@@ -1762,6 +1767,7 @@ impl ComputeRuntime {
             self.store.as_ref(),
             &sandbox,
             crate::grpc::policy::InitialPolicyHistoryStatus::Pending,
+            initial_policy_provenance,
         ))
         .await
         {
@@ -3426,6 +3432,28 @@ impl ComputeRuntime {
         })?
     }
 
+    /// Count a root's children that are not already being deleted.
+    async fn live_child_count(&self, parent: &Sandbox) -> Result<usize, Status> {
+        let sandboxes = self
+            .store
+            .collect_messages::<Sandbox>(ObjectListQuery::Workspace(parent.object_workspace()))
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        Ok(sandboxes
+            .iter()
+            .filter(|sandbox| {
+                sandbox
+                    .parent
+                    .as_ref()
+                    .is_some_and(|link| link.id == parent.object_id())
+                    && sandbox
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_time.is_none())
+            })
+            .count())
+    }
+
     async fn delete_sandbox_inner(
         &self,
         target: SandboxDeleteTarget,
@@ -3469,6 +3497,23 @@ impl ComputeRuntime {
             return Err(Status::aborted(
                 "sandbox resource version changed before delete mutation",
             ));
+        }
+        // Checked under the sandbox's lock, which a child create also takes on
+        // its parent, so a child cannot be added between this check and the
+        // delete. Children already being deleted do not block.
+        if current.parent.is_none() {
+            let live_children = self.live_child_count(&current).await?;
+            if live_children > 0 {
+                let noun = if live_children == 1 {
+                    "child sandbox"
+                } else {
+                    "child sandboxes"
+                };
+                return Err(Status::failed_precondition(format!(
+                    "sandbox '{}' has {live_children} {noun}; delete them first",
+                    target.sandbox_name
+                )));
+            }
         }
 
         // `Started` carries both sides of the CAS transition: the durable
@@ -4317,6 +4362,27 @@ impl ComputeRuntime {
                 authentication_failed(sandbox.object_id());
                 failed += 1;
                 continue;
+            }
+            // A child whose parent record is gone is never started again; the
+            // startup child sync stops it. Read by id; a store error only
+            // skips the check, so a brief outage cannot strand every child.
+            if let Some(parent) = sandbox.parent.as_ref() {
+                match self.store.get_message::<Sandbox>(&parent.id).await {
+                    Ok(None) => {
+                        warn!(
+                            sandbox_id,
+                            parent_id = %parent.id,
+                            "Not starting child sandbox whose parent no longer exists"
+                        );
+                        continue;
+                    }
+                    Ok(Some(_)) => {}
+                    Err(err) => warn!(
+                        sandbox_id,
+                        error = %err,
+                        "Failed to check child sandbox's parent during gateway startup"
+                    ),
+                }
             }
             if is_automatic_restart_transition(&sandbox) {
                 // The restart loop resumes both scheduled and claimed
@@ -8188,6 +8254,18 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
             }
         }
     }
+}
+
+/// Ends the message for a child whose parent record is gone.
+pub const ORPHANED_CHILD_SUFFIX: &str = "no longer exists; delete this child sandbox";
+
+/// Why an orphaned child is refused configuration and starts. Names the
+/// parent by id too: a root created later under the same name is not it.
+pub fn orphaned_child_message(parent: &openshell_core::proto::SandboxParent) -> String {
+    format!(
+        "parent sandbox '{}' (id {}) {ORPHANED_CHILD_SUFFIX}",
+        parent.name, parent.id
+    )
 }
 
 /// Phases for which a sandbox should have a running compute resource.
