@@ -18,20 +18,25 @@ action=$1
 root=$2
 shift 2
 
-# Write a whole file at once, so a reader sees all of it or none of it.
+# Helpers this shell and each job's own shell both use.
+# shellcheck disable=SC2016 # expanded where the text is run
+helpers='
+# Write a whole file at once, so a reader sees all of it or none of it. The
+# temporary name is per writer, as two shells may write one file.
 write_file() {
-    printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"
+    printf "%s\n" "$2" > "$1.$$.tmp" && mv -f "$1.$$.tmp" "$1"
 }
 
 # Field 22 of /proc/<pid>/stat: when the process started. The process name
 # before it may hold spaces and parentheses, so cut through its last ") ".
 start_time() {
     proc_stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
-    # shellcheck disable=SC2086
     set -- ${proc_stat##*") "}
     [ $# -ge 20 ] || return 1
-    printf '%s\n' "${20}"
+    printf "%s\n" "${20}"
 }
+'
+eval "$helpers"
 
 # running, completed or lost.
 job_state() {
@@ -77,10 +82,18 @@ case $action in
 start)
     token=$1 has_stdin=$2
     shift 2
-    # Jobs need a writable root, and wait needs /proc and stat.
-    if ! mkdir -p "$root" 2>/dev/null || [ ! -w "$root" ] \
-        || ! start_time $$ > /dev/null || ! stat -c %Y "$root" > /dev/null 2>&1; then
-        echo unusable
+    # Jobs need a writable root, and wait needs /proc and stat. Each cause
+    # is named, so the caller can say which one to fix.
+    if ! mkdir -p "$root" 2>/dev/null || [ ! -w "$root" ]; then
+        echo unusable tmp
+        exit 0
+    fi
+    if ! start_time $$ > /dev/null; then
+        echo unusable proc
+        exit 0
+    fi
+    if ! stat -c %Y "$root" > /dev/null 2>&1; then
+        echo unusable stat
         exit 0
     fi
     last=$(numbered_jobs | sort -n | tail -n 1)
@@ -106,10 +119,14 @@ start)
     # The job lets go of the exec's stdin, stdout and stderr, or the exec
     # would not end until the job does.
     setsid=$(command -v setsid || true)
+    # The job records its own pid first, so it reads as running even if
+    # this shell is killed before its own record below lands. Both write
+    # the same pid.
     # shellcheck disable=SC2016 # expanded by the job's own shell
-    $setsid sh -c '
+    $setsid sh -c "$helpers"'
         job=$1
         shift
+        write_file "$job/pid" "$$ $(start_time $$)"
         "$@" < "$job/stdin" > "$job/out" 2> "$job/err"
         printf "%s\n" "$?" > "$job/exit.tmp" && mv -f "$job/exit.tmp" "$job/exit"
     ' sh "$job" "$@" < /dev/null > /dev/null 2>&1 &

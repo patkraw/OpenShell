@@ -161,6 +161,7 @@ pub struct PolicyLocalContext {
     denials: DenialLogSource,
     token_grants: Option<Arc<dyn TokenGrantResolver>>,
     workspace_rx: tokio::sync::watch::Receiver<String>,
+    mcp_door: crate::gateway_mcp_door::DoorConnection,
 }
 
 impl std::fmt::Debug for PolicyLocalContext {
@@ -191,6 +192,7 @@ impl PolicyLocalContext {
             denials: DenialLogSource::default(),
             token_grants: None,
             workspace_rx,
+            mcp_door: crate::gateway_mcp_door::DoorConnection::default(),
         }
     }
 
@@ -216,6 +218,11 @@ impl PolicyLocalContext {
     /// This sandbox instance's gateway address and credentials.
     pub(crate) fn gateway(&self) -> Option<&GatewayEndpoint> {
         self.gateway.as_ref()
+    }
+
+    /// The gateway connection and request slots `openshell.local/mcp` shares.
+    pub(crate) fn mcp_door(&self) -> &crate::gateway_mcp_door::DoorConnection {
+        &self.mcp_door
     }
 
     /// Serve `/v1/denials` from `denials` instead of the process log files.

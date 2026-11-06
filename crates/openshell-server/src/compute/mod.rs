@@ -12,7 +12,7 @@ mod provisioning_operation;
 pub mod rootfs_tar;
 
 pub use mutation_guard::MutationScope;
-use mutation_guard::{LocalMutationGuard, LocalMutationLocks, MutationGuard};
+use mutation_guard::{LocalMutationGuard, LocalMutationLocks, MutationGuard, SandboxDeleteGuard};
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -3403,7 +3403,11 @@ impl ComputeRuntime {
         preconditions: SandboxDeletePreconditions,
     ) -> Result<DeleteSandboxResult, Status> {
         let delete_guard = self.lifecycle_gates.lock_for(&target.sandbox_id).await;
-        let sandbox_guard = self.lock_sandbox_for_lifecycle(&delete_guard).await;
+        let sandbox_guard = Box::pin(self.lock_sandbox_for_delete(&delete_guard))
+            .await
+            .map_err(|err| {
+                crate::grpc::persistence_error_to_status(err, "acquire sandbox delete lock")
+            })?;
 
         // There is no await between acquiring the initial guards and spawning
         // the worker. From this commitment point onward, request cancellation
@@ -3434,24 +3438,11 @@ impl ComputeRuntime {
 
     /// Count a root's children that are not already being deleted.
     async fn live_child_count(&self, parent: &Sandbox) -> Result<usize, Status> {
-        let sandboxes = self
-            .store
-            .collect_messages::<Sandbox>(ObjectListQuery::Workspace(parent.object_workspace()))
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        Ok(sandboxes
-            .iter()
-            .filter(|sandbox| {
-                sandbox
-                    .parent
-                    .as_ref()
-                    .is_some_and(|link| link.id == parent.object_id())
-                    && sandbox
-                        .metadata
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.deletion_time.is_none())
-            })
-            .count())
+        Ok(
+            count_children(&self.store, parent.object_workspace(), parent.object_id())
+                .await?
+                .live,
+        )
     }
 
     async fn delete_sandbox_inner(
@@ -3459,7 +3450,7 @@ impl ComputeRuntime {
         target: SandboxDeleteTarget,
         preconditions: SandboxDeletePreconditions,
         delete_guard: SandboxLifecycleGuard,
-        guard: LocalMutationGuard,
+        guard: SandboxDeleteGuard,
     ) -> Result<DeleteSandboxResult, Status> {
         let current = self
             .store
@@ -3498,9 +3489,10 @@ impl ComputeRuntime {
                 "sandbox resource version changed before delete mutation",
             ));
         }
-        // Checked under the sandbox's lock, which a child create also takes on
-        // its parent, so a child cannot be added between this check and the
-        // delete. Children already being deleted do not block.
+        // Checked under the root's mutation guard, which a child create on any
+        // replica also takes on its parent, so a child cannot be added between
+        // this check and the delete. Children already being deleted do not
+        // block.
         if current.parent.is_none() {
             let live_children = self.live_child_count(&current).await?;
             if live_children > 0 {
@@ -8256,14 +8248,59 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
     }
 }
 
-/// Ends the message for a child whose parent record is gone.
-pub const ORPHANED_CHILD_SUFFIX: &str = "no longer exists; delete this child sandbox";
+/// A parent's children, split by whether their delete has started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChildCount {
+    pub live: usize,
+    pub being_deleted: usize,
+}
+
+impl ChildCount {
+    pub fn total(self) -> usize {
+        self.live + self.being_deleted
+    }
+}
+
+/// Whether a sandbox's delete has started. It keeps its record, and its
+/// compute resources may still run, until the driver finishes.
+pub fn is_being_deleted(sandbox: &Sandbox) -> bool {
+    sandbox
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
+}
+
+/// Count a parent's children by scanning its workspace.
+pub async fn count_children(
+    store: &Store,
+    workspace: &str,
+    parent_id: &str,
+) -> Result<ChildCount, Status> {
+    let sandboxes = store
+        .collect_messages::<Sandbox>(ObjectListQuery::Workspace(workspace))
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    let mut count = ChildCount::default();
+    for sandbox in sandboxes.iter().filter(|sandbox| {
+        sandbox
+            .parent
+            .as_ref()
+            .is_some_and(|parent| parent.id == parent_id)
+    }) {
+        if is_being_deleted(sandbox) {
+            count.being_deleted += 1;
+        } else {
+            count.live += 1;
+        }
+    }
+    Ok(count)
+}
 
 /// Why an orphaned child is refused configuration and starts. Names the
 /// parent by id too: a root created later under the same name is not it.
 pub fn orphaned_child_message(parent: &openshell_core::proto::SandboxParent) -> String {
     format!(
-        "parent sandbox '{}' (id {}) {ORPHANED_CHILD_SUFFIX}",
+        "parent sandbox '{}' (id {}) no longer exists; delete this child sandbox",
         parent.name, parent.id
     )
 }

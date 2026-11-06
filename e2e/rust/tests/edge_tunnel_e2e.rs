@@ -233,8 +233,12 @@ async fn ws_tunnel_status_through_edge_proxy() {
 
 /// `openshell mcp serve` sends MCP over the same connection as the CLI's
 /// gRPC calls, so with edge auth it goes through the WebSocket tunnel. Needs
-/// a plaintext gateway with child sandboxes, and so `/mcp`, enabled.
+/// a plaintext gateway with child sandboxes, and so `/mcp`, enabled. No CI
+/// gateway is plaintext, so it is ignored unless run by hand:
+/// `OPENSHELL_E2E_CHILD_SANDBOXES=1 cargo test --manifest-path e2e/rust/Cargo.toml
+/// --test edge_tunnel_e2e -- --ignored mcp_serve_through_edge_proxy`.
 #[tokio::test]
+#[ignore = "needs a plaintext gateway with child sandboxes enabled"]
 async fn mcp_serve_through_edge_proxy() {
     if std::env::var("OPENSHELL_E2E_CHILD_SANDBOXES").as_deref() != Ok("1") {
         eprintln!(

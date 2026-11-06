@@ -27,7 +27,7 @@ openshell sandbox create --name lead --from codex-agent:local --provider openai 
 openshell sandbox create --name reviewer --parent lead --from claude-agent:local --provider anthropic
 ```
 
-The gateway refuses a child of a child with `only one level of child sandboxes is supported`. When a root already has as many children as the gateway's `max_concurrent_children` allows, it refuses with `sandbox 'lead' has reached its limit of 10 children`. Every child counts until it is deleted, whatever its state.
+The gateway refuses a child of a child with `only one level of child sandboxes is supported`. When a root already has as many children as the gateway's `max_concurrent_children` allows, it refuses with `sandbox 'lead' has reached its limit of 10 children`. Every child counts whatever its state, and keeps its slot until its delete finishes. While one is still being deleted, the refusal says so and you can retry shortly.
 
 `sandbox list` adds a `PARENT` column when the page holds a child. A root shows `-`, and a child whose parent no longer exists shows `deleted (<id>)`. List one root's children with `--parent`:
 
@@ -37,7 +37,7 @@ openshell sandbox list --parent lead
 
 ## Policy
 
-A child always uses its parent's policy. When it is created, the gateway copies the policy the parent is enforcing into the child. When the parent loads a new policy, the gateway copies that version into each child and delivers it as it delivers any policy update. A child that was offline catches up when it reconnects.
+A child always uses its parent's policy. When it is created, the gateway copies the policy the parent is enforcing into the child. When the parent loads a new policy, the gateway copies that version into each child and delivers it as it delivers any policy update. Until a child has the copy, the gateway refuses it configuration, so it has no new network access; this normally lasts seconds and at most about 30 seconds.
 
 You cannot give a child a policy of its own or change its policy. `sandbox create --parent` refuses `--policy` with `child sandboxes use their parent's policy; omit --policy`, and ignores `OPENSHELL_SANDBOX_POLICY` with a note. Policy updates, approvals and proposals for a child are refused. To change what a child can do, change its parent's policy.
 
@@ -47,7 +47,7 @@ A child always fails closed. If it cannot load its copy, it denies all new netwo
 
 A child can use only providers attached to its parent. Without `--provider`, a child gets all of its parent's providers. With `--provider`, it gets the ones you name, and naming one the parent does not have is refused with `provider 'github' is not attached to parent 'lead'`.
 
-When a provider is detached from the parent, the gateway detaches it from every child too. A provider later attached to the parent reaches only children created after that.
+When a provider is detached from the parent, every child stops receiving it at its next configuration update, and the gateway detaches it from the child too. A provider later attached to the parent reaches only children created after that.
 
 ## Delete a Parent
 
@@ -79,7 +79,7 @@ The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each to
 | `create_sandbox` | Create a sandbox and wait until it is ready, up to 45 seconds. If it is not ready by then, the tool returns its current state with `timed_out: true`, not an error; call it again with the same name to keep waiting. Calling it again returns the existing sandbox with `already_existed: true`. |
 | `list` | List sandboxes and their state. |
 | `exec` | Run a command and return its exit code and output, or start a background job. |
-| `wait` | Wait for a background job, up to 45 seconds, and return its result. |
+| `wait` | Wait for a background job, up to 40 seconds, and return its result. |
 | `delete` | Delete a sandbox. |
 | `logs` | Read a sandbox's own log lines, such as startup errors and policy denials. |
 
@@ -87,9 +87,11 @@ The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each to
 
 An agent in a root sandbox calls `http://openshell.local/mcp`. The sandbox's supervisor attaches the sandbox's credential, so the agent holds no token. A sandbox acts only on its own children:
 
-- `create_sandbox` takes a `name`, and optionally a `template` and `providers`. Without a template, the child copies the root's image, CPU and memory, but not a GPU. A template must carry the label `openshell.ai/agent-usable: "true"` and have no driver configuration. Without `providers`, the child gets all of the root's.
+- `create_sandbox` takes a `name`, and optionally a `template` and `providers`. Without a template, the child copies the root's image, CPU and memory, but not a GPU or other device. A template must carry the label `openshell.ai/agent-usable: "true"` and have no driver configuration. Either way, the child gets the root's runtime class and user namespace setting. Without `providers`, the child gets all of the root's.
+- A root created with driver configuration cannot create children through MCP.
 - `list`, `exec`, `wait`, `delete` and `logs` act only on the root's children. Any other name reads as not found.
-- The root can create children only while the user who created it is still a member of the workspace.
+- A sandbox can have 8 requests to `openshell.local/mcp` open at once. Another one gets `503` with `too many gateway requests at once; try again`.
+- The root can create children only while the user who created it is still a member of the workspace. A child the root creates records the root as its creator, as `sandbox:<id>`; a child you create with `--parent` records you.
 
 ### From the Host
 

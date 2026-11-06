@@ -625,7 +625,7 @@ pub async fn sandbox_create(
     // A child's providers must already be on its parent, which the gateway
     // checks, so `--parent` never creates one from local credentials.
     let configured_providers = if parent.is_some() {
-        providers.to_vec()
+        child_provider_names(providers)
     } else {
         ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
             .await?
@@ -1549,6 +1549,17 @@ fn merge_rootfs_tar_driver_config(
 /// to apply its own default.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     openshell_policy::load_sandbox_policy(cli_path)
+}
+
+/// A child's `--provider` names as given, each once, like a root's.
+fn child_provider_names(providers: &[String]) -> Vec<String> {
+    let mut names = Vec::with_capacity(providers.len());
+    for name in providers {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
 }
 
 const IGNORED_POLICY_ENV_NOTE: &str =
@@ -7328,6 +7339,15 @@ mod tests {
         assert_eq!(
             create_request_policy(Some("lead"), None, None).unwrap().1,
             None
+        );
+    }
+
+    #[test]
+    fn a_child_create_sends_each_provider_once() {
+        let names = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            super::child_provider_names(&names(&["github", "slack", "github"])),
+            names(&["github", "slack"])
         );
     }
 

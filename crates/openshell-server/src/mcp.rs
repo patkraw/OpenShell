@@ -19,13 +19,14 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use openshell_core::ObjectName;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     CreateSandboxRequest, DeleteSandboxRequest, ExecSandboxRequest, ListSandboxesRequest, Sandbox,
     SandboxPhase, SandboxSpec,
 };
+use openshell_core::{ObjectId, ObjectName};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tower::util::BoxCloneSyncService;
 use tracing::warn;
 
@@ -67,6 +68,8 @@ pub struct McpConnection {
     auth: CallerAuthenticator,
     grpc: GrpcStack,
     create_wait: CreateWait,
+    /// Read only to record, in audit events, the user a sandbox caller acts for.
+    store: Option<Arc<crate::persistence::Store>>,
 }
 
 /// How long `create_sandbox` waits for a child to become ready, and how often
@@ -106,7 +109,15 @@ impl McpConnection {
             auth,
             grpc: BoxCloneSyncService::new(grpc.map_err(Into::into)),
             create_wait: CreateWait::default(),
+            store: None,
         }
+    }
+
+    /// Let audit events record the user each sandbox caller acts for.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<crate::persistence::Store>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Shorten the create wait so tests need not sleep for real.
@@ -235,10 +246,23 @@ async fn handle(
                 _ => unreachable!("tool names are checked against TOOLS above"),
             };
             let origin = RequestOrigin::new(connection.auth.connection_source(), &headers);
-            let details = tool_call_details(name, &arguments, &result);
+            let mut details = tool_call_details(name, &arguments, &result);
+            if let Principal::Sandbox(sandbox) = &principal {
+                details.push((
+                    "acting_for",
+                    acting_for(&connection, &sandbox.sandbox_id).await,
+                ));
+            }
+            let details = capped_audit_details(details);
             match result {
                 Ok(content) => {
-                    audit::emit_mcp_tool_call(&origin, &principal, name, None, &details);
+                    audit::emit_mcp_tool_call(
+                        &origin,
+                        &principal,
+                        name,
+                        audit::McpOutcome::Allowed,
+                        &details,
+                    );
                     rpc_ok(&id, tool_result(&content, false))
                 }
                 Err(ToolError::Unauthenticated) => StatusCode::UNAUTHORIZED.into_response(),
@@ -247,7 +271,7 @@ async fn handle(
                         &origin,
                         &principal,
                         name,
-                        Some(error.code),
+                        audit_outcome(error.code),
                         &details,
                     );
                     rpc_ok(&id, tool_result(&error.to_json(), true))
@@ -326,7 +350,7 @@ fn tool_definitions() -> Vec<Value> {
                     "properties": {
                         "name": {"type": "string", "description": "Sandbox the job runs in."},
                         "job": {"type": "string", "description": "Job id returned by exec."},
-                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S},
+                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": jobs::MAX_WAIT_S},
                     },
                     "required": ["name", "job"],
                     "additionalProperties": false,
@@ -370,6 +394,10 @@ const OUTPUT_EDGE_BYTES: usize = 16 * 1024;
 const GATEWAY_TIMEOUT_EXIT_CODE: i32 = 124;
 /// Largest argument list recorded in the audit event.
 const MAX_AUDIT_ARGV_BYTES: usize = 1024;
+/// Largest working directory an audit event records.
+const MAX_AUDIT_WORKDIR_BYTES: usize = 512;
+/// Largest value of any other audit field.
+const MAX_AUDIT_FIELD_BYTES: usize = 256;
 
 struct ExecArgs {
     name: String,
@@ -680,77 +708,173 @@ fn utf8_start_after_partial(bytes: &[u8]) -> usize {
         .count()
 }
 
+/// A refusal is a policy or request decision; anything else the call could
+/// not finish is a failure, not a denial.
+fn audit_outcome(code: &str) -> audit::McpOutcome<'_> {
+    match code {
+        "internal" | "unavailable" | "timed_out" => audit::McpOutcome::Failed(code),
+        _ => audit::McpOutcome::Refused(code),
+    }
+}
+
+/// The user a sandbox caller acts for: its own record's creator. A failed
+/// read is recorded as `unknown` and never fails the call.
+pub async fn acting_for(connection: &McpConnection, sandbox_id: &str) -> String {
+    let Some(store) = connection.store.as_ref() else {
+        return "unknown".to_string();
+    };
+    match store.get_message::<Sandbox>(sandbox_id).await {
+        Ok(Some(sandbox)) if !sandbox.created_by.is_empty() => sandbox.created_by,
+        _ => "unknown".to_string(),
+    }
+}
+
 /// Every field the audit event records about a tool call beyond its caller
-/// and outcome. The handler adds nothing else: the arguments' fields, plus a
-/// started job's id and a waited job's state from the reply.
+/// and outcome: fields of the arguments, then of the reply. Never stdin,
+/// environment values, output, log lines or any reply body.
 fn tool_call_details(
     tool: &str,
     arguments: &Value,
     result: &Result<Value, ToolError>,
 ) -> Vec<(&'static str, String)> {
     let mut details = audit_details(tool, arguments);
-    if let Ok(content) = result
-        && content.get("job").is_some()
-    {
-        let field = |key: &str| content[key].as_str().unwrap_or_default().to_string();
-        if tool == "exec" {
-            details.push(("job", field("job")));
+    let content = match result {
+        Ok(content) => content,
+        Err(ToolError::Refused(Refusal {
+            withheld: Some(withheld),
+            ..
+        })) => {
+            details.push(("request_id", withheld.request_id.clone()));
+            details.push(("error_detail", withheld.detail.clone()));
+            return details;
         }
-        details.push(("state", field("state")));
+        Err(_) => return details,
+    };
+    let flag = |key: &str| content.get(key).and_then(Value::as_bool);
+    match tool {
+        "create_sandbox" => {
+            details.push(("sandbox_id", json_text(&content["id"])));
+            if let Some(already_existed) = flag("already_existed") {
+                details.push(("already_existed", already_existed.to_string()));
+            }
+            if let Some(timed_out) = flag("timed_out") {
+                details.push(("timed_out", timed_out.to_string()));
+            }
+        }
+        "list" => {
+            let count = content["sandboxes"].as_array().map_or(0, Vec::len);
+            details.push(("count", count.to_string()));
+        }
+        "exec" if content.get("job").is_some() => {
+            details.push(("job", json_text(&content["job"])));
+            details.push(("state", json_text(&content["state"])));
+        }
+        "exec" => {
+            details.push(("exit_code", json_text(&content["exit_code"])));
+            details.push(("timed_out", flag("timed_out").unwrap_or(false).to_string()));
+        }
+        "wait" => {
+            details.push(("state", json_text(&content["state"])));
+            if !content["exit_code"].is_null() {
+                details.push(("exit_code", json_text(&content["exit_code"])));
+            }
+        }
+        _ => {}
     }
     details
 }
 
-/// What the audit event records from a tool call's arguments: for `exec`,
-/// the target, the argument list (capped) and the working directory; never
-/// stdin.
+/// What the audit event records from a tool call's arguments.
 fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
-    let text = |key| {
+    let text = |key| arguments.get(key).map(json_text).unwrap_or_default();
+    let given = |key: &'static str| {
         arguments
             .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
+            .filter(|value| !value.is_null())
+            .map(|value| (key, json_text(value)))
     };
-    if tool == "delete" {
-        return vec![("target", text("name"))];
+    match tool {
+        "create_sandbox" => {
+            let mut details = vec![("target", text("name"))];
+            details.extend(
+                ["template", "parent", "image"]
+                    .into_iter()
+                    .filter_map(given),
+            );
+            if let Some(providers) = arguments.get("providers").and_then(Value::as_array) {
+                let names: Vec<_> = providers.iter().map(json_text).collect();
+                details.push(("providers", names.join(",")));
+            }
+            details
+        }
+        "list" => given("parent").into_iter().collect(),
+        "delete" => vec![("target", text("name"))],
+        "wait" => vec![("target", text("name")), ("job", text("job"))],
+        "logs" => {
+            let lines = arguments
+                .get("lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_LOG_LINES);
+            vec![("target", text("name")), ("lines", lines.to_string())]
+        }
+        "exec" => {
+            let argv = arguments
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let mut details = vec![
+                ("target", text("name")),
+                ("argv", argv),
+                ("workdir", text("workdir")),
+                (
+                    "background",
+                    (arguments.get("background") == Some(&Value::Bool(true))).to_string(),
+                ),
+            ];
+            details.extend(given("timeout_s"));
+            details
+        }
+        _ => Vec::new(),
     }
-    if tool == "wait" {
-        return vec![("target", text("name")), ("job", text("job"))];
+}
+
+/// A JSON value as audit text: a string as is, anything else encoded.
+fn json_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
-    if tool == "logs" {
-        let lines = arguments
-            .get("lines")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_LOG_LINES);
-        return vec![("target", text("name")), ("lines", lines.to_string())];
-    }
-    if tool != "exec" {
-        return Vec::new();
-    }
-    let argv = arguments
-        .get("command")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
+}
+
+/// Marks a value cut at its cap.
+const AUDIT_CUT_MARKER: &str = "…[cut]";
+
+/// Cut every field to its cap on a character boundary, marking a cut. With
+/// the fixed field set this keeps an event's details under 4 KiB.
+fn capped_audit_details(details: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
+    details
+        .into_iter()
+        .map(|(key, value)| {
+            let cap = match key {
+                "argv" => MAX_AUDIT_ARGV_BYTES,
+                "workdir" => MAX_AUDIT_WORKDIR_BYTES,
+                _ => MAX_AUDIT_FIELD_BYTES,
+            };
+            if value.len() <= cap {
+                return (key, value);
+            }
+            let kept = truncate_at_char_boundary(&value, cap - AUDIT_CUT_MARKER.len());
+            (key, format!("{kept}{AUDIT_CUT_MARKER}"))
         })
-        .unwrap_or_default();
-    vec![
-        ("target", text("name")),
-        (
-            "argv",
-            truncate_at_char_boundary(&argv, MAX_AUDIT_ARGV_BYTES).to_string(),
-        ),
-        ("workdir", text("workdir")),
-        (
-            "background",
-            (arguments.get("background") == Some(&Value::Bool(true))).to_string(),
-        ),
-    ]
+        .collect()
 }
 
 fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
@@ -976,6 +1100,7 @@ async fn create_child(call: &Call<'_>, arguments: &Value) -> Result<Value, ToolE
                         args.name
                     ),
                     retryable: false,
+                    withheld: None,
                 }))
             }
         }
@@ -999,6 +1124,7 @@ async fn wait_until_ready(
                 code: "not_found",
                 message: format!("sandbox '{name}' not found"),
                 retryable: false,
+                withheld: None,
             }));
         };
         let mut reply = child_summary(&child);
@@ -1010,6 +1136,7 @@ async fn wait_until_ready(
                     code: "failed_precondition",
                     message: format!("sandbox '{name}' failed: {}", failure_message(&child)),
                     retryable: false,
+                    withheld: None,
                 }));
             }
             _ => {}
@@ -1104,6 +1231,7 @@ fn child_summary(sandbox: &Sandbox) -> Value {
         .and_then(|metadata| metadata.created_time.as_ref())
         .map(ToString::to_string);
     let mut summary = json!({
+        "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "state": phase.as_str_name().trim_start_matches("SANDBOX_PHASE_").to_ascii_lowercase(),
         "created_at": created_at,
@@ -1195,6 +1323,15 @@ struct Refusal {
     code: &'static str,
     message: String,
     retryable: bool,
+    /// What the agent is not shown, for the gateway log and the audit event.
+    withheld: Option<Withheld>,
+}
+
+/// An error's own text, withheld from the agent, and the request id that
+/// matches the agent's message to the gateway log and the audit event.
+struct Withheld {
+    request_id: String,
+    detail: String,
 }
 
 impl Refusal {
@@ -1209,11 +1346,30 @@ impl ToolError {
             code: "invalid_argument",
             message: message.to_string(),
             retryable: false,
+            withheld: None,
         })
     }
 
-    /// Map a gRPC status to the agent-facing error. Internal errors can carry
-    /// store or driver detail, so their text is logged, not returned.
+    /// A retryable error whose text is logged and audited, not returned:
+    /// internal and unavailable errors can carry store or driver detail.
+    fn withheld(code: &'static str, summary: &str, status: &tonic::Status) -> Self {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        warn!(%request_id, code, error = %status.message(), "mcp: tool call failed");
+        Self::Refused(Refusal {
+            code,
+            message: format!(
+                "{summary} (request {request_id}); the operator can find it in the gateway logs"
+            ),
+            retryable: true,
+            withheld: Some(Withheld {
+                request_id,
+                detail: status.message().to_string(),
+            }),
+        })
+    }
+
+    /// Map a gRPC status to the agent-facing error. Internal, unknown and
+    /// unavailable errors are withheld; the rest are written for agents.
     fn from_status(status: tonic::Status) -> Self {
         use tonic::Code;
         let (code, retryable) = match status.code() {
@@ -1223,27 +1379,32 @@ impl ToolError {
             Code::AlreadyExists => ("already_exists", false),
             Code::FailedPrecondition => ("failed_precondition", false),
             Code::PermissionDenied => ("permission_denied", false),
+            Code::ResourceExhausted if is_rate_limit(&status) => ("rate_limited", true),
             Code::ResourceExhausted => ("limit_reached", false),
-            Code::Unavailable | Code::Aborted => ("unavailable", true),
+            Code::Aborted => ("unavailable", true),
             Code::DeadlineExceeded => ("timed_out", true),
-            _ => {
-                let request_id = uuid::Uuid::new_v4();
-                warn!(%request_id, error = %status.message(), "mcp: internal error");
-                return Self::Refused(Refusal {
-                    code: "internal",
-                    message: format!(
-                        "internal error (request {request_id}); the operator can find it in the gateway logs"
-                    ),
-                    retryable: true,
-                });
+            Code::Unavailable => {
+                return Self::withheld("unavailable", "gateway unavailable", &status);
             }
+            _ => return Self::withheld("internal", "internal error", &status),
         };
         Self::Refused(Refusal {
             code,
             message: status.message().to_string(),
             retryable,
+            withheld: None,
         })
     }
+}
+
+/// Whether the gateway's rate limiter refused the call, the one
+/// `ResourceExhausted` worth retrying.
+fn is_rate_limit(status: &tonic::Status) -> bool {
+    openshell_core::rpc_error::decode_details(status)
+        .and_then(|details| details.error_info().cloned())
+        .is_some_and(|info| {
+            info.reason == "RATE_LIMITED" && info.domain == openshell_core::rpc_error::ERROR_DOMAIN
+        })
 }
 
 fn tool_result(content: &Value, is_error: bool) -> Value {
@@ -1439,7 +1600,7 @@ mod tests {
             &RequestOrigin::new(None, &headers),
             &sandbox_principal("lead"),
             "exec",
-            Some("not_found"),
+            audit::McpOutcome::Refused("not_found"),
             &details,
         );
         let event = serde_json::to_value(event).unwrap();
@@ -1450,6 +1611,245 @@ mod tests {
         let text = event.to_string();
         assert!(!text.contains("canary-secret-token") && !text.contains("secret-stdin"));
         openshell_ocsf_validate::validate_event(&event).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn recorded(
+        tool: &str,
+        arguments: Value,
+        result: Result<Value, ToolError>,
+    ) -> std::collections::HashMap<&'static str, String> {
+        capped_audit_details(tool_call_details(tool, &arguments, &result))
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn each_tool_records_its_fields_and_keeps_the_existing_keys() {
+        let create = recorded(
+            "create_sandbox",
+            json!({"name": "w1", "parent": "lead", "image": "img:1", "providers": ["gh", "oa"]}),
+            Ok(json!({"id": "id-1", "name": "w1", "already_existed": false})),
+        );
+        assert_eq!(create["target"], "w1");
+        assert_eq!(create["parent"], "lead");
+        assert_eq!(create["image"], "img:1");
+        assert_eq!(create["providers"], "gh,oa");
+        assert_eq!(create["sandbox_id"], "id-1");
+        assert_eq!(create["already_existed"], "false");
+        assert!(!create.contains_key("template") && !create.contains_key("timed_out"));
+
+        let list = recorded(
+            "list",
+            json!({"parent": "lead"}),
+            Ok(json!({"sandboxes": [{}, {}]})),
+        );
+        assert_eq!(list["parent"], "lead");
+        assert_eq!(list["count"], "2");
+
+        let exec = recorded(
+            "exec",
+            json!({"name": "w1", "command": ["ls"], "timeout_s": 10, "stdin": "secret"}),
+            Ok(json!({"exit_code": 0, "timed_out": false, "stdout": "out"})),
+        );
+        assert_eq!(exec["target"], "w1");
+        assert_eq!(exec["argv"], "ls");
+        assert_eq!(exec["background"], "false");
+        assert_eq!(exec["timeout_s"], "10");
+        assert_eq!(exec["exit_code"], "0");
+        assert_eq!(exec["timed_out"], "false");
+
+        let started = recorded(
+            "exec",
+            json!({"name": "w1", "command": ["sleep", "9"], "background": true}),
+            Ok(json!({"job": "1-ab", "state": "running"})),
+        );
+        assert_eq!(started["job"], "1-ab");
+        assert_eq!(started["state"], "running");
+        assert_eq!(started["background"], "true");
+
+        let waited = recorded(
+            "wait",
+            json!({"name": "w1", "job": "1-ab"}),
+            Ok(json!({"job": "1-ab", "state": "completed", "exit_code": 3, "stdout": "x"})),
+        );
+        assert_eq!(waited["job"], "1-ab");
+        assert_eq!(waited["state"], "completed");
+        assert_eq!(waited["exit_code"], "3");
+
+        assert_eq!(
+            recorded("delete", json!({"name": "w1"}), Ok(json!({})))["target"],
+            "w1"
+        );
+        let logs = recorded("logs", json!({"name": "w1"}), Ok(json!({"lines": ["l"]})));
+        assert_eq!(logs["lines"], DEFAULT_LOG_LINES.to_string());
+
+        // Nothing from stdin, output, log lines or reply bodies.
+        for fields in [&create, &list, &exec, &started, &waited, &logs] {
+            for value in fields.values() {
+                assert!(!value.contains("secret") && value != "out" && value != "x");
+            }
+        }
+    }
+
+    #[test]
+    fn long_values_are_cut_at_their_cap_with_a_marker() {
+        let long = "é".repeat(4096);
+        let fields = recorded(
+            "exec",
+            json!({"name": long, "command": [long], "workdir": long, "timeout_s": 1}),
+            Ok(json!({"exit_code": 0, "timed_out": false})),
+        );
+        for (key, cap) in [
+            ("argv", MAX_AUDIT_ARGV_BYTES),
+            ("workdir", MAX_AUDIT_WORKDIR_BYTES),
+            ("target", MAX_AUDIT_FIELD_BYTES),
+        ] {
+            assert!(fields[key].len() <= cap, "{key}");
+            assert!(fields[key].ends_with(AUDIT_CUT_MARKER), "{key}");
+            assert!(fields[key].starts_with("éé"), "{key}");
+        }
+
+        // The largest event any tool can produce stays under 4 KiB.
+        let mut worst = capped_audit_details(tool_call_details(
+            "exec",
+            &json!({"name": long, "command": [long], "workdir": long, "timeout_s": long}),
+            &Ok(json!({"job": long, "state": long})),
+        ));
+        worst.push(("acting_for", long.clone()));
+        let worst = capped_audit_details(worst);
+        let total: usize = worst
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        assert!(total <= 4096, "{total}");
+
+        // So does a failed call, which records the withheld error instead.
+        let mut worst = capped_audit_details(tool_call_details(
+            "exec",
+            &json!({"name": long, "command": [long], "workdir": long, "timeout_s": long}),
+            &Err(ToolError::from_status(tonic::Status::internal(
+                long.clone(),
+            ))),
+        ));
+        worst.push(("acting_for", long));
+        let worst = capped_audit_details(worst);
+        let total: usize = worst
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        assert!(total <= 4096, "{total}");
+    }
+
+    #[test]
+    fn a_failure_is_not_recorded_as_a_denial() {
+        let event = |code| {
+            serde_json::to_value(audit::mcp_tool_call_event(
+                &RequestOrigin::new(None, &HeaderMap::new()),
+                &sandbox_principal("lead"),
+                "exec",
+                audit_outcome(code),
+                &[],
+            ))
+            .unwrap()
+        };
+        for code in ["internal", "unavailable", "timed_out"] {
+            let failed = event(code);
+            assert_eq!(failed["action_id"], 1, "{code}: allowed, not denied");
+            assert_eq!(failed["status_id"], 2, "{code}");
+            assert_eq!(failed["status_detail"], code);
+            assert_eq!(
+                failed["message"],
+                format!("mcp tool call exec: failed ({code})")
+            );
+            openshell_ocsf_validate::validate_event(&failed).unwrap_or_else(|e| panic!("{e}"));
+        }
+        for code in ["not_found", "failed_precondition", "limit_reached"] {
+            let refused = event(code);
+            assert_eq!(refused["action_id"], 2, "{code}: denied");
+            assert_eq!(refused["disposition_id"], 2, "{code}: blocked");
+            assert_eq!(
+                refused["message"],
+                format!("mcp tool call exec: refused ({code})")
+            );
+        }
+    }
+
+    /// Internal, unknown and unavailable errors can carry store or driver
+    /// detail: the agent gets a request id instead, and keeps its retry hint.
+    #[test]
+    fn internal_detail_never_reaches_the_agent() {
+        let detail = "store pool exhausted at 10.0.0.3:5432";
+        for (status, code) in [
+            (tonic::Status::internal(detail), "internal"),
+            (tonic::Status::unknown(detail), "internal"),
+            (tonic::Status::unavailable(detail), "unavailable"),
+        ] {
+            let ToolError::Refused(refusal) = ToolError::from_status(status) else {
+                panic!("not a refusal");
+            };
+            assert_eq!((refusal.code, refusal.retryable), (code, true));
+            assert!(!refusal.message.contains("10.0.0.3"), "{}", refusal.message);
+            // The audit event keeps the detail, under the id the agent sees.
+            let message = refusal.message.clone();
+            let fields = recorded("list", json!({}), Err(ToolError::Refused(refusal)));
+            assert_eq!(fields["error_detail"], detail);
+            assert!(
+                message.contains(&format!("(request {})", fields["request_id"])),
+                "{message}"
+            );
+        }
+        let fields = recorded(
+            "list",
+            json!({}),
+            Err(ToolError::from_status(tonic::Status::internal(
+                "é".repeat(400),
+            ))),
+        );
+        assert!(fields["error_detail"].len() <= MAX_AUDIT_FIELD_BYTES);
+        assert!(fields["error_detail"].ends_with(AUDIT_CUT_MARKER));
+        // Messages written for agents are kept.
+        for status in [
+            tonic::Status::failed_precondition("parent sandbox 'lead' is being deleted"),
+            tonic::Status::invalid_argument("name must be at most 63 characters"),
+        ] {
+            let message = status.message().to_string();
+            let ToolError::Refused(refusal) = ToolError::from_status(status) else {
+                panic!("not a refusal");
+            };
+            assert_eq!(refusal.message, message);
+        }
+    }
+
+    /// Only a rate limit is worth retrying: a full child limit, even one
+    /// waiting on deletes, and an oversized message are not.
+    #[test]
+    fn only_a_rate_limit_is_retryable() {
+        use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
+        let refusal = |status| match ToolError::from_status(status) {
+            ToolError::Refused(refusal) => refusal,
+            ToolError::Unauthenticated => panic!("not a refusal"),
+        };
+        let rate_limited = refusal(tonic::Status::with_error_details(
+            tonic::Code::ResourceExhausted,
+            "gRPC rate limit exceeded",
+            ErrorDetails::with_error_info(
+                "RATE_LIMITED",
+                ERROR_DOMAIN,
+                std::collections::HashMap::new(),
+            ),
+        ));
+        assert_eq!(
+            (rate_limited.code, rate_limited.retryable),
+            ("rate_limited", true)
+        );
+        assert_eq!(rate_limited.message, "gRPC rate limit exceeded");
+        for message in [
+            "sandbox 'lead' has reached its limit of 2 children, 1 of them still being deleted; try again shortly",
+            "gRPC message exceeds u32",
+        ] {
+            let other = refusal(tonic::Status::resource_exhausted(message));
+            assert_eq!((other.code, other.retryable), ("limit_reached", false));
+        }
     }
 
     #[test]
@@ -1664,10 +2064,10 @@ mod tests {
 
     #[test]
     fn the_audit_argument_list_is_capped_on_a_character_boundary() {
-        let details = audit_details(
+        let details = capped_audit_details(audit_details(
             "exec",
             &json!({"name": "w", "command": ["echo", "é".repeat(1000)], "stdin": "secret"}),
-        );
+        ));
         let argv = &details.iter().find(|(key, _)| *key == "argv").unwrap().1;
         assert!(argv.len() <= MAX_AUDIT_ARGV_BYTES);
         assert!(argv.starts_with("echo é"));

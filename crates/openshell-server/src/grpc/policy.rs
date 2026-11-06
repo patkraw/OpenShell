@@ -2921,7 +2921,7 @@ pub(super) async fn load_sandbox_config(
 ///
 /// This is a read-only projection shared by polling and stream delivery.
 pub async fn build_sandbox_config_snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     sandbox: &Sandbox,
 ) -> Result<SandboxConfigSnapshot, Status> {
     let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
@@ -2940,23 +2940,6 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
     let global_settings = &inputs.global_settings;
-
-    // A child is not admitted while its parent denies all new egress, so it
-    // fails closed with the parent instead of keeping its copy's access.
-    // An orphaned child is refused too, until it is stopped and deleted.
-    if let Some(parent) = sandbox.parent.as_ref() {
-        if super::sandbox::parent_is_missing(state, &parent.id).await? {
-            return Err(Status::failed_precondition(
-                crate::compute::orphaned_child_message(parent),
-            ));
-        }
-        if super::sandbox::parent_is_blocked(state, &parent.id).await? {
-            return Err(Status::failed_precondition(format!(
-                "parent sandbox '{}' rejected its latest policy",
-                parent.name
-            )));
-        }
-    }
 
     let global_policy = decode_policy_from_global_settings(global_settings)?;
     let mut global_policy_version: u32 = 0;
@@ -3904,7 +3887,7 @@ pub(super) async fn load_sandbox_provider_environment(
 
 /// Build the complete provider environment for one persisted sandbox.
 pub async fn build_provider_environment_snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     sandbox: &Sandbox,
     supports_static_credential_bindings: bool,
     supports_stable_placeholder_environment_keys: bool,
@@ -5121,14 +5104,24 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 }
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
+    use super::sandbox::child_refusal;
     let message = error.message();
-    if message.starts_with("parent sandbox ")
-        && message.ends_with(crate::compute::ORPHANED_CHILD_SUFFIX)
-    {
-        "The parent sandbox no longer exists; delete this child sandbox"
-    } else if message.starts_with("parent sandbox ") {
-        "The parent sandbox rejected its latest policy; fix the parent's policy"
-    } else if message.contains("middleware") {
+    match child_refusal::reason(error).as_deref() {
+        Some(child_refusal::PARENT_MISSING) => {
+            return "The parent sandbox no longer exists; delete this child sandbox";
+        }
+        Some(child_refusal::PARENT_POLICY_NOT_COPIED) => {
+            return "Waiting for a copy of the parent sandbox's latest policy";
+        }
+        Some(child_refusal::PARENT_POLICY_UNCOPYABLE) => {
+            return "The parent sandbox's policy cannot be copied to children; fix the parent's policy";
+        }
+        Some(child_refusal::PARENT_POLICY_REJECTED) => {
+            return "The parent sandbox rejected its latest policy; fix the parent's policy";
+        }
+        _ => {}
+    }
+    if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
     } else if message.contains("credential") || message.contains("provider") {
         "Effective provider configuration is invalid; repair credential bindings, attached providers, or their policy layers"
@@ -5363,7 +5356,7 @@ pub(super) async fn handle_report_policy_status(
 
 /// Sync a root's children in the background, so the root's report is not
 /// held up by them.
-fn spawn_child_policy_sync(state: &Arc<ServerState>, sandbox_id: &str) {
+pub(super) fn spawn_child_policy_sync(state: &Arc<ServerState>, sandbox_id: &str) {
     let state = Arc::clone(state);
     let parent_id = sandbox_id.to_string();
     tokio::spawn(async move {
@@ -8482,6 +8475,41 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The child hints follow the refusal's reason, not its wording, and the
+    /// reason travels alongside the message without changing it.
+    #[test]
+    fn child_configuration_hints_follow_the_refusal_reason() {
+        for (reason, hint) in [
+            (
+                "PARENT_SANDBOX_MISSING",
+                "The parent sandbox no longer exists; delete this child sandbox",
+            ),
+            (
+                "PARENT_POLICY_NOT_COPIED",
+                "Waiting for a copy of the parent sandbox's latest policy",
+            ),
+            (
+                "PARENT_POLICY_UNCOPYABLE",
+                "The parent sandbox's policy cannot be copied to children; fix the parent's policy",
+            ),
+            (
+                "PARENT_POLICY_REJECTED",
+                "The parent sandbox rejected its latest policy; fix the parent's policy",
+            ),
+        ] {
+            let refusal = openshell_core::rpc_error::failed_precondition(reason, "reworded");
+            assert_eq!(refusal.message(), "reworded");
+            assert_eq!(configuration_failure_diagnostic(&refusal), hint, "{reason}");
+        }
+        // Wording alone no longer picks a child hint.
+        let unreasoned =
+            Status::failed_precondition("parent sandbox 'lead' rejected its latest policy");
+        assert_eq!(
+            configuration_failure_diagnostic(&unreasoned),
+            "Stored policy structure or safety validation failed; submit a complete valid replacement policy"
+        );
+    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
