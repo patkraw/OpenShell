@@ -681,6 +681,9 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     printf 'enabled = false\n'
   fi
 } > "${GATEWAY_CONFIG}"
+if [ "${OPENSHELL_E2E_CHILD_SANDBOXES:-0}" = "1" ]; then
+  e2e_enable_child_sandboxes "${GATEWAY_CONFIG}" "${STATE_DIR}"
+fi
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
