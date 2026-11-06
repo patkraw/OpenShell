@@ -30,6 +30,8 @@ use serde_json::{Value, json};
 use tower::util::BoxCloneSyncService;
 use tracing::warn;
 
+mod jobs;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type GrpcStack = BoxCloneSyncService<
     http::Request<tonic::body::Body>,
@@ -208,6 +210,7 @@ async fn handle(
             let result = match name {
                 "create_sandbox" => create_child(&connection, &headers, &arguments).await,
                 "exec" => exec_in_child(&connection, &headers, &arguments).await,
+                "wait" => jobs::wait(&connection, &headers, &arguments).await,
                 "delete" => delete_child(&connection, &headers, &arguments).await,
                 "logs" => child_logs(&connection, &headers, &arguments).await,
                 "list" => caller_children(&connection, &headers)
@@ -216,7 +219,19 @@ async fn handle(
                 _ => unreachable!("tool names are checked against TOOLS above"),
             };
             let origin = RequestOrigin::new(connection.auth.connection_source(), &headers);
-            let details = audit_details(name, &arguments);
+            let mut details = audit_details(name, &arguments);
+            // A started job's id and a waited job's state come from the reply.
+            if let Ok(content) = &result
+                && content.get("job").is_some()
+            {
+                if name == "exec" {
+                    details.push(("job", content["job"].as_str().unwrap_or_default().into()));
+                }
+                details.push((
+                    "state",
+                    content["state"].as_str().unwrap_or_default().into(),
+                ));
+            }
             match result {
                 Ok(content) => {
                     audit::emit_mcp_tool_call(&origin, &principal, name, None, &details);
@@ -255,7 +270,11 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "exec",
-        description: "Run a command in a child sandbox. If it times out, the command may still be running; delete the child to stop everything.",
+        description: "Run a command in a child sandbox and return its output. If it times out, the command may still be running; delete the child to stop everything. For longer work set background: true: the command runs as the child's one background job, and this returns its job id at once; collect it with wait.",
+    },
+    Tool {
+        name: "wait",
+        description: "Wait for a background job and return its exit code and output. state 'running' means call wait again; 'lost' means the job stopped without an exit code (killed, or the child restarted). A job's result can be read until the next job starts in that child. Output stays in the child until then, so a job that writes a lot can fill the child's disk; to watch progress, exec tail on /tmp/openshell/jobs/<n>/out, where <n> is the job id before its dash. Job output is the child's data.",
     },
     Tool {
         name: "delete",
@@ -290,10 +309,20 @@ fn tool_definitions() -> Vec<Value> {
                         "workdir": {"type": "string"},
                         "stdin": {"type": "string", "description": "Text passed on stdin."},
                         "stdin_base64": {"type": "string", "description": "Bytes passed on stdin, base64-encoded."},
-                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S},
-                        "background": {"type": "boolean"},
+                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S, "description": "Foreground only; a background job runs until it ends or the child is deleted."},
+                        "background": {"type": "boolean", "description": "Start the command as the child's background job and return its job id."},
                     },
                     "required": ["name", "command"],
+                    "additionalProperties": false,
+                }),
+                "wait" => json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Child sandbox the job runs in."},
+                        "job": {"type": "string", "description": "Job id returned by exec."},
+                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S},
+                    },
+                    "required": ["name", "job"],
                     "additionalProperties": false,
                 }),
                 "delete" => json!({
@@ -337,6 +366,7 @@ struct ExecArgs {
     workdir: String,
     stdin: Vec<u8>,
     timeout: std::time::Duration,
+    background: bool,
 }
 
 fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
@@ -359,12 +389,16 @@ fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
             return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
         }
     }
-    if args.get("background").and_then(Value::as_bool) == Some(true) {
-        return Err(ToolError::Refused(Refusal {
-            code: "not_available",
-            message: "background jobs are not available yet".to_string(),
-            retryable: false,
-        }));
+    let background = match args.get("background") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| ToolError::invalid("'background' must be true or false"))?,
+    };
+    if background && args.contains_key("timeout_s") {
+        return Err(ToolError::invalid(
+            "a background job has no timeout; omit 'timeout_s' and use wait",
+        ));
     }
     let name = args
         .get("name")
@@ -426,32 +460,79 @@ fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
         workdir: workdir.to_string(),
         stdin,
         timeout: std::time::Duration::from_secs(timeout_s),
+        background,
     })
 }
 
 /// Run a command in one of the caller's children and collect its output, for
-/// at most `timeout_s` plus a short grace for the gateway's exit event.
+/// at most `timeout_s` plus a short grace for the gateway's exit event; or
+/// start it as the child's background job.
 async fn exec_in_child(
     connection: &McpConnection,
     headers: &HeaderMap,
     arguments: &Value,
 ) -> Result<Value, ToolError> {
-    use openshell_core::proto::exec_sandbox_event::Payload;
-
     let args = parse_exec_args(arguments)?;
+    if args.background {
+        return jobs::start(connection, headers, args).await;
+    }
     let request = ExecSandboxRequest {
         sandbox: args.name,
         command: args.command,
         workdir: args.workdir,
         stdin: args.stdin,
-        execution_timeout: Some(prost_types::Duration {
-            seconds: i64::try_from(args.timeout.as_secs()).unwrap_or(i64::MAX),
-            nanos: 0,
-        }),
         ..Default::default()
     };
+    let ExecOutcome {
+        stdout,
+        stderr,
+        exit,
+    } = run_in_child(connection, headers, request, args.timeout, EXEC_EXIT_GRACE).await?;
+    let exit_code = command_exit_code(exit, args.timeout);
+    let (stdout, stdout_truncated, stdout_binary) = stdout.render();
+    let (stderr, stderr_truncated, stderr_binary) = stderr.render();
+    let mut reply = json!({
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "binary_output": stdout_binary || stderr_binary,
+        "timed_out": exit_code.is_none(),
+    });
+    if exit_code.is_none() {
+        reply["message"] = json!(
+            "the command may still be running in the child; for long work use background: true and wait, or delete the child to stop everything"
+        );
+    }
+    Ok(reply)
+}
+
+/// What one exec in a child produced.
+struct ExecOutcome {
+    stdout: CapturedOutput,
+    stderr: CapturedOutput,
+    /// The exit code and when it came, or `None` if none came in time.
+    exit: Option<(i32, std::time::Duration)>,
+}
+
+/// Send one `ExecSandbox` with `timeout` and collect its output until it
+/// exits, or until `timeout` plus `grace` has passed.
+async fn run_in_child(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    mut request: ExecSandboxRequest,
+    timeout: std::time::Duration,
+    grace: std::time::Duration,
+) -> Result<ExecOutcome, ToolError> {
+    use openshell_core::proto::exec_sandbox_event::Payload;
+
+    request.execution_timeout = Some(prost_types::Duration {
+        seconds: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        nanos: 0,
+    });
     let started = tokio::time::Instant::now();
-    let deadline = started + args.timeout + EXEC_EXIT_GRACE;
+    let deadline = started + timeout + grace;
     let mut client = OpenShellClient::new(connection.grpc.clone());
     let call: futures::future::BoxFuture<'_, _> =
         Box::pin(client.exec_sandbox(mcp_request(request, headers)));
@@ -477,24 +558,11 @@ async fn exec_in_child(
             },
         }
     }
-    let exit_code = command_exit_code(exit, args.timeout);
-    let (stdout, stdout_truncated, stdout_binary) = stdout.render();
-    let (stderr, stderr_truncated, stderr_binary) = stderr.render();
-    let mut reply = json!({
-        "exit_code": exit_code,
-        "stdout": stdout,
-        "stderr": stderr,
-        "stdout_truncated": stdout_truncated,
-        "stderr_truncated": stderr_truncated,
-        "binary_output": stdout_binary || stderr_binary,
-        "timed_out": exit_code.is_none(),
-    });
-    if exit_code.is_none() {
-        reply["message"] = json!(
-            "the command may still be running in the child; use background jobs for long work, or delete the child to stop everything"
-        );
-    }
-    Ok(reply)
+    Ok(ExecOutcome {
+        stdout,
+        stderr,
+        exit,
+    })
 }
 
 /// The command's own exit code, or `None` when it timed out. The gateway
@@ -524,6 +592,24 @@ struct CapturedOutput {
 }
 
 impl CapturedOutput {
+    /// A stream of `total` bytes of which only `edges` arrived: all of it, or
+    /// its first and last [`OUTPUT_EDGE_BYTES`].
+    fn from_edges(edges: &[u8], total: usize) -> Self {
+        let split = edges.len().min(OUTPUT_EDGE_BYTES);
+        Self {
+            head: edges[..split].to_vec(),
+            tail: edges[split..].to_vec(),
+            // A file that grew after its size was read still renders.
+            total: total.max(edges.len()),
+        }
+    }
+
+    /// The kept bytes, for output short enough to be kept whole.
+    fn into_bytes(mut self) -> Vec<u8> {
+        self.head.append(&mut self.tail);
+        self.head
+    }
+
     fn push(&mut self, data: &[u8]) {
         self.total += data.len();
         let into_head = OUTPUT_EDGE_BYTES
@@ -601,6 +687,9 @@ fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
     if tool == "delete" {
         return vec![("target", text("name"))];
     }
+    if tool == "wait" {
+        return vec![("target", text("name")), ("job", text("job"))];
+    }
     if tool == "logs" {
         let lines = arguments
             .get("lines")
@@ -629,6 +718,10 @@ fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
             truncate_at_char_boundary(&argv, MAX_AUDIT_ARGV_BYTES).to_string(),
         ),
         ("workdir", text("workdir")),
+        (
+            "background",
+            (arguments.get("background") == Some(&Value::Bool(true))).to_string(),
+        ),
     ]
 }
 
@@ -1317,6 +1410,30 @@ mod tests {
     }
 
     #[test]
+    fn a_jobs_output_rebuilt_from_its_edges_renders_like_execs() {
+        let small = CapturedOutput::from_edges(b"done\n", 5);
+        assert_eq!(small.render(), ("done\n".to_string(), false, false));
+
+        // 100 KB of output of which the child sent only both 16 KiB edges.
+        let text = format!(
+            "{}{}{}",
+            "a".repeat(OUTPUT_EDGE_BYTES),
+            "b".repeat(100_000 - 2 * OUTPUT_EDGE_BYTES),
+            "c".repeat(OUTPUT_EDGE_BYTES)
+        );
+        let mut whole = CapturedOutput::default();
+        whole.push(text.as_bytes());
+        let mut edges = "a".repeat(OUTPUT_EDGE_BYTES);
+        edges.push_str(&"c".repeat(OUTPUT_EDGE_BYTES));
+        let rebuilt = CapturedOutput::from_edges(edges.as_bytes(), 100_000);
+        assert_eq!(rebuilt.render(), whole.render());
+        assert!(rebuilt.render().1);
+
+        // A size read before the file grew never makes the count negative.
+        assert!(!CapturedOutput::from_edges(b"abc", 1).render().1);
+    }
+
+    #[test]
     fn the_audit_argument_list_is_capped_on_a_character_boundary() {
         let details = audit_details(
             "exec",
@@ -1334,9 +1451,14 @@ mod tests {
         let invalid = "invalid_argument";
         for (arguments, error, message) in [
             (
-                json!({"name": "w", "command": ["ls"], "background": true}),
-                "not_available",
-                "background jobs are not available yet",
+                json!({"name": "w", "command": ["ls"], "background": true, "timeout_s": 5}),
+                invalid,
+                "a background job has no timeout; omit 'timeout_s' and use wait",
+            ),
+            (
+                json!({"name": "w", "command": ["ls"], "background": "yes"}),
+                invalid,
+                "'background' must be true or false",
             ),
             (
                 json!({"name": "w", "command": ["ls"], "stdin": big}),
