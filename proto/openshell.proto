@@ -1499,6 +1499,9 @@ message ListSandboxesRequest {
   string page_token = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
+  // Optional name of a root sandbox; lists only its children. Needs a named
+  // workspace scope. A child of a deleted root of the same name is not listed.
+  string parent = 5;
 }
 
 // List providers attached to a sandbox request.

@@ -2667,6 +2667,7 @@ async fn fetch_sandboxes(
             page_size: 100,
             page_token,
             label_selector: String::new(),
+            parent: String::new(),
             workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),
         };
         let result = tokio::time::timeout(Duration::from_secs(5), client.list_sandboxes(req)).await;

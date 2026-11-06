@@ -1793,12 +1793,38 @@ pub(super) async fn handle_list_sandboxes(
             .name;
         Some(workspace)
     };
+    // Names are unique only within a workspace, so the parent is resolved
+    // there, once, and filtered on by id.
+    let parent_id = if request.parent.is_empty() {
+        None
+    } else {
+        let Some(workspace) = workspace.as_deref() else {
+            return Err(Status::invalid_argument(
+                "a parent filter needs a single workspace",
+            ));
+        };
+        let parent = state
+            .store
+            .get_message_by_name::<Sandbox>(workspace, &request.parent)
+            .await
+            .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+            .ok_or_else(|| {
+                Status::not_found(format!("parent sandbox '{}' not found", request.parent))
+            })?;
+        Some(parent.object_id().to_string())
+    };
     let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    // The parent's id, not its name, so a token stops working if the parent
+    // is deleted and a new sandbox takes its name.
+    let mut fingerprint = vec![scope_fingerprint, request.label_selector.as_str()];
+    if let Some(parent_id) = parent_id.as_deref() {
+        fingerprint.push(parent_id);
+    }
     let pagination = Pagination::new(
         request.page_size,
         &request.page_token,
         "ListSandboxes",
-        &[scope_fingerprint, &request.label_selector],
+        &fingerprint,
     )?;
     let after = pagination.object_cursor()?;
     let query = match (workspace.as_deref(), request.label_selector.as_str()) {
@@ -1810,6 +1836,14 @@ pub(super) async fn handle_list_sandboxes(
             label_selector: selector,
         },
     };
+    if let Some(parent_id) = parent_id {
+        let (sandboxes, next_cursor) =
+            list_children_page(state, query, after, pagination.page_size(), &parent_id).await?;
+        return Ok(Response::new(ListSandboxesResponse {
+            sandboxes,
+            next_page_token: pagination.next_object_token(next_cursor.as_ref()),
+        }));
+    }
     let page = state
         .store
         .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
@@ -1820,6 +1854,48 @@ pub(super) async fn handle_list_sandboxes(
         sandboxes: page.messages,
         next_page_token,
     }))
+}
+
+/// Fill one response page with a parent's children, reading as many store
+/// pages as needed. When the response fills partway through a store page,
+/// the next cursor is the last record read, so the next page starts right
+/// after it instead of skipping the rest of that store page.
+async fn list_children_page(
+    state: &ServerState,
+    query: ObjectListQuery<'_>,
+    mut after: Option<crate::persistence::ObjectCursor>,
+    page_size: u32,
+    parent_id: &str,
+) -> Result<(Vec<Sandbox>, Option<crate::persistence::ObjectCursor>), Status> {
+    let limit = page_size as usize;
+    let mut children = Vec::new();
+    loop {
+        let page = state
+            .store
+            .list_object_page(Sandbox::object_type(), query, after.as_ref(), page_size)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        let read = page.records.len();
+        for (index, record) in page.records.into_iter().enumerate() {
+            let cursor = crate::persistence::ObjectCursor::from(&record);
+            let sandbox: Sandbox = crate::persistence::decode_record(record)
+                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+            if sandbox
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.id == parent_id)
+            {
+                children.push(sandbox);
+            }
+            if children.len() == limit && index + 1 < read {
+                return Ok((children, Some(cursor)));
+            }
+        }
+        match page.next_cursor {
+            Some(cursor) if children.len() < limit => after = Some(cursor),
+            next_cursor => return Ok((children, next_cursor)),
+        }
+    }
 }
 
 pub(super) async fn handle_create_sandbox_template(
@@ -8525,6 +8601,146 @@ mod tests {
         );
     }
 
+    fn list_children_request(
+        parent: &str,
+        page_size: i32,
+        page_token: String,
+    ) -> ListSandboxesRequest {
+        ListSandboxesRequest {
+            page_size,
+            page_token,
+            label_selector: String::new(),
+            parent: parent.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        }
+    }
+
+    fn listed_names(response: &ListSandboxesResponse) -> Vec<&str> {
+        response
+            .sandboxes
+            .iter()
+            .map(ObjectName::object_name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_parent_filter_pages_through_only_that_parents_children() {
+        let state = child_sandboxes_state().await;
+        // Store order is creation time, then name: a-lead, b, c, d, e-other.
+        let lead_id = put_parent_record(&state, "a-lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "a-lead".to_string(),
+            id: lead_id,
+        };
+        for name in ["b-child", "c-child", "d-child"] {
+            put_parent_record(&state, name, &[], Some(link.clone()), false).await;
+        }
+        put_parent_record(&state, "e-other", &[], None, false).await;
+
+        // Store pages of two are [a-lead, b-child] [c-child, d-child]
+        // [e-other], so the first response fills on c-child, partway through
+        // the second store page; d-child must still come next.
+        let first = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("a-lead", 2, String::new())),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed_names(&first), ["b-child", "c-child"]);
+        assert!(!first.next_page_token.is_empty());
+
+        let second = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("a-lead", 2, first.next_page_token)),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed_names(&second), ["d-child"]);
+        assert!(second.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_parent_filter_does_not_list_an_old_roots_orphans() {
+        let state = child_sandboxes_state().await;
+        orphaned_child(&state).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let listed = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("lead", 100, String::new())),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(listed.sandboxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_parent_filter_needs_one_workspace_and_an_existing_parent() {
+        let state = child_sandboxes_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let mut all_workspaces = list_children_request("lead", 100, String::new());
+        all_workspaces.workspace_scope = Some(openshell_core::proto::all_workspaces_selector());
+        let err = handle_list_sandboxes(&state, authed_request(all_workspaces))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("a parent filter needs a single workspace")
+        );
+
+        let err = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("missing", 100, String::new())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_page_token_is_tied_to_the_parent_it_was_listed_for() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        for name in ["worker1", "worker2"] {
+            put_parent_record(&state, name, &[], Some(link.clone()), false).await;
+        }
+        let list = |parent: &str, token: String| {
+            handle_list_sandboxes(
+                &state,
+                authed_request(list_children_request(parent, 1, token)),
+            )
+        };
+
+        let unfiltered = list("", String::new()).await.unwrap().into_inner();
+        let err = list("lead", unfiltered.next_page_token).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let filtered = list("lead", String::new()).await.unwrap().into_inner();
+        let err = list("", filtered.next_page_token.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // A new root under the same name is a different parent.
+        state
+            .store
+            .delete(Sandbox::object_type(), &lead_id)
+            .await
+            .unwrap();
+        put_parent_record(&state, "lead", &[], None, false).await;
+        let err = list("lead", filtered.next_page_token).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
     #[tokio::test]
     async fn detaching_a_provider_from_a_parent_detaches_it_from_its_children() {
         let state = child_sandboxes_state().await;
@@ -12293,6 +12509,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12311,6 +12528,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -12336,6 +12554,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12381,6 +12600,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
@@ -12394,6 +12614,7 @@ mod tests {
                 page_size: 1,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
@@ -12408,6 +12629,7 @@ mod tests {
                 page_size: 100,
                 page_token: first_page.next_page_token,
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )

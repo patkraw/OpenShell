@@ -504,6 +504,9 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `Sandbox` carries `SandboxCommands::Create`; see the note there on why
+// boxing one allocation per parse isn't worth it.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -1454,6 +1457,12 @@ enum SandboxCommands {
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
 
+        /// Create the sandbox as a child of this root sandbox.
+        /// The child uses the parent's policy, and `--provider` picks from
+        /// the parent's providers (all of them when omitted).
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        parent: Option<String>,
+
         /// Sandbox source: a rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`)
         /// or a container image reference (e.g., `myregistry.com/img:tag`).
         ///
@@ -1676,6 +1685,10 @@ enum SandboxCommands {
         /// Filter sandboxes by label selector (key1=value1,key2=value2).
         #[arg(long)]
         selector: Option<String>,
+
+        /// List only the child sandboxes of this root sandbox.
+        #[arg(long, conflicts_with = "all_workspaces", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        parent: Option<String>,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["ids", "names"])]
@@ -3383,6 +3396,7 @@ async fn run_async() -> Result<()> {
                 SandboxCommands::Create {
                     name,
                     template,
+                    parent,
                     from,
                     upload,
                     no_git_ignore,
@@ -3473,6 +3487,7 @@ async fn run_async() -> Result<()> {
                         run::SandboxCreateConfig {
                             name: name.as_deref(),
                             template: template.as_deref(),
+                            parent: parent.as_deref(),
                             from: from.as_deref(),
                             uploads: &upload_specs,
                             keep,
@@ -3581,6 +3596,7 @@ async fn run_async() -> Result<()> {
                             ids,
                             names,
                             selector,
+                            parent,
                             output,
                             all_workspaces,
                         } => {
@@ -3591,6 +3607,7 @@ async fn run_async() -> Result<()> {
                                 ids,
                                 names,
                                 selector.as_deref(),
+                                parent.as_deref(),
                                 output.as_str(),
                                 &cli.workspace,
                                 all_workspaces,
@@ -6615,6 +6632,57 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(template.as_deref(), Some("gpu-kata"));
+                assert_eq!(providers, vec!["github".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_list_parent_flag_parses_and_needs_one_workspace() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "--parent", "lead"])
+            .expect("sandbox list parent flag should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List { parent: Some(ref parent), .. }),
+            }) if parent == "lead"
+        ));
+
+        let err = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "list",
+            "--parent",
+            "lead",
+            "--all-workspaces",
+        ])
+        .expect_err("--parent needs a single workspace");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn sandbox_create_parent_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--parent",
+            "lead",
+            "--provider",
+            "github",
+        ])
+        .expect("sandbox create parent flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        parent, providers, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(parent.as_deref(), Some("lead"));
                 assert_eq!(providers, vec!["github".to_string()]);
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
