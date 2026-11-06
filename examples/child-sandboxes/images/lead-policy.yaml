@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Policy for a lead whose children run Claude Code, Codex and Pi from the
+# images in this folder. Children always use their parent's policy, so the
+# lead's policy names every harness its children run, even the ones the lead
+# does not have. All three images install their harness with npm on the same
+# base, so the paths below match in every image. Every harness talks to the
+# NVIDIA inference API, which serves Anthropic, OpenAI and Nemotron models.
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/workspace, /sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+network_policies:
+  nvidia_inference:
+    name: nvidia_inference
+    endpoints:
+      - { host: inference-api.nvidia.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: "/usr/local/lib/node_modules/**" }
