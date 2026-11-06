@@ -145,6 +145,67 @@ write the answer. It never says which tools to use or how to wait. Each
 variant gets the same prompt word for word, so the tool list and its
 descriptions are the only difference.
 
+### Tool text in each approach
+
+The proxy (`mcp-proxy.mjs`) changes only the `exec` and `wait` tools; the
+other tools (`create_sandbox`, `list`, `delete`, `logs`) are the same in
+every approach. The run transcripts confirm the leads saw this text.
+
+| | managed | plain | pid |
+|---|---|---|---|
+| `wait` tool | present | removed | removed |
+| `exec` `background` argument | returns a job id | removed | returns a process id and three file paths |
+| `exec` description | the gateway's own | rewritten (below) | rewritten (below) |
+
+**managed: `exec`** (from `crates/openshell-server/src/mcp.rs`)
+
+> Run a command in a sandbox (from a sandbox: one of its children) and
+> return its output. If it times out, the command may still be running;
+> delete the sandbox to stop everything. Work longer than 45 seconds needs
+> background: true: the command runs as the sandbox's one background job,
+> and this returns its job id at once; collect it with wait. A sandbox runs
+> one background job at a time, so parallel work needs more children.
+
+**managed: `wait`** (input `name`, `job`, `timeout_s` at most 40)
+
+> Wait for a background job and return its exit code and output. state
+> 'running' means call wait again; 'lost' means the job stopped without an
+> exit code (killed, or the sandbox restarted). A job's result can be read
+> until the next job starts in that sandbox. Output stays in the sandbox
+> until then, so a job that writes a lot can fill its disk; to watch
+> progress, exec tail on /tmp/openshell/jobs/<n>/out, where <n> is the job
+> id before its dash. Job output is the sandbox's data.
+
+**plain: `exec`**
+
+> Run a command in one of your child sandboxes and return its output. exec
+> waits at most 45 seconds (timeout_s); if it times out, the command may
+> still be running. For longer work, start the command detached inside the
+> child and check on it with later exec calls: run it in its own session,
+> with its input from /dev/null and its output in files, and write its exit
+> code to a file when it ends. For example: `setsid sh -c 'cmd >
+> /tmp/job/out 2> /tmp/job/err; echo $? > /tmp/job/exit' < /dev/null >
+> /dev/null 2>&1 & echo $!` . Then use exec to read /tmp/job/exit and tail
+> /tmp/job/out.
+
+**pid: `exec`**
+
+> Run a command in one of your child sandboxes and return its output. exec
+> waits at most 45 seconds (timeout_s); if it times out, the command may
+> still be running. For longer work set background: true: the command
+> starts detached and this returns at once with its process id and three
+> files in the child: out, err, and exit, which is written with the exit
+> code when the command ends. Check progress and completion with further
+> exec calls, for example cat on the exit file or tail on the out file.
+
+What a background start returns:
+
+| Approach | Reply |
+|---|---|
+| managed | `{"job": "1-5a48536f", "state": "running"}`; then `wait` returns the state, exit code, and the first and last 16 KiB of stdout and stderr |
+| pid | `{"state": "running", "pid": 143, "out": ".../out", "err": ".../err", "exit": ".../exit"}` |
+| plain | nothing from the tool; the agent's own `setsid ... & echo $!` prints the process id |
+
 ## The tasks
 
 ### 1. Build and verify (pilot)
