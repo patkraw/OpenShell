@@ -23,7 +23,8 @@ use axum::routing::post;
 use openshell_core::ObjectName;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    CreateSandboxRequest, ListSandboxesRequest, Sandbox, SandboxPhase, SandboxSpec,
+    CreateSandboxRequest, DeleteSandboxRequest, ExecSandboxRequest, ListSandboxesRequest, Sandbox,
+    SandboxPhase, SandboxSpec,
 };
 use serde_json::{Value, json};
 use tower::util::BoxCloneSyncService;
@@ -206,20 +207,30 @@ async fn handle(
             let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
             let result = match name {
                 "create_sandbox" => create_child(&connection, &headers, &arguments).await,
+                "exec" => exec_in_child(&connection, &headers, &arguments).await,
+                "delete" => delete_child(&connection, &headers, &arguments).await,
+                "logs" => child_logs(&connection, &headers, &arguments).await,
                 "list" => caller_children(&connection, &headers)
                     .await
                     .map(|children| json!({"sandboxes": children.iter().map(child_summary).collect::<Vec<_>>()})),
-                _ => Err(ToolError::not_available(name)),
+                _ => unreachable!("tool names are checked against TOOLS above"),
             };
             let origin = RequestOrigin::new(connection.auth.connection_source(), &headers);
+            let details = audit_details(name, &arguments);
             match result {
                 Ok(content) => {
-                    audit::emit_mcp_tool_call(&origin, &principal, name, None);
+                    audit::emit_mcp_tool_call(&origin, &principal, name, None, &details);
                     rpc_ok(&id, tool_result(&content, false))
                 }
                 Err(ToolError::Unauthenticated) => StatusCode::UNAUTHORIZED.into_response(),
                 Err(ToolError::Refused(error)) => {
-                    audit::emit_mcp_tool_call(&origin, &principal, name, Some(error.code));
+                    audit::emit_mcp_tool_call(
+                        &origin,
+                        &principal,
+                        name,
+                        Some(error.code),
+                        &details,
+                    );
                     rpc_ok(&id, tool_result(&error.to_json(), true))
                 }
             }
@@ -248,11 +259,11 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "delete",
-        description: "Delete a child sandbox and everything running in it.",
+        description: "Delete a child sandbox and everything running in it. Deletion finishes in the background; a later not_found for the same name means the child is gone.",
     },
     Tool {
         name: "logs",
-        description: "Read a child sandbox's recent logs.",
+        description: "Read a child sandbox's own recent log lines (its output and policy denials), newest kept.",
     },
 ];
 
@@ -271,11 +282,473 @@ fn tool_definitions() -> Vec<Value> {
                     "required": ["name"],
                     "additionalProperties": false,
                 }),
+                "exec" => json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Child sandbox to run in."},
+                        "command": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments; not a shell string."},
+                        "workdir": {"type": "string"},
+                        "stdin": {"type": "string", "description": "Text passed on stdin."},
+                        "stdin_base64": {"type": "string", "description": "Bytes passed on stdin, base64-encoded."},
+                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_S},
+                        "background": {"type": "boolean"},
+                    },
+                    "required": ["name", "command"],
+                    "additionalProperties": false,
+                }),
+                "delete" => json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "description": "Child sandbox to delete."}},
+                    "required": ["name"],
+                    "additionalProperties": false,
+                }),
+                "logs" => json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Child sandbox to read."},
+                        "lines": {"type": "integer", "minimum": 1, "maximum": MAX_LOG_LINES},
+                        "since": {"type": "string", "description": "Only lines at or after this RFC 3339 time."},
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false,
+                }),
                 _ => json!({"type": "object"}),
             };
             json!({"name": tool.name, "description": tool.description, "inputSchema": schema})
         })
         .collect()
+}
+
+const DEFAULT_EXEC_TIMEOUT_S: u64 = 30;
+const MAX_EXEC_TIMEOUT_S: u64 = 45;
+/// How long past `timeout_s` the tool waits for the gateway's exit event.
+const EXEC_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_STDIN_BYTES: usize = 512 * 1024;
+/// Bytes kept from each end of each output stream.
+const OUTPUT_EDGE_BYTES: usize = 16 * 1024;
+/// Exit code the gateway reports when `execution_timeout` fires.
+const GATEWAY_TIMEOUT_EXIT_CODE: i32 = 124;
+/// Largest argument list recorded in the audit event.
+const MAX_AUDIT_ARGV_BYTES: usize = 1024;
+
+struct ExecArgs {
+    name: String,
+    command: Vec<String>,
+    workdir: String,
+    stdin: Vec<u8>,
+    timeout: std::time::Duration,
+}
+
+fn parse_exec_args(arguments: &Value) -> Result<ExecArgs, ToolError> {
+    let args = arguments_object(arguments)?;
+    for key in args.keys() {
+        if key == "env" {
+            return Err(ToolError::invalid("'env' is only available to users"));
+        }
+        if ![
+            "name",
+            "command",
+            "workdir",
+            "stdin",
+            "stdin_base64",
+            "timeout_s",
+            "background",
+        ]
+        .contains(&key.as_str())
+        {
+            return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
+        }
+    }
+    if args.get("background").and_then(Value::as_bool) == Some(true) {
+        return Err(ToolError::Refused(Refusal {
+            code: "not_available",
+            message: "background jobs are not available yet".to_string(),
+            retryable: false,
+        }));
+    }
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ToolError::invalid("'name' is required"))?;
+    let command = args
+        .get("command")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        })
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| ToolError::invalid("'command' must be a nonempty list of strings"))?;
+    let workdir = args
+        .get("workdir")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stdin = match (args.get("stdin"), args.get("stdin_base64")) {
+        (Some(_), Some(_)) => {
+            return Err(ToolError::invalid(
+                "send 'stdin' or 'stdin_base64', not both",
+            ));
+        }
+        (Some(text), None) => text
+            .as_str()
+            .ok_or_else(|| ToolError::invalid("'stdin' must be a string"))?
+            .as_bytes()
+            .to_vec(),
+        (None, Some(encoded)) => {
+            use base64::Engine;
+            encoded
+                .as_str()
+                .and_then(|encoded| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                })
+                .ok_or_else(|| ToolError::invalid("'stdin_base64' must be base64"))?
+        }
+        (None, None) => Vec::new(),
+    };
+    if stdin.len() > MAX_STDIN_BYTES {
+        return Err(ToolError::invalid("stdin is larger than 512 KiB"));
+    }
+    let timeout_s = match args.get("timeout_s") {
+        None => DEFAULT_EXEC_TIMEOUT_S,
+        Some(value) => value
+            .as_u64()
+            .filter(|timeout| (1..=MAX_EXEC_TIMEOUT_S).contains(timeout))
+            .ok_or_else(|| ToolError::invalid("'timeout_s' must be between 1 and 45"))?,
+    };
+    Ok(ExecArgs {
+        name: name.to_string(),
+        command,
+        workdir: workdir.to_string(),
+        stdin,
+        timeout: std::time::Duration::from_secs(timeout_s),
+    })
+}
+
+/// Run a command in one of the caller's children and collect its output, for
+/// at most `timeout_s` plus a short grace for the gateway's exit event.
+async fn exec_in_child(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    use openshell_core::proto::exec_sandbox_event::Payload;
+
+    let args = parse_exec_args(arguments)?;
+    let request = ExecSandboxRequest {
+        sandbox: args.name,
+        command: args.command,
+        workdir: args.workdir,
+        stdin: args.stdin,
+        execution_timeout: Some(prost_types::Duration {
+            seconds: i64::try_from(args.timeout.as_secs()).unwrap_or(i64::MAX),
+            nanos: 0,
+        }),
+        ..Default::default()
+    };
+    let started = tokio::time::Instant::now();
+    let deadline = started + args.timeout + EXEC_EXIT_GRACE;
+    let mut client = OpenShellClient::new(connection.grpc.clone());
+    let call: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.exec_sandbox(mcp_request(request, headers)));
+    let mut events = call.await.map_err(ToolError::from_status)?.into_inner();
+    let (mut stdout, mut stderr) = (CapturedOutput::default(), CapturedOutput::default());
+    let mut exit = None;
+    loop {
+        let next: futures::future::BoxFuture<'_, _> = Box::pin(events.message());
+        let Ok(event) = tokio::time::timeout_at(deadline, next).await else {
+            warn!("mcp: exec did not end at its timeout");
+            break;
+        };
+        match event.map_err(ToolError::from_status)? {
+            None => break,
+            Some(event) => match event.payload {
+                Some(Payload::Stdout(out)) => stdout.push(&out.data),
+                Some(Payload::Stderr(err)) => stderr.push(&err.data),
+                Some(Payload::Exit(code)) => {
+                    exit = Some((code.exit_code, started.elapsed()));
+                    break;
+                }
+                None => {}
+            },
+        }
+    }
+    let exit_code = command_exit_code(exit, args.timeout);
+    let (stdout, stdout_truncated, stdout_binary) = stdout.render();
+    let (stderr, stderr_truncated, stderr_binary) = stderr.render();
+    let mut reply = json!({
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "binary_output": stdout_binary || stderr_binary,
+        "timed_out": exit_code.is_none(),
+    });
+    if exit_code.is_none() {
+        reply["message"] = json!(
+            "the command may still be running in the child; use background jobs for long work, or delete the child to stop everything"
+        );
+    }
+    Ok(reply)
+}
+
+/// The command's own exit code, or `None` when it timed out. The gateway
+/// reports its timeout as 124; a command can exit 124 too, but only earlier
+/// than one second before the timeout.
+fn command_exit_code(
+    exit: Option<(i32, std::time::Duration)>,
+    timeout: std::time::Duration,
+) -> Option<i32> {
+    match exit {
+        Some((GATEWAY_TIMEOUT_EXIT_CODE, elapsed))
+            if elapsed + std::time::Duration::from_secs(1) >= timeout =>
+        {
+            None
+        }
+        Some((code, _)) => Some(code),
+        None => None,
+    }
+}
+
+/// One output stream: its first and last bytes, and how many there were.
+#[derive(Default)]
+struct CapturedOutput {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl CapturedOutput {
+    fn push(&mut self, data: &[u8]) {
+        self.total += data.len();
+        let into_head = OUTPUT_EDGE_BYTES
+            .saturating_sub(self.head.len())
+            .min(data.len());
+        self.head.extend_from_slice(&data[..into_head]);
+        self.tail.extend_from_slice(&data[into_head..]);
+        if self.tail.len() > OUTPUT_EDGE_BYTES {
+            self.tail.drain(..self.tail.len() - OUTPUT_EDGE_BYTES);
+        }
+    }
+
+    /// The kept text, whether bytes were omitted, and whether the kept bytes
+    /// held invalid UTF-8. Cuts fall on character boundaries.
+    fn render(&self) -> (String, bool, bool) {
+        if self.head.len() + self.tail.len() == self.total {
+            let mut all = self.head.clone();
+            all.extend_from_slice(&self.tail);
+            let text = String::from_utf8_lossy(&all);
+            let binary = matches!(text, std::borrow::Cow::Owned(_));
+            return (text.into_owned(), false, binary);
+        }
+        let head = &self.head[..utf8_end_before_partial(&self.head)];
+        let tail = &self.tail[utf8_start_after_partial(&self.tail)..];
+        let omitted = self.total - head.len() - tail.len();
+        let (head, tail) = (String::from_utf8_lossy(head), String::from_utf8_lossy(tail));
+        let binary = matches!(head, std::borrow::Cow::Owned(_))
+            || matches!(tail, std::borrow::Cow::Owned(_));
+        (
+            format!("{head}\n… [{omitted} bytes omitted] …\n{tail}"),
+            true,
+            binary,
+        )
+    }
+}
+
+/// Length of `bytes` without a multi-byte character cut off at its end.
+fn utf8_end_before_partial(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    for back in 1..=len.min(4) {
+        let byte = bytes[len - back];
+        if byte & 0xC0 == 0x80 {
+            continue;
+        }
+        let width = match byte {
+            0xF0..=0xF7 => 4,
+            0xE0..=0xEF => 3,
+            0xC0..=0xDF => 2,
+            _ => 1,
+        };
+        return if width > back { len - back } else { len };
+    }
+    len
+}
+
+/// Offset past continuation bytes left at the start of `bytes` by a cut.
+fn utf8_start_after_partial(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take(3)
+        .take_while(|byte| *byte & 0xC0 == 0x80)
+        .count()
+}
+
+/// What the audit event records about a tool call: for `exec`, the target,
+/// the argument list (capped) and the working directory; never stdin.
+fn audit_details(tool: &str, arguments: &Value) -> Vec<(&'static str, String)> {
+    let text = |key| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    if tool == "delete" {
+        return vec![("target", text("name"))];
+    }
+    if tool == "logs" {
+        let lines = arguments
+            .get("lines")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_LOG_LINES);
+        return vec![("target", text("name")), ("lines", lines.to_string())];
+    }
+    if tool != "exec" {
+        return Vec::new();
+    }
+    let argv = arguments
+        .get("command")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    vec![
+        ("target", text("name")),
+        (
+            "argv",
+            truncate_at_char_boundary(&argv, MAX_AUDIT_ARGV_BYTES).to_string(),
+        ),
+        ("workdir", text("workdir")),
+    ]
+}
+
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn arguments_object(arguments: &Value) -> Result<serde_json::Map<String, Value>, ToolError> {
+    match arguments {
+        Value::Null => Ok(serde_json::Map::new()),
+        Value::Object(args) => Ok(args.clone()),
+        _ => Err(ToolError::invalid("arguments must be an object")),
+    }
+}
+
+/// Delete one of the caller's children. Returns at once; deletion finishes in
+/// the background.
+async fn delete_child(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let name = required_name(&arguments_object(arguments)?, &["name"])?;
+    let request = DeleteSandboxRequest {
+        name: name.clone(),
+        ..Default::default()
+    };
+    let mut client = OpenShellClient::new(connection.grpc.clone());
+    let call: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.delete_sandbox(mcp_request(request, headers)));
+    call.await.map_err(ToolError::from_status)?;
+    Ok(json!({"name": name, "deleting": true}))
+}
+
+const DEFAULT_LOG_LINES: u64 = 200;
+const MAX_LOG_LINES: u64 = 2000;
+/// Largest log reply; the newest lines are kept.
+const MAX_LOG_BYTES: usize = 64 * 1024;
+
+/// A child's own recent output, newest lines kept within the reply cap.
+async fn child_logs(
+    connection: &McpConnection,
+    headers: &HeaderMap,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let args = arguments_object(arguments)?;
+    let name = required_name(&args, &["name", "lines", "since"])?;
+    let lines = match args.get("lines") {
+        None => DEFAULT_LOG_LINES,
+        Some(value) => value
+            .as_u64()
+            .filter(|lines| (1..=MAX_LOG_LINES).contains(lines))
+            .ok_or_else(|| ToolError::invalid("'lines' must be between 1 and 2000"))?,
+    };
+    let since_time = match args.get("since") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(|since| since.parse::<prost_types::Timestamp>().ok())
+                .ok_or_else(|| ToolError::invalid("'since' must be an RFC 3339 time"))?,
+        ),
+    };
+    let request = openshell_core::proto::GetSandboxLogsRequest {
+        sandbox: name,
+        lines: u32::try_from(lines).unwrap_or(u32::MAX),
+        since_time,
+        ..Default::default()
+    };
+    let mut client = OpenShellClient::new(connection.grpc.clone());
+    let call: futures::future::BoxFuture<'_, _> =
+        Box::pin(client.get_sandbox_logs(mcp_request(request, headers)));
+    let logs = call
+        .await
+        .map_err(ToolError::from_status)?
+        .into_inner()
+        .logs;
+    let (lines, truncated) = newest_log_lines(&logs);
+    Ok(json!({"lines": lines, "truncated": truncated}))
+}
+
+/// The newest lines that fit in the reply cap, oldest first. A single line
+/// over the cap keeps its start, cut on a character boundary.
+fn newest_log_lines(logs: &[openshell_core::proto::SandboxLogLine]) -> (Vec<Value>, bool) {
+    let mut kept = Vec::new();
+    let mut bytes = 0;
+    let mut truncated = false;
+    for log in logs.iter().rev() {
+        let room = MAX_LOG_BYTES.saturating_sub(bytes);
+        if room == 0 {
+            truncated = true;
+            break;
+        }
+        let message = truncate_at_char_boundary(&log.message, room);
+        truncated |= message.len() < log.message.len();
+        bytes += message.len();
+        let time = log.event_time.as_ref().map(ToString::to_string);
+        kept.push(json!({"time": time, "level": log.level, "message": message}));
+    }
+    kept.reverse();
+    (kept, truncated)
+}
+
+/// Refuse arguments outside `allowed`, and return the required `name`.
+fn required_name(
+    args: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<String, ToolError> {
+    if let Some(key) = args.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(ToolError::invalid(&format!("unknown argument '{key}'")));
+    }
+    args.get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ToolError::invalid("'name' is required"))
 }
 
 /// `create_sandbox` arguments a user may send but a sandbox may not.
@@ -290,12 +763,7 @@ struct CreateArgs {
 }
 
 fn parse_create_args(arguments: &Value) -> Result<CreateArgs, ToolError> {
-    let empty = serde_json::Map::new();
-    let args = match arguments {
-        Value::Null => &empty,
-        Value::Object(args) => args,
-        _ => return Err(ToolError::invalid("arguments must be an object")),
-    };
+    let args = arguments_object(arguments)?;
     for key in args.keys() {
         if USER_ONLY_CREATE_ARGUMENTS.contains(&key.as_str()) {
             return Err(ToolError::invalid(&format!(
@@ -533,14 +1001,6 @@ impl ToolError {
         })
     }
 
-    fn not_available(name: &str) -> Self {
-        Self::Refused(Refusal {
-            code: "not_available",
-            message: format!("'{name}' is not available yet"),
-            retryable: false,
-        })
-    }
-
     /// Map a gRPC status to the agent-facing error. Internal errors can carry
     /// store or driver detail, so their text is logged, not returned.
     fn from_status(status: tonic::Status) -> Self {
@@ -753,38 +1213,47 @@ mod tests {
 
         let (_, reply) = post_mcp(lead(), &[], rpc("tools/call", json!({"name": "rm"}))).await;
         assert_eq!(reply.unwrap()["error"]["code"], -32602);
-
-        let (status, reply) =
-            post_mcp(lead(), &[], rpc("tools/call", json!({"name": "exec"}))).await;
-        assert_eq!(status, StatusCode::OK);
-        let result = &reply.unwrap()["result"];
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["structuredContent"]["error"], "not_available");
     }
 
-    #[tokio::test]
-    async fn each_tool_call_emits_one_valid_audit_event_without_the_token() {
-        let capture = openshell_ocsf::test_support::OcsfCapture::default();
-        let _guard = capture.install();
-        let (status, _) = post_mcp(
-            connection(Some(sandbox_principal("lead"))),
-            &[("authorization", "Bearer canary-secret-token-7d1e")],
-            rpc("tools/call", json!({"name": "exec"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-
-        let events: Vec<_> = capture
-            .json_events()
-            .into_iter()
-            .filter(|event| event["class_uid"] == 6003)
-            .collect();
-        assert_eq!(events.len(), 1, "{events:?}");
-        let event = &events[0];
+    #[test]
+    fn the_audit_event_is_valid_and_carries_no_token_or_stdin() {
+        let headers = HeaderMap::from_iter([(
+            http::header::AUTHORIZATION,
+            "Bearer canary-secret-token-7d1e".parse().unwrap(),
+        )]);
+        let details = audit_details(
+            "exec",
+            &json!({"name": "w1", "command": ["ls", "-l"], "workdir": "/tmp", "stdin": "secret-stdin"}),
+        );
+        let event = audit::mcp_tool_call_event(
+            &RequestOrigin::new(None, &headers),
+            &sandbox_principal("lead"),
+            "exec",
+            Some("not_found"),
+            &details,
+        );
+        let event = serde_json::to_value(event).unwrap();
         assert_eq!(event["api"]["operation"], "exec");
-        assert_eq!(event["status_detail"], "not_available");
-        assert!(!event.to_string().contains("canary-secret-token"));
-        openshell_ocsf_validate::validate_event(event).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(event["status_detail"], "not_found");
+        assert_eq!(event["unmapped"]["argv"], "ls -l");
+        assert_eq!(event["unmapped"]["workdir"], "/tmp");
+        let text = event.to_string();
+        assert!(!text.contains("canary-secret-token") && !text.contains("secret-stdin"));
+        openshell_ocsf_validate::validate_event(&event).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn a_late_124_is_a_timeout_and_an_early_one_is_the_commands() {
+        let timeout = std::time::Duration::from_secs(10);
+        let at = std::time::Duration::from_millis;
+        assert_eq!(command_exit_code(Some((124, at(9_000))), timeout), None);
+        assert_eq!(command_exit_code(Some((124, at(10_200))), timeout), None);
+        assert_eq!(
+            command_exit_code(Some((124, at(8_900))), timeout),
+            Some(124)
+        );
+        assert_eq!(command_exit_code(Some((0, at(10_200))), timeout), Some(0));
+        assert_eq!(command_exit_code(None, timeout), None);
     }
 
     #[tokio::test]
@@ -818,6 +1287,198 @@ mod tests {
     }
 
     #[test]
+    fn output_keeps_both_ends_and_cuts_on_character_boundaries() {
+        let mut small = CapturedOutput::default();
+        small.push(b"hello");
+        assert_eq!(small.render(), ("hello".to_string(), false, false));
+
+        // "é" is two bytes; one straddles the head's 16 KiB edge and one the
+        // tail's, so neither may turn into a replacement character.
+        let mut text = "a".repeat(OUTPUT_EDGE_BYTES - 1);
+        text.push('é');
+        text.push_str(&"b".repeat(40_000));
+        text.push('é');
+        text.push_str(&"c".repeat(OUTPUT_EDGE_BYTES - 2));
+        let mut output = CapturedOutput::default();
+        for chunk in text.as_bytes().chunks(1000) {
+            output.push(chunk);
+        }
+        let (rendered, truncated, binary) = output.render();
+        assert!(truncated);
+        assert!(!binary, "a cut character is not binary output");
+        assert!(!rendered.contains('\u{FFFD}'));
+        assert!(rendered.starts_with(&"a".repeat(OUTPUT_EDGE_BYTES - 1)));
+        assert!(rendered.ends_with(&"c".repeat(OUTPUT_EDGE_BYTES - 2)));
+        assert!(rendered.contains("bytes omitted"));
+
+        let mut binary = CapturedOutput::default();
+        binary.push(&[0xff, 0xfe, b'x']);
+        assert!(binary.render().2);
+    }
+
+    #[test]
+    fn the_audit_argument_list_is_capped_on_a_character_boundary() {
+        let details = audit_details(
+            "exec",
+            &json!({"name": "w", "command": ["echo", "é".repeat(1000)], "stdin": "secret"}),
+        );
+        let argv = &details.iter().find(|(key, _)| *key == "argv").unwrap().1;
+        assert!(argv.len() <= MAX_AUDIT_ARGV_BYTES);
+        assert!(argv.starts_with("echo é"));
+        assert!(details.iter().all(|(_, value)| !value.contains("secret")));
+    }
+
+    #[tokio::test]
+    async fn exec_refuses_bad_arguments_before_calling_the_gateway() {
+        let big = "x".repeat(MAX_STDIN_BYTES + 1);
+        let invalid = "invalid_argument";
+        for (arguments, error, message) in [
+            (
+                json!({"name": "w", "command": ["ls"], "background": true}),
+                "not_available",
+                "background jobs are not available yet",
+            ),
+            (
+                json!({"name": "w", "command": ["ls"], "stdin": big}),
+                invalid,
+                "stdin is larger than 512 KiB",
+            ),
+            (
+                json!({"name": "w", "command": ["ls"], "stdin": "a", "stdin_base64": "YQ=="}),
+                invalid,
+                "send 'stdin' or 'stdin_base64', not both",
+            ),
+            (
+                json!({"name": "w", "command": ["ls"], "timeout_s": 46}),
+                invalid,
+                "'timeout_s' must be between 1 and 45",
+            ),
+            (
+                json!({"name": "w", "command": ["ls"], "env": {}}),
+                invalid,
+                "'env' is only available to users",
+            ),
+            (
+                json!({"name": "w", "command": ["ls"], "size": 3}),
+                invalid,
+                "unknown argument 'size'",
+            ),
+            (
+                json!({"name": "w", "command": "ls"}),
+                invalid,
+                "'command' must be a nonempty list of strings",
+            ),
+        ] {
+            let (_, reply) = post_mcp(
+                connection(Some(sandbox_principal("lead"))),
+                &[],
+                rpc(
+                    "tools/call",
+                    json!({"name": "exec", "arguments": arguments}),
+                ),
+            )
+            .await;
+            let result = &reply.unwrap()["result"];
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["error"], error);
+            assert_eq!(result["structuredContent"]["message"], message);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_unknown_arguments() {
+        for (arguments, message) in [
+            (
+                json!({"name": "w", "force": true}),
+                "unknown argument 'force'",
+            ),
+            (json!({}), "'name' is required"),
+        ] {
+            let (_, reply) = post_mcp(
+                connection(Some(sandbox_principal("lead"))),
+                &[],
+                rpc(
+                    "tools/call",
+                    json!({"name": "delete", "arguments": arguments}),
+                ),
+            )
+            .await;
+            let result = &reply.unwrap()["result"];
+            assert_eq!(result["structuredContent"]["error"], "invalid_argument");
+            assert_eq!(result["structuredContent"]["message"], message);
+        }
+    }
+
+    #[test]
+    fn logs_keep_the_newest_lines_within_the_cap() {
+        let line = |message: String| openshell_core::proto::SandboxLogLine {
+            message,
+            ..Default::default()
+        };
+        let small: Vec<_> = (0..3).map(|i| line(format!("line {i}"))).collect();
+        let (kept, truncated) = newest_log_lines(&small);
+        assert_eq!(kept.len(), 3);
+        assert!(!truncated);
+
+        // Three 30 KiB lines: only the newest two fit, the second-newest cut.
+        let big: Vec<_> = (0..3)
+            .map(|i| line(format!("{i}{}", "x".repeat(30 * 1024))))
+            .collect();
+        let (kept, truncated) = newest_log_lines(&big);
+        assert!(truncated);
+        assert_eq!(kept.len(), 3);
+        assert!(
+            kept.last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .starts_with('2')
+        );
+        let total: usize = kept
+            .iter()
+            .map(|l| l["message"].as_str().unwrap().len())
+            .sum();
+        assert!(total <= MAX_LOG_BYTES);
+
+        // One line over the cap made of two-byte characters is cut on a
+        // character boundary.
+        let (kept, truncated) = newest_log_lines(&[line("é".repeat(MAX_LOG_BYTES))]);
+        assert!(truncated);
+        let message = kept[0]["message"].as_str().unwrap();
+        assert!(message.len() <= MAX_LOG_BYTES && message.chars().all(|c| c == 'é'));
+    }
+
+    #[tokio::test]
+    async fn logs_refuses_unknown_arguments() {
+        for (arguments, message) in [
+            (
+                json!({"name": "w", "sources": ["gateway"]}),
+                "unknown argument 'sources'",
+            ),
+            (
+                json!({"name": "w", "lines": 2001}),
+                "'lines' must be between 1 and 2000",
+            ),
+            (
+                json!({"name": "w", "since": "yesterday"}),
+                "'since' must be an RFC 3339 time",
+            ),
+        ] {
+            let (_, reply) = post_mcp(
+                connection(Some(sandbox_principal("lead"))),
+                &[],
+                rpc(
+                    "tools/call",
+                    json!({"name": "logs", "arguments": arguments}),
+                ),
+            )
+            .await;
+            let result = &reply.unwrap()["result"];
+            assert_eq!(result["structuredContent"]["error"], "invalid_argument");
+            assert_eq!(result["structuredContent"]["message"], message);
+        }
+    }
+
+    #[test]
     fn internal_errors_do_not_reach_the_agent() {
         let ToolError::Refused(refusal) =
             ToolError::from_status(tonic::Status::internal("fetch parent sandbox failed: db"))
@@ -825,7 +1486,12 @@ mod tests {
             panic!("an internal error is a tool error");
         };
         assert_eq!(refusal.code, "internal");
-        assert!(!refusal.message.contains("db"), "{}", refusal.message);
+        // The request id is random hex, so check for the hidden text itself.
+        assert!(
+            !refusal.message.contains("fetch parent sandbox failed"),
+            "{}",
+            refusal.message
+        );
         assert!(matches!(
             ToolError::from_status(tonic::Status::unauthenticated("expired")),
             ToolError::Unauthenticated
