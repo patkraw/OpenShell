@@ -530,6 +530,41 @@ pub fn deny(principal: &Principal, denial: AuthzDenial<'_>, message: impl Into<S
     Status::permission_denied(message)
 }
 
+/// Emit one API Activity event for an MCP tool call: allowed, or refused with
+/// the agent-facing error code.
+pub fn emit_mcp_tool_call(
+    origin: &RequestOrigin,
+    principal: &Principal,
+    tool: &str,
+    refused: Option<&str>,
+) {
+    let ctx = crate::gateway_ocsf::context("", "");
+    let builder = ApiActivityBuilder::new(&ctx, tool)
+        .actor_user(principal_user(principal))
+        .src_endpoint(origin.source.map_or_else(
+            || Endpoint::from_name("unknown"),
+            ConnectionSource::endpoint,
+        ))
+        .api_service(Service::new("mcp"))
+        .http_request(post("/mcp"));
+    let builder = match refused {
+        None => builder
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(format!("mcp tool call {tool}: allowed")),
+        Some(code) => builder
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Low)
+            .status(StatusId::Failure)
+            .status_detail(code)
+            .message(format!("mcp tool call {tool}: refused ({code})")),
+    };
+    ocsf_emit!(builder.build());
+}
+
 /// Emit an API Activity denial for a gRPC request to `path`, paired with a
 /// Detection Finding when a sandbox principal crossed its boundary.
 pub fn emit_authorization_denial_for(
