@@ -6,12 +6,13 @@ host through `openshell mcp serve`.
 
 Each tutorial is short and copy-pasteable, and shows real output from a dev
 gateway with the Docker driver. Your ids, times and container names differ.
-Start with **00**; the rest can be done in any order, but 02 to 06 reuse the
-sandboxes from 01.
+Start with **00**, then **01** and **02**: they create the root `lead` and
+the children `w1` and `a1` that the others reuse. After that, 03 to 06 can
+be done in any order; each says what it needs at the top.
 
 | # | Tutorial | You will |
 |---|---|---|
-| 00 | [Setup](00-setup.md) | build, start a dev gateway with child sandboxes on, build the agent images |
+| 00 | [Setup](00-setup.md) | build, start a dev gateway with child sandboxes on, build the agent images, publish the harness templates |
 | 01 | [CLI children](01-cli-children.md) | create a root and a child, list a tree, see each CLI refusal, delete in order |
 | 02 | [MCP inside a root](02-mcp-inside-a-root.md) | call every tool from inside the root, retry a create, see each refusal |
 | 03 | [Long work](03-long-work.md) | run background jobs, wait for them, watch progress, run workers in parallel |
@@ -47,4 +48,5 @@ Two scripted demos build on these tutorials:
 
 The user guide is
 [Child sandboxes](../../../docs/how-it-works/sandboxes/child-sandboxes.mdx);
-the design is RFC 0021, "Sandboxed Subagents".
+the design is RFC 0021, "Sandboxed Subagents", under review in
+[NVIDIA/OpenShell#4721](https://github.com/NVIDIA/OpenShell/pull/4721).

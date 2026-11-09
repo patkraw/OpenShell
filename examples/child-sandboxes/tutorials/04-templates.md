@@ -56,7 +56,7 @@ openshell sandbox exec --name lead --no-tty -- curl -s -X POST http://openshell.
 
 ```json
 {
-  "description": "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`. Templates you may create a child from: pi-tutorial (image child-pi:local). Without a template the child copies your image.",
+  "description": "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`. A child never contacts its parent on its own: results come only from exec and wait. Delete a child when its work is done. Templates you may create a child from: pi-tutorial (image child-pi:local). Without a template the child copies your image.",
   "template": {
     "description": "(sandboxes only) Sandbox template made available to agents.",
     "enum": [
@@ -118,7 +118,8 @@ label one, check two things:
 
 [`demo-mixed-harnesses.sh`](../demo-mixed-harnesses.sh) starts Claude Code,
 Codex and Pi children under one lead from the templates `claude-agent`,
-`codex-agent` and `pi-agent`, with the lead policy in
+`codex-agent` and `pi-agent` (step 5 of [00](00-setup.md)), with the lead
+policy in
 [`images/lead-policy.yaml`](../images/lead-policy.yaml) that names every
 harness its children run.
 

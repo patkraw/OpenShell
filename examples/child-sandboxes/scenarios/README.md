@@ -1,6 +1,7 @@
 # Child sandbox scenarios
 
-Six runnable scenarios that exercise child sandboxes (RFC 0021) end to end,
+Six runnable scenarios that exercise child sandboxes
+([RFC 0021](https://github.com/NVIDIA/OpenShell/pull/4721)) end to end,
 through the MCP tools and the CLI, with real coding agents where it matters.
 Each script creates what it needs, checks the outcome and prints a `PASS` or
 `FAIL` line per check, and deletes everything when it ends.
@@ -16,10 +17,10 @@ Needs:
 
 - a gateway with `experimental_enable_child_sandboxes = true` and the default
   limit of 10 children per parent;
-- the images, templates and provider profile from [`../images`](../images):
-  `child-base`, `child-claude`, `child-codex` and `child-pi` built, and
-  templates `claude-agent`, `codex-agent` and `pi-agent` labelled
-  `openshell.ai/agent-usable=true`;
+- the images from [`../images`](../images) (`child-base`, `child-claude`,
+  `child-codex` and `child-pi`) and the templates `claude-agent`,
+  `codex-agent` and `pi-agent` labelled `openshell.ai/agent-usable=true`,
+  made as in steps 3 and 5 of [tutorial 00](../tutorials/00-setup.md);
 - for scenarios 1, 2 and 4, an `nvidia-inference` provider named `nv-p` (or
   `NV_PROVIDER`) holding a key for `inference-api.nvidia.com`.
 
@@ -115,8 +116,8 @@ The first run had 3 of 6 passing. None of the failures was a product bug:
 
 - **Scenario 6** could not start any sandbox: something outside this run
   rebuilt the shared `openshell/supervisor:dev` image, and the gateway still
-  pointed at the deleted one. The dev gateway now uses its own
-  `openshell/supervisor:children` tag. `run-all.sh` also reported this
+  pointed at the deleted one. Restarting the dev gateway fixed it; avoid
+  rebuilding that image while scenarios run. `run-all.sh` also reported this
   scenario as passed with no checks; a scenario now passes only when it ran
   at least one check and exited 0.
 - **Scenario 2:** Claude Code's `--allowedTools` took the prompt as another
