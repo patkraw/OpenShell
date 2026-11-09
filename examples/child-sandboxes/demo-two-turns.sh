@@ -12,7 +12,7 @@
 # credential: the root gets the named provider, and the worker inherits it.
 #
 # Usage:
-#   examples/child-sandboxes/demo-two-turns.sh --provider anthropic --image claude-agent:local
+#   examples/child-sandboxes/demo-two-turns.sh --provider anthropic --image child-claude:local
 #
 # Needs: an active gateway with experimental_enable_child_sandboxes on, the
 # openshell CLI, python3 on the host, and an image that has `claude` and

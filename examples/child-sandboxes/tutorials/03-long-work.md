@@ -117,7 +117,7 @@ done
 ```
 
 ```json
-{"job":"3-ffef5209","state":"completed","exit_code":0,"stdout":"a1 done\n"}
+{"job":"2-ffef5209","state":"completed","exit_code":0,"stdout":"a1 done\n"}
 {"job":"1-6a555b98","state":"completed","exit_code":0,"stdout":"w1 done\n"}
 ```
 
@@ -132,7 +132,9 @@ There is no cancel. To stop a job, delete its child:
 mcp lead delete '{"name":"a1"}'
 ```
 
-Create `a1` again if you go on to 05: `mcp lead create_sandbox '{"name":"a1"}'`.
+Deletion finishes in the background. If you go on to 05, wait until
+`mcp lead list` no longer shows `a1`, then create it again:
+`mcp lead create_sandbox '{"name":"a1"}'`.
 
 ## What you learned
 

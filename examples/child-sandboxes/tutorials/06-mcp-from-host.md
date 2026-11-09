@@ -9,7 +9,7 @@ Setup: [00](00-setup.md), a root called `lead`
 
 `openshell mcp serve` is an MCP server over stdio. It forwards each call to
 the gateway with your CLI login, so the tools act as **you**, not as a
-sandbox. That changes three things:
+sandbox. That changes four things:
 
 - You see every sandbox you may see in the workspace, roots included.
 - `create_sandbox` without `parent` creates a **root**. Pass `parent` to
@@ -98,7 +98,8 @@ serve`, and `initialize` fails with `cannot reach the gateway`.
 - **`cannot reach the gateway`**: the server picked a different gateway than
   your shell. Add `--gateway` to `args`, or make sure `OPENSHELL_GATEWAY`
   reaches it.
-- **`child sandboxes are disabled on this gateway`**: see
+- **`the gateway refused the call (HTTP …)`** on every call: the gateway may
+  have child sandboxes off, which also leaves out its `/mcp` endpoint; see
   [00](00-setup.md).
 
 ## Clean up
