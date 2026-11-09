@@ -13,8 +13,9 @@
 #   examples/child-sandboxes/demo-mixed-harnesses.sh --provider <nvidia-inference provider>
 #
 # Needs: an active gateway with experimental_enable_child_sandboxes on, the
-# images, templates and provider profile from examples/child-sandboxes/images,
-# the openshell CLI and python3 on the host. The script never reads, prints or
+# harness images and the claude-agent, codex-agent and pi-agent templates
+# (steps 3 and 5 of examples/child-sandboxes/tutorials/00-setup.md), the
+# openshell CLI and python3 on the host. The script never reads, prints or
 # passes a credential: each harness reads the provider's NVIDIA_API_KEY
 # placeholder, which the sandbox proxy replaces on the way out.
 

@@ -83,8 +83,9 @@ openshell sandbox exec --name a1 --no-tty -- curl -s -o /dev/null -w '%{http_cod
 `Superseded`.
 
 If a parent's new policy fails to load, its children never get that
-version. Until the parent loads a good one, the gateway refuses to create its
-children or send them new configuration, with
+version. When the parent fails closed (the default), the gateway also
+refuses to create its children or send them new configuration until the
+parent loads a good one, with
 `parent sandbox 'lead' rejected its latest policy`.
 
 A policy that removes filesystem paths, like
@@ -108,7 +109,10 @@ NAME       TYPE    CREDENTIAL_KEYS   CONFIG_KEYS
 my-github  github  1                 0
 ```
 
-A child gets only the providers its create call names; `a1` has none.
+A create that names providers gives the child only those; one that names
+none gives it all of the parent's at that moment. `a1` has none because
+`lead` had none when `a1` was created, and attaching a provider to the
+parent later does not reach existing children.
 
 ## 4. Take it away again
 
@@ -131,6 +135,8 @@ not in a state required for the operation's execution)`. To remove a provider
 from one child only, detach it from that child.
 
 ## Clean up
+
+Keep `lead` if you go on to 04 or 06. Otherwise:
 
 ```shell
 openshell sandbox delete gh1 a1 w1

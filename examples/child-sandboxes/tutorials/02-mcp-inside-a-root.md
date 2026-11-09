@@ -176,8 +176,9 @@ mcp lead delete '{"name":"tmp1"}'
 {"deleting":true,"name":"tmp1"}
 ```
 
-Deleting stops everything running in the child. A second delete of the same
-name is `not_found`.
+Deleting stops everything running in the child. It finishes in the
+background: while it runs, another delete of the same name answers
+`deleting` again; once the child is gone, it answers `not_found`.
 
 ## Clean up
 

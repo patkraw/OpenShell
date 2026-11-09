@@ -61,7 +61,7 @@ docker build --target pi     -t child-pi:local     examples/child-sandboxes/imag
 ```
 
 You need `child-base:local` for every tutorial. The harness images are for
-04 and the demos. Harness state lives under `/tmp`, which every child can
+04, the demos and the scenarios. Harness state lives under `/tmp`, which every child can
 write.
 
 ## 4. Create a provider to share
@@ -80,6 +80,19 @@ Imported 1 provider profile.
 ✓ Created provider my-github
 ```
 
+## 5. Publish the harness templates
+
+The demos and the scenarios create Claude Code, Codex and Pi children from
+three templates labelled for agents. Tutorial
+[04](04-templates.md) explains templates; create these once:
+
+```shell
+for harness in claude codex pi; do
+  openshell sandbox template create "${harness}-agent" --image "child-${harness}:local" \
+    --label openshell.ai/agent-usable=true
+done
+```
+
 ## Troubleshooting
 
 - **`child sandboxes are disabled on this gateway`**: the gateway started
@@ -94,8 +107,8 @@ Imported 1 provider profile.
     OPENSHELL_DOCKER_GATEWAY_NAME=tut-dev OPENSHELL_SANDBOX_NAMESPACE=tut-dev \
     OPENSHELL_DOCKER_GATEWAY_STATE_DIR="$PWD/.cache/gateway-tut" mise run gateway:docker
   ```
-- **`provider profile 'github' not found`**: import the profile first, as in
-  step 4.
+- **`provider profile 'github' was not found in the requested scope`**:
+  import the profile first, as in step 4.
 
 ## What you learned
 

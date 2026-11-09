@@ -40,8 +40,8 @@ count="$("${OPENSHELL}" sandbox list --parent "${ROOT}" 2>&1 | grep -c "^${ROOT}
 expect "${LIMIT} children listed" "${count}" "^${LIMIT}$"
 
 step "One more child"
-r="$(mcp "${ROOT}" create_sandbox "{\"name\": \"${ROOT}-over\"}")"
-track "${ROOT}-over"
+r="$(mcp "${ROOT}" create_sandbox "{\"name\": \"${ROOT}-c$((LIMIT + 1))\"}")"
+track "${ROOT}-c$((LIMIT + 1))"
 expect "refused at the limit" "$(printf '%s' "${r}" | jget structuredContent.message)" 'limit|at most|children'
 info "$(printf '%s' "${r}" | jget structuredContent.message)"
 
