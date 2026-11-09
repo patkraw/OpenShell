@@ -97,6 +97,18 @@ in_sandbox() {
   "${OPENSHELL}" sandbox exec --name "$1" --no-tty -- sh -c "$2" 2>&1
 }
 
+# container_of <sandbox> <sandbox|supervisor>: the id of a Docker driver
+# sandbox's workload or supervisor container; empty when there is none.
+container_of() {
+  docker ps -q --filter "label=openshell.ai/sandbox-name=$1" \
+    --filter "label=openshell.ai/isolation-role=$2" | head -n 1
+}
+
+# mount_source <container> <path>: the volume or host path mounted at <path>.
+mount_source() {
+  docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{if .Name}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}" "$1"
+}
+
 # mcp_raw <sandbox> <method> <params JSON>: one JSON-RPC request to
 # openshell.local/mcp from inside a sandbox; prints the whole reply.
 # shellcheck disable=SC2016 # Python code and the sandbox's shell

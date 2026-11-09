@@ -32,9 +32,26 @@ step "The lead tries to run a command in itself over MCP"
 r="$(mcp "${LEAD}" exec "{\"name\": \"${LEAD}\", \"command\": [\"id\"]}")"
 expect "itself reads as not found" "$(printf '%s' "${r}" | jget structuredContent.error)" '^not_found$'
 
-step "A child tries to read the sandbox's gateway token"
-r="$(in_sandbox "${A}" 'cat /etc/openshell/auth/sandbox.jwt >/dev/null 2>&1 && echo READ || echo DENIED')"
-expect "token unreadable" "${r}" 'DENIED'
+step "A child tries to reach its supervisor's gateway credentials"
+# The Docker driver gives the supervisor container a volume at
+# /.openshell/supervisor holding auth.json. The checks below confirm the file
+# exists and that the workload has no way to it; none reads the file.
+STATE=/.openshell/supervisor
+supervisor="$(container_of "${A}" supervisor)"
+workload="$(container_of "${A}" sandbox)"
+volume=""
+[ -n "${supervisor}" ] && volume="$(mount_source "${supervisor}" "${STATE}")"
+if [ -n "${volume}" ] && docker run --rm --network none -v "${volume}:/s:ro" --entrypoint test \
+  "$(docker inspect -f '{{.Image}}' "${workload}")" -s /s/auth.json; then
+  pass "credentials present in the supervisor's state"
+else
+  fail "credentials present in the supervisor's state" "no non-empty auth.json under ${STATE} for ${A}"
+fi
+expect "workload container found" "${workload}" '.'
+[ -n "${workload}" ] && expect "workload container does not mount it" "$(mount_source "${workload}" "${STATE}")" '^$'
+r="$(in_sandbox "${A}" "test -e ${STATE} && echo VISIBLE; for p in /proc/[0-9]*; do [ -e \"\$p/root${STATE}\" ] && echo VIA-\$p; done; env | grep -c '^OPENSHELL_SANDBOX_TOKEN' || true")"
+expect_not "not visible from the workload or its processes" "${r}" 'VISIBLE|VIA-'
+expect "no token in the workload's environment" "${r}" '^0$'
 
 step "A child tries to reach a host its parent's policy does not allow"
 r="$(in_sandbox "${A}" 'curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://example.com/; true')"
