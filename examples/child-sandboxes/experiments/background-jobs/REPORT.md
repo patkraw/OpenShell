@@ -1,5 +1,24 @@
 # Background jobs for sandboxed subagents: an experiment
 
+> **Update: a second, larger experiment** ([report](../background-jobs-2/REPORT.md))
+> ran 342 runs with five 2026 models in Claude Code and Pi. It added a
+> fourth approach, **auto** (every `exec` waits up to 40 seconds, then
+> becomes a job for `wait`), rewritten tool text (T1), and tasks with a
+> 20-minute job and a job that never ends.
+>
+> - Claude Haiku 5.5 and DeepSeek V4.1 Flash completed **all 84** main runs
+>   with every approach; approaches differ in effort, not success.
+> - **Auto needed the fewest actions:** a median of 10.5 tool calls, against
+>   14.5 for managed, 17 for plain and 18.5 for pid with the same text.
+> - Agents run commands of unknown length in the **foreground first**, then
+>   mistake the timed-out command for a job. T1 removed this for managed
+>   (8 runs to 0) and cut timeouts from 19 to 4.
+> - In tuning, **managed and auto had no failures** in 64 runs; plain and
+>   pid had 4, three of them loops that ran until the time limit.
+> - Leanings: keep `wait`; build auto; ship T1 for managed.
+>
+> The rest of this page is the first experiment, unchanged.
+
 ## Summary
 
 A lead agent often asks a child sandbox to run work that takes minutes. One
