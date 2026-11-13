@@ -344,6 +344,14 @@ pub struct Config {
     /// armed until Ready. Must be between 1 and 86400, inclusive.
     pub provisioning_repair_window_seconds: i64,
 
+    /// Allow creating child sandboxes under a root sandbox. Disabled by
+    /// default; turning it off blocks only new children.
+    pub enable_child_sandboxes: bool,
+
+    /// Maximum number of children one parent may have at once. Must be
+    /// between 0 and 1000, inclusive; 0 allows none.
+    pub max_concurrent_children: u32,
+
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
     /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
@@ -1067,6 +1075,8 @@ impl Config {
             max_service_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_seconds: 300,
+            enable_child_sandboxes: false,
+            max_concurrent_children: 10,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
