@@ -1,7 +1,8 @@
 # Background jobs for child sandboxes: a second experiment
 
-**Status: draft.** Covers all stages, S0 to S2b (342 runs). A run on real
-tasks from Terminal-Bench 2.0 is being prepared. The full design is in
+**Status: draft.** Covers all stages, S0 to S2b (342 runs), plus a run on
+a real task from Terminal-Bench 2.0 (crack-7z-hash, 32 runs; see
+[A real task](#a-real-task-crack-7z-hash)). The full design is in
 [PLAN.md](PLAN.md), the text tuning round by round in
 [TUNING.md](TUNING.md), and observations from the traces in
 [NOTES.md](NOTES.md).
@@ -32,6 +33,11 @@ text, on tasks of unknown length, with five models in two harnesses.
   through a rate limit or by stopping a few seconds before the deadline.
   The failures that remain are Lightning's, mostly from working in its
   own sandbox.
+- **It holds on a real task.** On crack-7z-hash from Terminal-Bench 2.0,
+  where the lead splits a password search across children, DeepSeek and
+  Qwen3.6 solved it under **all four approaches** (8 of 8 each), and auto
+  again used the fewest calls. The two Nemotron models were the weak link,
+  not the mechanism.
 
 ## The four approaches
 
@@ -221,6 +227,7 @@ verify) were used only to tune the text.
 | **S1** text tuning | four rounds: managed, plain, pid, auto with T1, on the practice tasks, with the tuning models; failures read after each round | 128 |
 | **S2a** main comparison | 7 conditions (managed, plain, pid with T0 and T1; auto with T1) × long-log, chain, parallel × 3 models × 2 | 126 |
 | **S2b** long and stuck jobs | the same 7 conditions × 3 models × marathon (1 each) and hang (2 each) | 63 |
+| **crack** real task | crack-7z-hash (Terminal-Bench 2.0) × managed, plain, pid, auto with T1 × 4 open models × 2 | 32 |
 
 Runs within a stage were shuffled, with at most 6 at once and 2 per model.
 
@@ -323,6 +330,50 @@ leads also put short commands (such as a 5-second `pipeline prepare`) in
 the background, so one call became a start and a wait. Auto has no such
 cost: a short command finishes within its first call.
 
+## A real task: crack-7z-hash
+
+The tasks above are synthetic commands with known run-time ranges. To check
+the approaches on real work, we ran one task from **Terminal-Bench 2.0**,
+[`crack-7z-hash`](https://github.com/harbor-framework/terminal-bench-2):
+recover the password of a 7-Zip archive from its hash. It fits a lead with
+children, because the search splits cleanly: the lead hands each child a
+slice of the keyspace, the child reports only whether it found the
+password, and the lead writes the answer. The task's own tests grade the
+**lead's** sandbox, so a pass means the lead collected a child's result and
+wrote it where the task expects — the whole point of child sandboxes.
+
+Every run used the lead-splits-across-children frame and the T1 text. Four
+open-weight models on the pi harness, each approach, twice. Each cell is
+passes out of 2:
+
+| Model | managed | auto | plain | pid | total |
+|---|---|---|---|---|---|
+| **DeepSeek V4.1 Flash** | 2/2 | 2/2 | 2/2 | 2/2 | **8/8** |
+| **Qwen3.6 35B** | 2/2 | 2/2 | 2/2 | 2/2 | **8/8** |
+| Nemotron 3 Ultra | 1/2 | 0/2 | 0/2 | 1/2 | 2/8 |
+| Nemotron 3.5 Lightning | 1/2 | 1/2 | 0/2 | 0/2 | 2/8 |
+
+- **Both capable models solved it under all four approaches.** The
+  child-sandbox split works on a real task, and the approach does not
+  decide success for a capable model — as with the synthetic tasks.
+- **The Nemotron models are the weak link, not the mechanism.** Lightning
+  burned 4 to 8 million tokens per run and refused or returned an empty
+  reply; Ultra had one empty-reply timeout. Both struggle with the task
+  itself, in any approach.
+
+Median MCP calls per run, for the two models that passed every cell:
+
+| Model | managed | auto | plain | pid |
+|---|---|---|---|---|
+| DeepSeek | 21.5 | **9.5** | 12.5 | 20 |
+| Qwen3.6 | 27.5 | **3.5** | 8 | 17 |
+
+**Auto was the leanest and managed the heaviest,** the same order as the
+synthetic tasks: auto's single call per short step keeps the count down,
+while managed spends calls on explicit `wait`. Plain sat below pid for both
+models. The real task repeats the synthetic finding instead of overturning
+it.
+
 ## What went wrong
 
 ```mermaid
@@ -388,7 +439,8 @@ flowchart TD
 - **Two of the three main models succeeded every time,** so success does
   not separate the approaches for them; actions do.
 - **Lightning often worked in its own sandbox,** which blurs its results.
-- **The tasks are synthetic commands** with known ranges of run time.
+- **The tasks are synthetic commands** with known ranges of run time; the
+  one real task (crack-7z-hash) adds 2 runs per cell on one harness.
 - **Rate limits cut 8 of 21 DeepSeek runs in S2b,** so its S2b results do not
   compare the approaches.
 - **The hang deadline is scored from the start of the tests,** not from the
@@ -399,6 +451,43 @@ flowchart TD
 - **Plain, pid and auto are built in a proxy,** not in the gateway.
 - **Failures were classified by reading traces,** by someone who knew each
   run's approach.
+
+## What auto would cost to build
+
+Auto is the one approach with no gateway support behind it. In this
+experiment it lives only in the proxy: the proxy runs a foreground `exec`,
+waits about 40 seconds, and if the command is still running it hands back a
+synthesized job id to poll. The gateway's real `exec` cannot do this, so
+shipping auto means a real change to how `exec` runs a command.
+
+Today the gateway has **two separate paths**. Foreground `exec` streams one
+`ExecSandbox` call, bounded by a timeout; nothing is tracked after it ends.
+Background `exec` takes a different path: a small shell wrapper launches the
+command **detached** under `setsid`, writing to `/tmp/openshell/jobs/<n>/`,
+and returns a job id at once; `wait` polls those files. A foreground command
+is not in that wrapper, so at the 40-second mark there is no job to promote
+and no saved output to collect — you cannot adopt a running process's output
+from outside after the fact.
+
+So auto really means **launching every command through the job wrapper and
+reading it inline for up to 40 seconds**: if the exit file appears, return
+the output like foreground and clean the job up; if not, return the job id
+like background. Concretely:
+
+| Change | Size |
+|---|---|
+| `exec_in_child`: drop the `background` branch; always start a job, poll ≤40 s, branch on the exit file | medium |
+| jobs module: a "start then poll inline" helper reusing the existing start/check/output steps, plus cleanup for a job that finished fast | medium |
+| foreground streaming path | no longer the `exec` path |
+| tool schema and text: remove the `background` argument; reword `exec` and `wait` | small |
+| pre-build checks (setsid, sh, stat, `/tmp` writable) | now gate **every** command, not just background ones |
+
+The work is two medium functions, not a large diff. The real cost is two
+behaviour changes: **every command becomes a detached job**, so live
+streaming gives way to reading job files, with different latency and
+truncation; and **every image must support the job wrapper**, which today
+only background commands need. Managed avoids all of this, because it is
+already the gateway's own behaviour.
 
 ## Conclusion
 
@@ -413,7 +502,7 @@ Long and stuck jobs (S2b) did not change this. On the decisions:
 | Decision | Leaning | Evidence |
 |---|---|---|
 | **D1: keep `wait`** | **Keep it** | With T1, managed needed fewer actions than plain and pid, and in tuning it had no failures: its `wait` catches a mistaken job at once |
-| **D2: add auto** | **Promising; worth building** | The fewest actions of the T1 conditions on every task, no timed-out calls with the capable models, no foreground or background choice to get wrong, and close to what the leading harnesses do. A gateway version needs `exec` to start a job and wait in one call, and job output kept until it is read |
+| **D2: add auto** | **Promising; worth building** | The fewest actions of the T1 conditions on every task and on the real task, no timed-out calls with the capable models, no foreground or background choice to get wrong, and close to what the leading harnesses do. The build cost is two medium `exec` changes but a shift to launching every command as a job (see [What auto would cost to build](#what-auto-would-cost-to-build)) |
 | **D3: ship T1** | **Ship it for managed** | It removed foreground-first runs (8 to 0) and most timeouts (19 to 4) with the capable models, at the cost of a few extra calls for short commands |
 
 A design idea from the traces, close to auto: a foreground `exec` that
