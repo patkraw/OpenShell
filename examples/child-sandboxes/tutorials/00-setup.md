@@ -109,6 +109,17 @@ done
   ```
 - **`provider profile 'github' was not found in the requested scope`**:
   import the profile first, as in step 4.
+- **`the user who started this sandbox is not a member of workspace
+  'default' with the user role`**, when an agent calls `create_sandbox`: the
+  dev gateway never says this, because it has no admin role. On a gateway
+  that has one, the user who created the root must be a workspace member,
+  platform admins included:
+
+  ```shell
+  openshell workspace member add --workspace default --subject <user> --role user
+  ```
+
+  `openshell whoami` prints your subject.
 
 ## What you learned
 
