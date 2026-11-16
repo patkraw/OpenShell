@@ -56,10 +56,13 @@ openshell sandbox exec --name lead --no-tty -- curl -s -X POST http://openshell.
 
 ```json
 {
-  "description": "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`. A child never contacts its parent on its own: results come only from exec and wait. Delete a child when its work is done. Templates you may create a child from: pi-tutorial (image child-pi:local). Without a template the child copies your image.",
+  "description": "Create a sandbox. Called from a sandbox, it creates a child of that sandbox; called by a user, a root, or a child of `parent`. A child never contacts its parent on its own: results come only from exec and wait. Delete a child when its work is done. Templates you may create a child from: claude-agent (image child-claude:local), codex-agent (image child-codex:local), pi-agent (image child-pi:local), pi-tutorial (image child-pi:local). Without a template the child copies your image.",
   "template": {
     "description": "(sandboxes only) Sandbox template made available to agents.",
     "enum": [
+      "claude-agent",
+      "codex-agent",
+      "pi-agent",
       "pi-tutorial"
     ],
     "type": "string"
@@ -67,9 +70,11 @@ openshell sandbox exec --name lead --no-tty -- curl -s -X POST http://openshell.
 }
 ```
 
+The three `-agent` templates are the ones you published in step 5 of
+[00](00-setup.md).
+
 The list holds every labelled template in the workspace without driver
-configuration, up to 50, with its image but never its environment. Other
-labelled templates on your gateway show up here too. Before you publish one,
+configuration, up to 50, with its image but never its environment. Before you publish one,
 the `template` argument has no `enum` and the description no list. A user's
 tool list, through `openshell mcp serve`, never has one
 ([06](06-mcp-from-host.md)).
